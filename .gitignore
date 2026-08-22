@@ -1,0 +1,66 @@
+# macOS and filesystem metadata
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Editors and IDEs
+.idea/
+.fleet/
+*.swp
+*.swo
+*~
+.vscode/*
+!.vscode/extensions.json
+!.vscode/launch.json
+!.vscode/settings.json
+!.vscode/tasks.json
+
+# Rust and Cargo build outputs
+target/
+*.rs.bk
+*.pdb
+*.dSYM/
+
+# wasm-pack generated outputs
+renderer-wasm/pkg/
+renderer-wasm/.wasm-pack/
+wasm-pack.log
+
+# pnpm and web dependencies
+node_modules/
+.pnpm-store/
+
+# Web build and tool caches
+dist/
+build/
+.cache/
+.vite/
+.parcel-cache/
+.turbo/
+.eslintcache
+
+# Tests, coverage, and generated reports
+coverage/
+lcov.info
+*.profraw
+*.profdata
+playwright-report/
+test-results/
+blob-report/
+/artifacts/
+
+# Local environment and logs
+.env
+.env.*
+!.env.example
+*.log
+pnpm-debug.log*
+
+# Temporary files
+.tmp/
+tmp/
+*.tmp
+*.temp
