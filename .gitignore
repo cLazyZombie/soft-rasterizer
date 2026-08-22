@@ -27,6 +27,7 @@ target/
 # wasm-pack generated outputs
 renderer-wasm/pkg/
 renderer-wasm/.wasm-pack/
+web/pkg/
 wasm-pack.log
 
 # pnpm and web dependencies

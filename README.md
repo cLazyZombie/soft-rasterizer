@@ -2,7 +2,58 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약으로 시작합니다. 각 장의 수식, 불변조건, 테스트 기준을 먼저 이해한 뒤 `renderer-core`, `renderer-wasm`, `web`을 단계적으로 구현합니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 1장에서는 Rust가 소유한 RGBA8/깊이 버퍼를 프레임마다 지우고, Wasm 메모리 뷰를 통해 Canvas 2D에 표시하는 경로까지 연결되어 있습니다.
+
+## 실행 방법
+
+필요한 도구는 Rust stable/nightly, `wasm32-unknown-unknown` target, `wasm-pack`, Node.js와 `pnpm`입니다. 처음 한 번 의존성과 E2E용 Chromium을 설치합니다.
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install wasm-pack
+pnpm install --frozen-lockfile
+pnpm exec playwright install chromium
+```
+
+전체 검증까지 실행하려면 coverage와 Rust 중복 검사 도구도 설치합니다.
+
+```bash
+rustup toolchain install nightly --component llvm-tools-preview
+cargo install cargo-llvm-cov
+brew install corca-ai/tap/nose
+```
+
+개발 서버는 dev Wasm을 빌드한 뒤 Vite를 실행합니다.
+
+```bash
+pnpm run dev
+```
+
+터미널에 표시된 주소(기본값 `http://127.0.0.1:5173`)를 브라우저에서 엽니다. Canvas 내부 버퍼는 물리 픽셀 수가 아니라 CSS 논리 해상도를 사용합니다. 예를 들어 화면 폭이 물리 1920px이고 `devicePixelRatio`가 2라면 내부 폭은 960px입니다. 창 크기나 화면 배율이 바뀌면 `Renderer::resize`로 색/깊이 버퍼를 함께 다시 만들고 오래된 Wasm `TypedArray` view를 버립니다.
+
+release Wasm과 정적 웹 파일은 다음 명령으로 `dist/`에 만듭니다.
+
+```bash
+pnpm run build
+pnpm exec vite preview --config vite.config.js
+```
+
+주요 검증 명령은 다음과 같습니다.
+
+```bash
+pnpm run format:check
+pnpm run check
+pnpm run lint
+pnpm run test
+pnpm run e2e:smoke
+pnpm run e2e
+pnpm run e2e:headed
+pnpm run check:duplication
+pnpm run coverage
+pnpm run verify
+```
+
+`pnpm run verify`는 frozen install부터 format, 전체 headless E2E, Rust 중복 검사, 마지막 clean coverage까지 저장소 표준 순서로 실행합니다. 실제 창 lifecycle과 DPR 경계를 확인할 때는 test automation 빌드까지 포함하는 `pnpm run e2e:headed`를 사용합니다.
 
 ## 먼저 읽기
 
@@ -86,4 +137,4 @@ tests/            결정적 fixture, golden, browser 통합 검사
 docs/decisions/   결과 전체에 영향을 주는 확정 규약
 ```
 
-구현과 검증 명령은 scaffold가 추가되는 장에서 [저장소 작업 지침](AGENTS.md)의 canonical `pnpm` 진입점에 연결합니다.
+구현과 검증 명령은 [저장소 작업 지침](AGENTS.md)의 canonical `pnpm` 진입점에 연결되어 있습니다.

@@ -1,0 +1,157 @@
+import init, { Renderer } from "./pkg/renderer_wasm.js";
+import { FramebufferPresenter } from "./present.js";
+
+const MAX_FRAME_DT_SECONDS = 0.1;
+
+// clientWidth/clientHeight는 물리 픽셀이 아니라 이미 DPR로 나눈 CSS 논리 픽셀이다.
+// 따라서 1920 물리 픽셀 화면이 DPR 2라면 960 논리 픽셀만 렌더링한다.
+function logicalRenderSize(canvas) {
+  return {
+    width: Math.max(1, canvas.clientWidth),
+    height: Math.max(1, canvas.clientHeight),
+  };
+}
+
+function rendererStats(renderer) {
+  return {
+    frameIndex: renderer.stats_frame_index(),
+    dtSeconds: renderer.stats_dt_seconds(),
+    inputVertices: renderer.stats_input_vertices(),
+    inputTriangles: renderer.stats_input_triangles(),
+    clippedTriangles: renderer.stats_clipped_triangles(),
+    rasterizedTriangles: renderer.stats_rasterized_triangles(),
+    shadedSamples: renderer.stats_shaded_samples(),
+    invalidValues: renderer.stats_invalid_values(),
+  };
+}
+
+function canvasPixelHash(context, width, height) {
+  const bytes = context.getImageData(0, 0, width, height).data;
+  let hash = 0x811c9dc5;
+  for (const byte of bytes) {
+    hash ^= byte;
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, "0");
+}
+
+async function bootstrap() {
+  const canvas = document.querySelector("#framebuffer");
+  const errorOutput = document.querySelector("#error");
+  const context = canvas.getContext("2d", { alpha: false });
+  if (context === null) {
+    throw new Error("Canvas 2D context를 만들 수 없습니다.");
+  }
+
+  const wasm = await init();
+  const initialSize = logicalRenderSize(canvas);
+  canvas.width = initialSize.width;
+  canvas.height = initialSize.height;
+  const renderer = new Renderer(initialSize.width, initialSize.height);
+  const presenter = new FramebufferPresenter(context, wasm.memory, renderer);
+  let previousTimestamp = null;
+  let updateCalls = 0;
+  let resizeEvents = 0;
+  let resizeScheduled = false;
+
+  const updateStatus = () => {
+    document.querySelector("#internal-size").textContent = `${renderer.width()} × ${renderer.height()} px`;
+    document.querySelector("#css-size").textContent = `${canvas.clientWidth} × ${canvas.clientHeight} CSS px`;
+    document.querySelector("#display-scale").textContent = `${window.devicePixelRatio || 1}× (논리 해상도 사용)`;
+    document.querySelector("#present-path").textContent = "Rust/Wasm RGBA8 → Canvas 2D";
+    document.querySelector("#frame-index").textContent = String(renderer.stats_frame_index());
+  };
+
+  const renderFrame = (dtSeconds) => {
+    renderer.update_and_render(dtSeconds);
+    updateCalls += 1;
+    presenter.present();
+    updateStatus();
+  };
+
+  const applyDisplayResize = () => {
+    resizeScheduled = false;
+    const size = logicalRenderSize(canvas);
+    if (size.width === renderer.width() && size.height === renderer.height()) {
+      updateStatus();
+      return;
+    }
+    if (!renderer.resize(size.width, size.height)) {
+      errorOutput.textContent = renderer.last_error();
+      return;
+    }
+    canvas.width = size.width;
+    canvas.height = size.height;
+    resizeEvents += 1;
+    presenter.present();
+    updateStatus();
+  };
+
+  const scheduleDisplayResize = () => {
+    if (!resizeScheduled) {
+      resizeScheduled = true;
+      requestAnimationFrame(applyDisplayResize);
+    }
+  };
+
+  const resizeObserver = new ResizeObserver(scheduleDisplayResize);
+  resizeObserver.observe(canvas);
+  window.addEventListener("resize", scheduleDisplayResize);
+
+  const snapshot = () => ({
+    internalSize: [renderer.width(), renderer.height()],
+    cssSize: [canvas.clientWidth, canvas.clientHeight],
+    deviceScaleFactor: window.devicePixelRatio || 1,
+    framebufferLength: renderer.framebuffer_len(),
+    framebufferGeneration: renderer.framebuffer_generation(),
+    typedArrayViewRebuilds: presenter.viewRebuilds,
+    updateAndRenderCalls: updateCalls,
+    resizeEvents,
+    contextKind: "2d",
+    pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
+    stats: rendererStats(renderer),
+  });
+
+  const onAnimationFrame = (timestamp) => {
+    const dtSeconds =
+      previousTimestamp === null
+        ? 0
+        : Math.min(Math.max((timestamp - previousTimestamp) / 1000, 0), MAX_FRAME_DT_SECONDS);
+    previousTimestamp = timestamp;
+    renderFrame(dtSeconds);
+
+    if (__AUTOMATION__) {
+      window.__softRasterizer = Object.freeze({
+        ready: true,
+        advanceFrame(requestedDtSeconds) {
+          renderFrame(requestedDtSeconds);
+          return snapshot();
+        },
+        applyDisplayResize,
+        growMemory(pages = 1) {
+          const previousBuffer = wasm.memory.buffer;
+          const previousPages = wasm.memory.grow(pages);
+          return {
+            previousPages,
+            currentPages: wasm.memory.buffer.byteLength / 65_536,
+            bufferChanged: wasm.memory.buffer !== previousBuffer,
+          };
+        },
+        snapshot,
+      });
+      document.documentElement.dataset.ready = "true";
+    } else {
+      requestAnimationFrame(onAnimationFrame);
+    }
+  };
+
+  requestAnimationFrame(onAnimationFrame);
+  errorOutput.textContent = "";
+}
+
+bootstrap().catch((error) => {
+  const message = error instanceof Error ? error.message : String(error);
+  document.querySelector("#error").textContent = message;
+  document.documentElement.dataset.ready = "error";
+  throw error;
+});

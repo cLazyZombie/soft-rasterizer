@@ -1,0 +1,31 @@
+{
+  "name": "soft-rasterizer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@11.20.0",
+  "scripts": {
+    "wasm:dev": "wasm-pack build renderer-wasm --dev --target web --out-dir ../web/pkg --out-name renderer_wasm",
+    "wasm:release": "wasm-pack build renderer-wasm --release --target web --out-dir ../web/pkg --out-name renderer_wasm",
+    "dev": "pnpm run wasm:dev && vite --config vite.config.js",
+    "build:test": "pnpm run wasm:release && vite build --config vite.config.js --mode test",
+    "format:check": "cargo fmt --all -- --check",
+    "check": "cargo check --workspace --all-targets && cargo check -p renderer-wasm --target wasm32-unknown-unknown",
+    "lint": "cargo clippy --workspace --all-targets -- -D warnings && eslint vite.config.js playwright.config.js eslint.config.js web tests scripts",
+    "test": "cargo test --workspace",
+    "build": "pnpm run wasm:release && vite build --config vite.config.js",
+    "e2e:smoke": "pnpm run build:test && SOFT_RASTERIZER_E2E_MODE=headless playwright test --grep @smoke",
+    "e2e": "pnpm run build:test && SOFT_RASTERIZER_E2E_MODE=headless playwright test",
+    "e2e:headed": "pnpm run build:test && SOFT_RASTERIZER_E2E_MODE=headed playwright test --headed",
+    "check:duplication": "bash scripts/check_duplication.sh && node --test scripts/check_duplication.test.mjs",
+    "coverage": "bash scripts/coverage.sh",
+    "verify": "bash scripts/verify.sh"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@playwright/test": "1.62.1",
+    "eslint": "10.9.0",
+    "globals": "17.11.0",
+    "vite": "8.2.2"
+  }
+}
