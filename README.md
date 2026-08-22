@@ -20,6 +20,7 @@ pnpm exec playwright install chromium
 ```bash
 rustup toolchain install nightly --component llvm-tools-preview
 cargo install cargo-llvm-cov
+cargo install --git https://github.com/cLazyZombie/lcov_filter --force
 brew install corca-ai/tap/nose
 ```
 
@@ -54,6 +55,8 @@ pnpm run verify
 ```
 
 `pnpm run verify`는 frozen install부터 format, 전체 headless E2E, Rust 중복 검사, 마지막 clean coverage까지 저장소 표준 순서로 실행합니다. 실제 창 lifecycle과 DPR 경계를 확인할 때는 test automation 빌드까지 포함하는 `pnpm run e2e:headed`를 사용합니다.
+
+Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source marker로만 표현합니다. 한 줄은 `LCOV_EXCL_LINE`, 최소 범위는 `LCOV_EXCL_START`/`LCOV_EXCL_STOP`, 파일 전체는 첫 번째 비어 있지 않은 줄의 `LCOV_EXCL_FILE`을 사용합니다. `LINE`, `START`, `FILE` marker에는 같은 줄의 사유가 필요합니다. 자세한 계약은 [coverage 제외 결정](docs/decisions/coverage-exclusions.md)을 따릅니다.
 
 ## 먼저 읽기
 

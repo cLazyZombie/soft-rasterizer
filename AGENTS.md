@@ -217,7 +217,11 @@ headless browser는 Wasm/Canvas 통합과 결정적 pixel 검증의 기본 경�
 - coverage는 format, build, lint, unit/property/golden, 전체 E2E와 중복 검사가 모두 끝난 뒤 마지막에 clean 상태로 실행한다. 이전 계측 결과를 재사용하는 `--no-clean`은 사용하지 않는다.
 - `pnpm run coverage`는 `cargo +nightly llvm-cov` 기반 canonical script를 호출하고 pipeline 전체에 `pipefail`을 적용해야 한다.
 - `Missing Lines`가 나오면 파일과 line을 보고하고 같은 변경에서 의미 있는 정상/실패 경로 테스트를 추가한다. runtime 분기나 오류 처리를 제거해 수치만 맞추지 않는다.
-- coverage 제외 annotation은 기본적으로 허용하지 않는다. toolchain 생성 코드처럼 실제로 제어할 수 없는 예외가 필요하면 범위와 사유를 먼저 보고하고 명시적 승인을 받아 최소 범위에만 적용한다.
+- `#[coverage(off)]`, `#![coverage(off)]`와 이를 감싼 `cfg_attr`는 사용하지 않는다. 저장소 소유 Rust 파일을 `--ignore-filename-regex`로 숨기지도 않는다. 현재 파일만 읽어도 제외 여부와 사유를 알 수 있도록 source marker만 사용한다.
+- line 제외는 같은 줄의 `// LCOV_EXCL_LINE -- <사유>`, 범위 제외는 독립된 `// LCOV_EXCL_START -- <사유>`와 `// LCOV_EXCL_STOP`을 사용한다. marker에는 구체적인 사유가 필수이며 section은 중첩하거나 닫지 않은 채 둘 수 없다.
+- 파일 전체 제외는 첫 번째 비어 있지 않은 줄의 `// LCOV_EXCL_FILE -- <사유>`만 사용한다. line/section marker와 섞지 않는다. `LCOV_EXCL_FILE`은 프로젝트가 `lcov_filter`에 추가한 확장이다.
+- coverage 제외는 기본적으로 허용하지 않는다. 먼저 테스트 seam을 만들고, 불가능하면 line, 최소 section, 파일 전체 순으로 검토한다. toolchain 생성 코드처럼 실제로 제어할 수 없는 예외가 필요하면 범위와 사유를 먼저 보고하고 명시적 승인을 받아 최소 범위에만 적용한다.
+- `pnpm run check:coverage-policy`는 workspace Rust source 전체에서 금지 annotation, marker 위치·사유·균형을 검사한다. `pnpm run coverage`는 filtered LCOV의 included/excluded/missing line과 제외 파일 목록을 출력하고, missing line이 있거나 포함 line이 0이면 실패해야 한다.
 
 ## Rust 코드 중복 검사
 
@@ -274,7 +278,7 @@ pnpm run coverage
 - 추가한 정상/반례 fixture와 debug scene
 - 실행한 네이티브, golden, Wasm build, browser 검증 명령 및 결과
 - headless/headed E2E의 scenario/step 수와 report/artifact 경로
-- Rust coverage의 대상 line 수와 `Missing Lines 0` 결과
+- Rust coverage의 included/excluded line 수, 제외 파일 목록과 `Missing Lines 0` 결과
 - Rust 중복 검사의 새/변경 family 수와 ignore/baseline 변화 여부
 - golden 차이가 있다면 정량 diff와 승인 근거
 - 성능 수치가 있다면 측정 조건과 correctness 보존 증거
