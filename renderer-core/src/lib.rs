@@ -1,9 +1,13 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 4장까지 RGBA8 패턴과 Bresenham 디버그 선을 같은 프레임버퍼에 그린다.
+//! 5장까지 RGBA8 패턴과 수학 규약을 보여 주는 Bresenham 디버그 선을 그린다.
+
+pub mod math;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+
+use math::Vec3;
 
 /// 4096 × 4096 RGBA8와 깊이 버퍼까지만 허용한다.
 pub const MAX_PIXEL_COUNT: usize = 16_777_216;
@@ -261,7 +265,7 @@ impl InputSnapshot {
     }
 }
 
-/// 렌더 타깃과 3-4장 debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-5장 debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -380,45 +384,48 @@ fn draw_debug_scene(target: &mut RenderTarget) -> u32 {
         ));
     }
 
-    let center = ScreenPoint::new(width / 4, height / 2);
-    let radius = (shortest_side / 5).max(4);
-    let half_radius = radius / 2;
-    let star = Color::rgb(255, 198, 74);
-    let offsets = [
-        (radius, half_radius),
-        (half_radius, radius),
-        (-half_radius, radius),
-        (-radius, half_radius),
-        (-radius, -half_radius),
-        (-half_radius, -radius),
-        (half_radius, -radius),
-        (radius, -half_radius),
-    ];
-    for (offset_x, offset_y) in offsets {
+    let axis_origin = ScreenPoint::new(width / 4, height / 2);
+    let axis_length = (shortest_side / 8).max(6) as f32;
+    for (axis, color) in [
+        (Vec3::X, Color::rgb(255, 64, 64)),
+        (Vec3::Y, Color::rgb(64, 255, 128)),
+        (Vec3::Z, Color::rgb(64, 128, 255)),
+    ] {
         written = written.saturating_add(target.draw_line_bresenham(
-            center,
-            ScreenPoint::new(center.x + offset_x, center.y + offset_y),
-            star,
+            axis_origin,
+            project_debug_point(axis_origin, axis, axis_length),
+            color,
         ));
     }
-    written = written.saturating_add(target.draw_point(center, white));
+    written = written.saturating_add(target.draw_point(axis_origin, white));
 
-    let triangle = [
-        ScreenPoint::new(width * 5 / 8, height * 3 / 4),
-        ScreenPoint::new(width * 3 / 4, height / 4),
-        ScreenPoint::new(width * 7 / 8, height * 3 / 4),
+    let face_origin = ScreenPoint::new(width * 3 / 4, height / 2);
+    let face_scale = (shortest_side / 5).max(8) as f32;
+    let face_vertices = [
+        Vec3::new(-0.8, -0.5, 0.0),
+        Vec3::new(0.8, -0.5, 0.0),
+        Vec3::new(0.0, 0.7, 0.0),
     ];
-    written = written.saturating_add(target.draw_wireframe_triangle(
-        triangle,
-        [
-            Color::rgb(255, 96, 112),
-            Color::rgb(92, 226, 154),
-            Color::rgb(96, 174, 255),
-        ],
-    ));
+    let triangle = face_vertices.map(|vertex| project_debug_point(face_origin, vertex, face_scale));
+    written = written
+        .saturating_add(target.draw_wireframe_triangle(triangle, [Color::rgb(174, 190, 214); 3]));
     for vertex in triangle {
         written = written.saturating_add(target.draw_point(vertex, white));
     }
+
+    let centroid = (face_vertices[0] + face_vertices[1] + face_vertices[2]) / 3.0;
+    let normal = (face_vertices[1] - face_vertices[0])
+        .cross(face_vertices[2] - face_vertices[0])
+        .normalized()
+        .expect("고정 debug 삼각형은 퇴화하지 않아야 합니다");
+    let normal_start = project_debug_point(face_origin, centroid, face_scale);
+    let normal_end = project_debug_point(face_origin, centroid + normal * 0.8, face_scale);
+    written = written.saturating_add(target.draw_line_bresenham(
+        normal_start,
+        normal_end,
+        Color::rgb(255, 210, 72),
+    ));
+    written = written.saturating_add(target.draw_point(normal_start, white));
 
     let inset = (shortest_side / 32).max(2);
     written = written.saturating_add(target.draw_rect_outline(
@@ -427,6 +434,17 @@ fn draw_debug_scene(target: &mut RenderTarget) -> u32 {
         white,
     ));
     written
+}
+
+/// 5장에서는 카메라/MVP를 미리 도입하지 않고 축 의미만 보여 주는 고정 debug 투영을 쓴다.
+/// +X는 오른쪽, +Y는 화면 위, +Z는 화면 아래-왼쪽으로 보인다.
+fn project_debug_point(origin: ScreenPoint, point: Vec3, scale: f32) -> ScreenPoint {
+    let screen_x = (point.x - 0.5 * point.z) * scale;
+    let screen_y = (-point.y + 0.5 * point.z) * scale;
+    ScreenPoint::new(
+        origin.x + screen_x.round() as i32,
+        origin.y + screen_y.round() as i32,
+    )
 }
 
 fn checked_buffer_lengths(
@@ -757,9 +775,19 @@ mod tests {
     }
 
     #[test]
-    fn chapter_four_debug_scene_matches_64_by_64_golden_hash() {
+    fn chapter_five_axis_and_normal_scene_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x0241_97d9);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x6a5c_a6a0);
+    }
+
+    #[test]
+    fn chapter_five_axis_colors_and_positive_z_normal_have_expected_directions() {
+        let renderer = Renderer::new(64, 64).expect("debug renderer should be valid");
+        let target = &renderer.target;
+        assert_eq!(pixel(target, 24, 32), [255, 64, 64, 255]);
+        assert_eq!(pixel(target, 16, 24), [64, 255, 128, 255]);
+        assert_eq!(pixel(target, 12, 36), [64, 128, 255, 255]);
+        assert_eq!(pixel(target, 43, 38), [255, 210, 72, 255]);
     }
 
     #[test]

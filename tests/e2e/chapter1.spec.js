@@ -206,7 +206,7 @@ test("framebuffer_pattern: RGBA gradient와 8x8 checker가 정확하다", async 
   recordEvidence(testInfo, snapshot, 0, browserLog, screenshotPath);
 });
 
-test("debug_lines: Bresenham grid와 wireframe이 결정적으로 켜지고 꺼진다", async ({
+test("debug_lines: 축과 법선 debug 선이 결정적으로 켜지고 꺼진다", async ({
   page,
 }, testInfo) => {
   testInfo.annotations.push(
@@ -218,7 +218,23 @@ test("debug_lines: Bresenham grid와 wireframe이 결정적으로 켜지고 꺼�
 
   const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
-  expect(initial.pixelHash).toBe("1cd4e722");
+  expect(initial.pixelHash).toBe("ebee3f1e");
+  const debugColors = await page.locator("#framebuffer").evaluate((canvas) => {
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    const at = (x, y) => Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
+    return {
+      positiveX: at(307, 270),
+      positiveY: at(240, 203),
+      positiveZ: at(206, 304),
+      faceNormal: at(677, 324),
+    };
+  });
+  expect(debugColors).toEqual({
+    positiveX: [255, 64, 64, 255],
+    positiveY: [64, 255, 128, 255],
+    positiveZ: [64, 128, 255, 255],
+    faceNormal: [255, 210, 72, 255],
+  });
   const disabled = await page.evaluate(() => {
     window.__softRasterizer.setDebugLinesEnabled(false);
     return window.__softRasterizer.advanceFrame(0);
@@ -232,15 +248,16 @@ test("debug_lines: Bresenham grid와 wireframe이 결정적으로 켜지고 꺼�
   expect(restored.stats.debugPixels).toBe(initial.stats.debugPixels);
   expect(restored.pixelHash).toBe(initial.pixelHash);
   await expect(page.locator("#line-algorithm")).toHaveText("All-octants Bresenham (Rust)");
+  await expect(page.locator("#math-convention")).toHaveText("열벡터 · LH · +Z 전방");
 
   const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
   await mkdir(screenshotDirectory, { recursive: true });
   const screenshotPath = path.join(
     screenshotDirectory,
-    `${EXECUTION_MODE}-${testInfo.project.name}-chapter4-bresenham.png`,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter5-math-debug.png`,
   );
   await page.locator("main").screenshot({ path: screenshotPath });
-  await testInfo.attach("chapter4-bresenham", { path: screenshotPath, contentType: "image/png" });
+  await testInfo.attach("chapter5-math-debug", { path: screenshotPath, contentType: "image/png" });
   expect(browserLog.errors).toEqual([]);
   recordEvidence(testInfo, restored, 0, browserLog, screenshotPath);
 });

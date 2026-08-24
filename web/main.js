@@ -78,6 +78,7 @@ async function bootstrap() {
     document.querySelector("#present-path").textContent = "Rust/Wasm RGBA8 → Canvas 2D";
     document.querySelector("#framebuffer-mib").textContent = `${framebufferMiB(currentSize).toFixed(2)} MiB`;
     document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
+    document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
       document.querySelector("#high-level-calls").textContent = String(

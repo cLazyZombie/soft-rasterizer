@@ -1,3 +1,11 @@
 {
-  "ignores": []
+  "ignores": [
+    {
+      "family_id": "649073955bc3d53f",
+      "reason": "5장 학습자가 Vec2, Vec3, Vec4의 성분별 dot, length, normalize 계약을 macro 전개 없이 직접 읽을 수 있도록 차원별 공개 구현을 명시적으로 유지한다",
+      "note": "15장 scalar pipeline 완성 뒤 수학 API의 교육적 가독성과 공통화 경계를 다시 검토한다",
+      "owner": "renderer-core",
+      "expires_at": "2027-02-28"
+    }
+  ]
 }
