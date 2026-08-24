@@ -90,11 +90,12 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     shadedSamples: 0,
     invalidValues: 0,
   });
+  expect(initial.stats.debugPixels).toBeGreaterThan(0);
 
   const afterAdvance = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
   expect(afterAdvance.stats.frameIndex).toBe(2);
   expect(afterAdvance.stats.dtSeconds).toBeCloseTo(0.1, 6);
-  expect(afterAdvance.pixelHash).not.toBe(initial.pixelHash);
+  expect(afterAdvance.pixelHash).toBe(initial.pixelHash);
   expect(afterAdvance.typedArrayViewRebuilds).toBe(1);
 
   const pixelSummary = await page.locator("#framebuffer").evaluate((canvas) => {
@@ -117,11 +118,9 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     }
     return { first, differingPixels, nonOpaquePixels };
   });
-  expect(pixelSummary).toEqual({
-    first: [24, 58, 88, 255],
-    differingPixels: 0,
-    nonOpaquePixels: 0,
-  });
+  expect(pixelSummary.first).toEqual([0, 0, 220, 255]);
+  expect(pixelSummary.differingPixels).toBeGreaterThan(0);
+  expect(pixelSummary.nonOpaquePixels).toBe(0);
 
   const requestedContexts = await page.evaluate(() => window.__requestedCanvasContexts);
   expect(requestedContexts).toEqual(["2d", "2d"]);
@@ -144,6 +143,106 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   recordEvidence(testInfo, afterAdvance, 0.1, browserLog, screenshotPath, {
     requestedCanvasContexts: requestedContexts,
   });
+});
+
+test("framebuffer_pattern: RGBA gradient와 8x8 checker가 정확하다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "framebuffer_pattern" },
+    { type: "steps", description: "8" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  const snapshot = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(false);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(snapshot.stats.debugPixels).toBe(0);
+  expect(snapshot.framebufferMiB).toBeCloseTo((960 * 540 * 4) / (1024 * 1024), 10);
+  const pixels = await page.locator("#framebuffer").evaluate((canvas) => {
+    const context = canvas.getContext("2d");
+    const data = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    const at = (x, y) => Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
+    let nonOpaquePixels = 0;
+    for (let index = 3; index < data.length; index += 4) {
+      nonOpaquePixels += Number(data[index] !== 255);
+    }
+    return {
+      topLeft: at(0, 0),
+      topRight: at(canvas.width - 1, 0),
+      bottomLeft: at(0, canvas.height - 1),
+      bottomRight: at(canvas.width - 1, canvas.height - 1),
+      tile00: at(7, 7),
+      tile10: at(8, 7),
+      tile01: at(7, 8),
+      tile11: at(8, 8),
+      nonOpaquePixels,
+    };
+  });
+  expect(pixels).toEqual({
+    topLeft: [0, 0, 220, 255],
+    topRight: [255, 0, 40, 255],
+    bottomLeft: [0, 255, 40, 255],
+    bottomRight: [255, 255, 220, 255],
+    tile00: [2, 3, 220, 255],
+    tile10: [2, 3, 40, 255],
+    tile01: [2, 4, 40, 255],
+    tile11: [2, 4, 220, 255],
+    nonOpaquePixels: 0,
+  });
+  await expect(page.locator("#framebuffer-mib")).toHaveText("1.98 MiB");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter3-pattern.png`,
+  );
+  await page.locator("#framebuffer").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter3-pattern", { path: screenshotPath, contentType: "image/png" });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, snapshot, 0, browserLog, screenshotPath);
+});
+
+test("debug_lines: Bresenham grid와 wireframe이 결정적으로 켜지고 꺼진다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "debug_lines" },
+    { type: "steps", description: "7" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(initial.stats.debugPixels).toBeGreaterThan(0);
+  expect(initial.pixelHash).toBe("1cd4e722");
+  const disabled = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(false);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(disabled.stats.debugPixels).toBe(0);
+  expect(disabled.pixelHash).not.toBe(initial.pixelHash);
+  const restored = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(true);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(restored.stats.debugPixels).toBe(initial.stats.debugPixels);
+  expect(restored.pixelHash).toBe(initial.pixelHash);
+  await expect(page.locator("#line-algorithm")).toHaveText("All-octants Bresenham (Rust)");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter4-bresenham.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter4-bresenham", { path: screenshotPath, contentType: "image/png" });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath);
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({

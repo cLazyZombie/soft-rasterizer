@@ -40,6 +40,10 @@ impl Renderer {
             .update_and_render(dt_seconds, InputSnapshot::from_packed(packed_input));
     }
 
+    pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
+        self.core.set_debug_lines_enabled(enabled);
+    }
+
     pub fn width(&self) -> u32 {
         self.core.width() as u32
     }
@@ -96,6 +100,10 @@ impl Renderer {
         self.stats().shaded_samples
     }
 
+    pub fn stats_debug_pixels(&self) -> u32 {
+        self.stats().debug_pixels
+    }
+
     pub fn stats_invalid_values(&self) -> u32 {
         self.stats().invalid_values
     }
@@ -130,6 +138,7 @@ mod tests {
         assert_eq!(renderer.stats_clipped_triangles(), 0);
         assert_eq!(renderer.stats_rasterized_triangles(), 0);
         assert_eq!(renderer.stats_shaded_samples(), 0);
+        assert!(renderer.stats_debug_pixels() > 0);
         assert_eq!(renderer.stats_invalid_values(), 0);
     }
 
@@ -141,10 +150,26 @@ mod tests {
         assert_eq!((renderer.width(), renderer.height()), (3, 2));
         assert_eq!(renderer.framebuffer_generation(), 0);
 
+        let pointer = renderer.framebuffer_ptr();
+        assert!(renderer.resize(3, 2));
+        assert_eq!(renderer.framebuffer_ptr(), pointer);
+        assert_eq!(renderer.framebuffer_generation(), 0);
+
         assert!(renderer.resize(4, 2));
         assert_eq!(renderer.last_error(), "");
         assert_eq!(renderer.framebuffer_len(), 32);
         assert_eq!(renderer.framebuffer_generation(), 1);
+    }
+
+    #[test]
+    fn adapter_toggles_bresenham_debug_pass() {
+        let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
+        renderer.set_debug_lines_enabled(false);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_debug_pixels(), 0);
+        renderer.set_debug_lines_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.stats_debug_pixels() > 0);
     }
 
     #[test]

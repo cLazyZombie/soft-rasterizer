@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 2장</title>
+    <title>소프트웨어 래스터라이저 · 4장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -81,9 +81,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>2장 · Rust-Wasm 역할 경계</h1>
+        <h1>4장 · Bresenham 디버그 선</h1>
       </div>
-      <p>프레임당 한 번의 고수준 호출로 Rust/Wasm이 만든 RGBA8 버퍼를 표시합니다.</p>
+      <p>Rust가 만든 그라데이션·8×8 체크무늬 위에 격자와 wireframe을 그립니다.</p>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <dl aria-label="렌더러 상태">
         <dt>내부 해상도</dt>
@@ -94,6 +94,10 @@
         <dd id="display-scale">초기화 중</dd>
         <dt>표시 경로</dt>
         <dd id="present-path">초기화 중</dd>
+        <dt>프레임버퍼</dt>
+        <dd id="framebuffer-mib">초기화 중</dd>
+        <dt>선 알고리즘</dt>
+        <dd id="line-algorithm">초기화 중</dd>
         <dt>프레임</dt>
         <dd id="frame-index">0</dd>
         <dt>고수준 렌더 호출</dt>

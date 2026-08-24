@@ -1,6 +1,6 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 2장에서는 브라우저 타입 없이 프레임 입력을 받고, 한 번의 호출로 렌더링한다.
+//! 4장까지 RGBA8 패턴과 Bresenham 디버그 선을 같은 프레임버퍼에 그린다.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -8,7 +8,35 @@ use std::fmt::{Display, Formatter};
 /// 4096 × 4096 RGBA8와 깊이 버퍼까지만 허용한다.
 pub const MAX_PIXEL_COUNT: usize = 16_777_216;
 const MAX_FRAME_DT_SECONDS: f32 = 0.1;
-const BACKGROUND_CYCLE_SECONDS: f32 = 2.0;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Color {
+    red: u8,
+    green: u8,
+    blue: u8,
+}
+
+impl Color {
+    pub const fn rgb(red: u8, green: u8, blue: u8) -> Self {
+        Self { red, green, blue }
+    }
+
+    pub const fn rgba(self) -> [u8; 4] {
+        [self.red, self.green, self.blue, 255]
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ScreenPoint {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl ScreenPoint {
+    pub const fn new(x: i32, y: i32) -> Self {
+        Self { x, y }
+    }
+}
 
 /// 렌더 타깃 생성 또는 크기 변경이 거부된 이유다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,12 +99,133 @@ impl RenderTarget {
         &self.depth
     }
 
-    pub fn clear(&mut self, rgb: [u8; 3]) {
+    pub fn clear_color(&mut self, color: Color) {
         for pixel in self.color.chunks_exact_mut(4) {
-            pixel.copy_from_slice(&[rgb[0], rgb[1], rgb[2], 255]);
+            pixel.copy_from_slice(&color.rgba());
         }
         self.depth.fill(f32::INFINITY);
     }
+
+    pub fn put_pixel(&mut self, point: ScreenPoint, color: Color) -> bool {
+        let (Ok(x), Ok(y)) = (usize::try_from(point.x), usize::try_from(point.y)) else {
+            return false;
+        };
+        if x >= self.width || y >= self.height {
+            return false;
+        }
+        let byte_index = 4 * (y * self.width + x);
+        self.color[byte_index..byte_index + 4].copy_from_slice(&color.rgba());
+        true
+    }
+
+    pub fn render_gradient_checker(&mut self) {
+        let x_denominator = self.width.saturating_sub(1).max(1);
+        let y_denominator = self.height.saturating_sub(1).max(1);
+        for y in 0..self.height {
+            let green = ((255 * y + y_denominator / 2) / y_denominator) as u8;
+            for x in 0..self.width {
+                let red = ((255 * x + x_denominator / 2) / x_denominator) as u8;
+                let blue = if (x / 8 + y / 8).is_multiple_of(2) {
+                    220
+                } else {
+                    40
+                };
+                let byte_index = 4 * (y * self.width + x);
+                self.color[byte_index..byte_index + 4].copy_from_slice(&[red, green, blue, 255]);
+            }
+        }
+        self.depth.fill(f32::INFINITY);
+    }
+
+    pub fn draw_point(&mut self, point: ScreenPoint, color: Color) -> u32 {
+        u32::from(self.put_pixel(point, color))
+    }
+
+    pub fn draw_line_bresenham(
+        &mut self,
+        start: ScreenPoint,
+        end: ScreenPoint,
+        color: Color,
+    ) -> u32 {
+        walk_bresenham(start, end, |point| self.put_pixel(point, color))
+    }
+
+    pub fn draw_rect_outline(
+        &mut self,
+        first: ScreenPoint,
+        second: ScreenPoint,
+        color: Color,
+    ) -> u32 {
+        let left = first.x.min(second.x);
+        let right = first.x.max(second.x);
+        let top = first.y.min(second.y);
+        let bottom = first.y.max(second.y);
+        let corners = [
+            ScreenPoint::new(left, top),
+            ScreenPoint::new(right, top),
+            ScreenPoint::new(right, bottom),
+            ScreenPoint::new(left, bottom),
+        ];
+        let mut written = 0_u32;
+        for edge in 0..4 {
+            written = written.saturating_add(self.draw_line_bresenham(
+                corners[edge],
+                corners[(edge + 1) % 4],
+                color,
+            ));
+        }
+        written
+    }
+
+    pub fn draw_wireframe_triangle(
+        &mut self,
+        vertices: [ScreenPoint; 3],
+        edge_colors: [Color; 3],
+    ) -> u32 {
+        let mut written = 0_u32;
+        for edge in 0..3 {
+            written = written.saturating_add(self.draw_line_bresenham(
+                vertices[edge],
+                vertices[(edge + 1) % 3],
+                edge_colors[edge],
+            ));
+        }
+        written
+    }
+}
+
+fn walk_bresenham(
+    start: ScreenPoint,
+    end: ScreenPoint,
+    mut visit: impl FnMut(ScreenPoint) -> bool,
+) -> u32 {
+    let (mut x0, mut y0) = (i64::from(start.x), i64::from(start.y));
+    let (x1, y1) = (i64::from(end.x), i64::from(end.y));
+    let dx = (x1 - x0).abs();
+    let step_x = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let step_y = if y0 < y1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    let mut written = 0_u32;
+
+    loop {
+        if visit(ScreenPoint::new(x0 as i32, y0 as i32)) {
+            written = written.saturating_add(1);
+        }
+        if x0 == x1 && y0 == y1 {
+            break;
+        }
+        let doubled_error = 2 * error;
+        if doubled_error >= dy {
+            error += dy;
+            x0 += step_x;
+        }
+        if doubled_error <= dx {
+            error += dx;
+            y0 += step_y;
+        }
+    }
+    written
 }
 
 /// 한 프레임의 작은 값만 복사하는 통계 snapshot이다.
@@ -90,6 +239,7 @@ pub struct FrameStats {
     pub clipped_triangles: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
+    pub debug_pixels: u32,
     pub invalid_values: u32,
 }
 
@@ -111,30 +261,33 @@ impl InputSnapshot {
     }
 }
 
-/// 렌더 타깃과 시간 상태를 소유하는 2장 Renderer다.
+/// 렌더 타깃과 3-4장 debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
-    elapsed_seconds: f32,
     stats: FrameStats,
     framebuffer_generation: u32,
+    debug_lines_enabled: bool,
 }
 
 impl Renderer {
     pub fn new(width: usize, height: usize) -> Result<Self, RenderTargetError> {
         let mut renderer = Self {
             target: RenderTarget::new(width, height)?,
-            elapsed_seconds: 0.0,
             stats: FrameStats::default(),
             framebuffer_generation: 0,
+            debug_lines_enabled: true,
         };
-        renderer.target.clear(background_rgb(0.0));
+        draw_frame(&mut renderer.target, renderer.debug_lines_enabled);
         Ok(renderer)
     }
 
     pub fn resize(&mut self, width: usize, height: usize) -> Result<(), RenderTargetError> {
+        if width == self.width() && height == self.height() {
+            return Ok(());
+        }
         let mut replacement = RenderTarget::new(width, height)?;
-        replacement.clear(background_rgb(self.elapsed_seconds));
+        draw_frame(&mut replacement, self.debug_lines_enabled);
         self.target = replacement;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
@@ -142,13 +295,12 @@ impl Renderer {
 
     pub fn update_and_render(&mut self, dt_seconds: f32, input: InputSnapshot) -> FrameStats {
         let (dt_seconds, invalid_dt) = sanitize_dt(dt_seconds);
-        self.elapsed_seconds =
-            (self.elapsed_seconds + dt_seconds).rem_euclid(BACKGROUND_CYCLE_SECONDS);
-        self.target.clear(background_rgb(self.elapsed_seconds));
+        let debug_pixels = draw_frame(&mut self.target, self.debug_lines_enabled);
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
             input_bits: input.packed_bits(),
+            debug_pixels,
             invalid_values: u32::from(invalid_dt),
             ..FrameStats::default()
         };
@@ -156,7 +308,11 @@ impl Renderer {
     }
 
     pub fn clear(&mut self, rgb: [u8; 3]) {
-        self.target.clear(rgb);
+        self.target.clear_color(Color::rgb(rgb[0], rgb[1], rgb[2]));
+    }
+
+    pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
+        self.debug_lines_enabled = enabled;
     }
 
     pub const fn width(&self) -> usize {
@@ -182,6 +338,95 @@ impl Renderer {
     pub const fn framebuffer_generation(&self) -> u32 {
         self.framebuffer_generation
     }
+}
+
+fn draw_frame(target: &mut RenderTarget, debug_lines_enabled: bool) -> u32 {
+    target.render_gradient_checker();
+    if debug_lines_enabled {
+        draw_debug_scene(target)
+    } else {
+        0
+    }
+}
+
+fn draw_debug_scene(target: &mut RenderTarget) -> u32 {
+    let width = target.width() as i32;
+    let height = target.height() as i32;
+    let shortest_side = width.min(height);
+    let white = Color::rgb(238, 244, 255);
+    if width < 16 || height < 16 {
+        return target.draw_line_bresenham(
+            ScreenPoint::new(0, 0),
+            ScreenPoint::new(width - 1, height - 1),
+            white,
+        );
+    }
+
+    let mut written = 0_u32;
+    let grid_spacing = (shortest_side / 8).max(8) as usize;
+    let grid = Color::rgb(42, 61, 84);
+    for x in (grid_spacing..width as usize).step_by(grid_spacing) {
+        written = written.saturating_add(target.draw_line_bresenham(
+            ScreenPoint::new(x as i32, 0),
+            ScreenPoint::new(x as i32, height - 1),
+            grid,
+        ));
+    }
+    for y in (grid_spacing..height as usize).step_by(grid_spacing) {
+        written = written.saturating_add(target.draw_line_bresenham(
+            ScreenPoint::new(0, y as i32),
+            ScreenPoint::new(width - 1, y as i32),
+            grid,
+        ));
+    }
+
+    let center = ScreenPoint::new(width / 4, height / 2);
+    let radius = (shortest_side / 5).max(4);
+    let half_radius = radius / 2;
+    let star = Color::rgb(255, 198, 74);
+    let offsets = [
+        (radius, half_radius),
+        (half_radius, radius),
+        (-half_radius, radius),
+        (-radius, half_radius),
+        (-radius, -half_radius),
+        (-half_radius, -radius),
+        (half_radius, -radius),
+        (radius, -half_radius),
+    ];
+    for (offset_x, offset_y) in offsets {
+        written = written.saturating_add(target.draw_line_bresenham(
+            center,
+            ScreenPoint::new(center.x + offset_x, center.y + offset_y),
+            star,
+        ));
+    }
+    written = written.saturating_add(target.draw_point(center, white));
+
+    let triangle = [
+        ScreenPoint::new(width * 5 / 8, height * 3 / 4),
+        ScreenPoint::new(width * 3 / 4, height / 4),
+        ScreenPoint::new(width * 7 / 8, height * 3 / 4),
+    ];
+    written = written.saturating_add(target.draw_wireframe_triangle(
+        triangle,
+        [
+            Color::rgb(255, 96, 112),
+            Color::rgb(92, 226, 154),
+            Color::rgb(96, 174, 255),
+        ],
+    ));
+    for vertex in triangle {
+        written = written.saturating_add(target.draw_point(vertex, white));
+    }
+
+    let inset = (shortest_side / 32).max(2);
+    written = written.saturating_add(target.draw_rect_outline(
+        ScreenPoint::new(inset, inset),
+        ScreenPoint::new(width - 1 - inset, height - 1 - inset),
+        white,
+    ));
+    written
 }
 
 fn checked_buffer_lengths(
@@ -214,25 +459,33 @@ fn sanitize_dt(dt_seconds: f32) -> (f32, bool) {
     }
 }
 
-fn background_rgb(elapsed_seconds: f32) -> [u8; 3] {
-    let phase = elapsed_seconds.rem_euclid(BACKGROUND_CYCLE_SECONDS);
-    let triangle_wave = if phase <= 1.0 { phase } else { 2.0 - phase };
-    let green = 48.0 + triangle_wave * 96.0;
-    [24, green.round() as u8, 88]
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn pixel(target: &RenderTarget, x: usize, y: usize) -> [u8; 4] {
+        let byte_index = 4 * (y * target.width() + x);
+        target.color()[byte_index..byte_index + 4]
+            .try_into()
+            .expect("pixel slice should have four bytes")
+    }
+
+    fn fnv1a(bytes: &[u8]) -> u32 {
+        bytes.iter().fold(0x811c_9dc5, |hash, byte| {
+            (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
+        })
+    }
+
     #[test]
-    fn three_by_two_target_has_expected_lengths_and_clear_values() {
+    fn target_has_expected_lengths_opaque_clear_and_depth_values() {
         let mut target = RenderTarget::new(3, 2).expect("3x2 target should be valid");
         assert_eq!((target.width(), target.height()), (3, 2));
         assert_eq!(target.color().len(), 24);
         assert_eq!(target.depth().len(), 6);
 
-        target.clear([7, 11, 13]);
+        let color = Color::rgb(7, 11, 13);
+        assert_eq!(color.rgba(), [7, 11, 13, 255]);
+        target.clear_color(color);
         assert!(
             target
                 .color()
@@ -279,9 +532,160 @@ mod tests {
     }
 
     #[test]
-    fn resize_is_atomic_and_increments_generation_only_on_success() {
+    fn two_by_two_gradient_checker_fixes_rgba_channel_and_row_order() {
+        let mut target = RenderTarget::new(2, 2).expect("2x2 target should be valid");
+        target.render_gradient_checker();
+        assert_eq!(
+            target.color(),
+            [
+                0, 0, 220, 255, 255, 0, 220, 255, 0, 255, 220, 255, 255, 255, 220, 255,
+            ]
+        );
+    }
+
+    #[test]
+    fn gradient_checker_handles_one_pixel_odd_and_wide_targets() {
+        let mut one = RenderTarget::new(1, 1).expect("1x1 target should be valid");
+        one.render_gradient_checker();
+        assert_eq!(one.color(), [0, 0, 220, 255]);
+
+        let mut odd = RenderTarget::new(17, 17).expect("odd target should be valid");
+        odd.render_gradient_checker();
+        assert_eq!(pixel(&odd, 0, 0), [0, 0, 220, 255]);
+        assert_eq!(pixel(&odd, 8, 0), [128, 0, 40, 255]);
+        assert_eq!(pixel(&odd, 0, 8), [0, 128, 40, 255]);
+        assert_eq!(pixel(&odd, 8, 8), [128, 128, 220, 255]);
+        assert_eq!(pixel(&odd, 16, 16), [255, 255, 220, 255]);
+
+        let mut wide = RenderTarget::new(257, 1).expect("wide target should be valid");
+        wide.render_gradient_checker();
+        assert_eq!(pixel(&wide, 0, 0), [0, 0, 220, 255]);
+        assert_eq!(pixel(&wide, 256, 0), [255, 0, 220, 255]);
+        assert!(wide.depth().iter().all(|depth| *depth == f32::INFINITY));
+    }
+
+    #[test]
+    fn safe_pixel_write_accepts_inside_and_rejects_every_outside_direction() {
+        let mut target = RenderTarget::new(3, 2).expect("target should be valid");
+        target.clear_color(Color::rgb(0, 0, 0));
+        let white = Color::rgb(255, 255, 255);
+        assert!(target.put_pixel(ScreenPoint::new(2, 1), white));
+        assert_eq!(pixel(&target, 2, 1), [255, 255, 255, 255]);
+        assert!(!target.put_pixel(ScreenPoint::new(-1, 0), white));
+        assert!(!target.put_pixel(ScreenPoint::new(0, -1), white));
+        assert!(!target.put_pixel(ScreenPoint::new(3, 0), white));
+        assert!(!target.put_pixel(ScreenPoint::new(0, 2), white));
+    }
+
+    #[test]
+    fn bresenham_includes_endpoints_and_connects_all_octants() {
+        let start = ScreenPoint::new(10, 10);
+        let offsets = [
+            (5, 0),
+            (5, 2),
+            (2, 5),
+            (0, 5),
+            (-2, 5),
+            (-5, 2),
+            (-5, 0),
+            (-5, -2),
+            (-2, -5),
+            (0, -5),
+            (2, -5),
+            (5, -2),
+        ];
+        for (offset_x, offset_y) in offsets {
+            let end = ScreenPoint::new(start.x + offset_x, start.y + offset_y);
+            let mut points = Vec::new();
+            let count = walk_bresenham(start, end, |point| {
+                points.push(point);
+                true
+            });
+            assert_eq!(count as usize, points.len());
+            assert_eq!(points.first(), Some(&start));
+            assert_eq!(points.last(), Some(&end));
+            assert_eq!(
+                points.len(),
+                offset_x.unsigned_abs().max(offset_y.unsigned_abs()) as usize + 1
+            );
+            assert!(points.windows(2).all(|pair| {
+                let dx = (pair[1].x - pair[0].x).abs();
+                let dy = (pair[1].y - pair[0].y).abs();
+                dx <= 1 && dy <= 1 && dx + dy >= 1
+            }));
+        }
+
+        let mut point = Vec::new();
+        assert_eq!(
+            walk_bresenham(start, start, |value| {
+                point.push(value);
+                true
+            }),
+            1
+        );
+        assert_eq!(point, [start]);
+    }
+
+    #[test]
+    fn debug_helpers_clip_writes_safely_and_keep_wireframe_vertices_connected() {
+        let mut target = RenderTarget::new(7, 7).expect("target should be valid");
+        target.clear_color(Color::rgb(0, 0, 0));
+        let white = Color::rgb(255, 255, 255);
+        assert_eq!(target.draw_point(ScreenPoint::new(-1, -1), white), 0);
+        assert_eq!(
+            target.draw_line_bresenham(ScreenPoint::new(-2, 2), ScreenPoint::new(2, 2), white,),
+            3
+        );
+        assert_eq!(
+            target.draw_line_bresenham(ScreenPoint::new(-3, -3), ScreenPoint::new(-1, -1), white,),
+            0
+        );
+        assert_eq!(
+            target.draw_rect_outline(
+                ScreenPoint::new(5, 5),
+                ScreenPoint::new(1, 1),
+                Color::rgb(200, 100, 50),
+            ),
+            20
+        );
+        let triangle = [
+            ScreenPoint::new(1, 5),
+            ScreenPoint::new(3, 1),
+            ScreenPoint::new(5, 5),
+        ];
+        assert_eq!(
+            target.draw_wireframe_triangle(
+                triangle,
+                [
+                    Color::rgb(255, 0, 0),
+                    Color::rgb(0, 255, 0),
+                    Color::rgb(0, 0, 255),
+                ],
+            ),
+            15
+        );
+        assert_eq!(pixel(&target, 2, 4), [255, 0, 0, 255]);
+        assert_eq!(pixel(&target, 4, 2), [0, 255, 0, 255]);
+        assert_eq!(pixel(&target, 4, 5), [0, 0, 255, 255]);
+        assert_eq!(pixel(&target, 1, 5), [0, 0, 255, 255]);
+        assert_eq!(pixel(&target, 3, 1), [0, 255, 0, 255]);
+        assert_eq!(pixel(&target, 5, 5), [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn resize_is_atomic_and_same_size_preserves_allocations() {
         let mut renderer = Renderer::new(3, 2).expect("renderer should be valid");
         renderer.clear([1, 2, 3]);
+        let color_pointer = renderer.color_buffer().as_ptr();
+        let depth_pointer = renderer.depth_buffer().as_ptr();
+
+        renderer
+            .resize(3, 2)
+            .expect("same-size resize should succeed");
+        assert_eq!(renderer.color_buffer().as_ptr(), color_pointer);
+        assert_eq!(renderer.depth_buffer().as_ptr(), depth_pointer);
+        assert_eq!(renderer.color_buffer()[..4], [1, 2, 3, 255]);
+        assert_eq!(renderer.framebuffer_generation(), 0);
 
         let error = renderer.resize(MAX_PIXEL_COUNT + 1, 1).unwrap_err();
         assert!(matches!(
@@ -306,9 +710,10 @@ mod tests {
     }
 
     #[test]
-    fn frame_clamps_dt_resets_stage_counts_and_animates_clear_color() {
-        let mut renderer = Renderer::new(1, 1).expect("renderer should be valid");
-        assert_eq!(renderer.color_buffer(), [24, 48, 88, 255]);
+    fn frame_clamps_dt_preserves_buffers_and_resets_debug_count_when_disabled() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        let color_pointer = renderer.color_buffer().as_ptr();
+        let depth_pointer = renderer.depth_buffer().as_ptr();
 
         let first = renderer.update_and_render(0.25, InputSnapshot::from_packed(0xa5));
         assert_eq!(first.frame_index, 1);
@@ -319,25 +724,42 @@ mod tests {
         assert_eq!(first.clipped_triangles, 0);
         assert_eq!(first.rasterized_triangles, 0);
         assert_eq!(first.shaded_samples, 0);
+        assert!(first.debug_pixels > 0);
         assert_eq!(first.invalid_values, 0);
         assert_eq!(renderer.stats(), first);
-        assert_eq!(renderer.color_buffer(), [24, 58, 88, 255]);
+        assert_eq!(renderer.color_buffer().as_ptr(), color_pointer);
+        assert_eq!(renderer.depth_buffer().as_ptr(), depth_pointer);
 
+        renderer.set_debug_lines_enabled(false);
         let negative = renderer.update_and_render(-1.0, InputSnapshot::default());
         assert_eq!(negative.dt_seconds, 0.0);
+        assert_eq!(negative.debug_pixels, 0);
         assert_eq!(negative.invalid_values, 0);
+        assert_eq!(renderer.color_buffer()[..4], [0, 0, 220, 255]);
         for invalid_dt in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             let stats = renderer.update_and_render(invalid_dt, InputSnapshot::default());
             assert_eq!(stats.dt_seconds, 0.0);
+            assert_eq!(stats.debug_pixels, 0);
             assert_eq!(stats.invalid_values, 1);
         }
+        assert_eq!(renderer.color_buffer().as_ptr(), color_pointer);
+        assert_eq!(renderer.depth_buffer().as_ptr(), depth_pointer);
+
+        let mut tiny = Renderer::new(1, 1).expect("tiny renderer should be valid");
+        assert_eq!(tiny.color_buffer(), [238, 244, 255, 255]);
+        tiny.set_debug_lines_enabled(false);
+        assert_eq!(
+            tiny.update_and_render(0.0, InputSnapshot::default())
+                .debug_pixels,
+            0
+        );
+        assert_eq!(tiny.color_buffer(), [0, 0, 220, 255]);
     }
 
     #[test]
-    fn background_triangle_wave_reverses_and_wraps() {
-        assert_eq!(background_rgb(1.0), [24, 144, 88]);
-        assert_eq!(background_rgb(1.5), [24, 96, 88]);
-        assert_eq!(background_rgb(2.0), [24, 48, 88]);
+    fn chapter_four_debug_scene_matches_64_by_64_golden_hash() {
+        let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x0241_97d9);
     }
 
     #[test]

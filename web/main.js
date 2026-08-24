@@ -22,6 +22,7 @@ function rendererStats(renderer) {
     clippedTriangles: renderer.stats_clipped_triangles(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),
+    debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
   };
 }
@@ -33,6 +34,10 @@ function collectInputSnapshot() {
 
 function formatMilliseconds(value) {
   return `${value.toFixed(3)} ms`;
+}
+
+function framebufferMiB(size) {
+  return (size.width * size.height * 4) / (1024 * 1024);
 }
 
 function canvasPixelHash(context, width, height) {
@@ -71,6 +76,8 @@ async function bootstrap() {
     document.querySelector("#css-size").textContent = `${canvas.clientWidth} × ${canvas.clientHeight} CSS px`;
     document.querySelector("#display-scale").textContent = `${window.devicePixelRatio || 1}× (논리 해상도 사용)`;
     document.querySelector("#present-path").textContent = "Rust/Wasm RGBA8 → Canvas 2D";
+    document.querySelector("#framebuffer-mib").textContent = `${framebufferMiB(currentSize).toFixed(2)} MiB`;
+    document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
       document.querySelector("#high-level-calls").textContent = String(
@@ -152,6 +159,7 @@ async function bootstrap() {
     cssSize: [canvas.clientWidth, canvas.clientHeight],
     deviceScaleFactor: window.devicePixelRatio || 1,
     framebufferLength: renderer.framebuffer_len(),
+    framebufferMiB: framebufferMiB(currentSize),
     framebufferGeneration: renderer.framebuffer_generation(),
     typedArrayViewRebuilds: presenter.viewRebuilds,
     updateAndRenderCalls: updateCalls,
@@ -178,6 +186,9 @@ async function bootstrap() {
           return snapshot();
         },
         applyDisplayResize,
+        setDebugLinesEnabled(enabled) {
+          renderer.set_debug_lines_enabled(enabled);
+        },
         growMemory(pages = 1) {
           const previousBuffer = wasm.memory.buffer;
           const previousPages = wasm.memory.grow(pages);
