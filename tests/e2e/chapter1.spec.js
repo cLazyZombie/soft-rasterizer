@@ -83,7 +83,7 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   expect(initial.stats).toMatchObject({
     frameIndex: 1,
     inputBits: 0,
-    inputVertices: 0,
+    inputVertices: 8,
     inputTriangles: 0,
     clippedTriangles: 0,
     rasterizedTriangles: 0,
@@ -95,7 +95,7 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   const afterAdvance = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
   expect(afterAdvance.stats.frameIndex).toBe(2);
   expect(afterAdvance.stats.dtSeconds).toBeCloseTo(0.1, 6);
-  expect(afterAdvance.pixelHash).toBe(initial.pixelHash);
+  expect(afterAdvance.pixelHash).not.toBe(initial.pixelHash);
   expect(afterAdvance.typedArrayViewRebuilds).toBe(1);
 
   const pixelSummary = await page.locator("#framebuffer").evaluate((canvas) => {
@@ -206,35 +206,41 @@ test("framebuffer_pattern: RGBA gradient와 8x8 checker가 정확하다", async 
   recordEvidence(testInfo, snapshot, 0, browserLog, screenshotPath);
 });
 
-test("debug_lines: 축과 법선 debug 선이 결정적으로 켜지고 꺼진다", async ({
+test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진단을 표시한다", async ({
   page,
 }, testInfo) => {
   testInfo.annotations.push(
-    { type: "scenario", description: "debug_lines" },
-    { type: "steps", description: "7" },
+    { type: "scenario", description: "coordinate_spaces" },
+    { type: "steps", description: "12" },
   );
   const browserLog = observeBrowserLog(page);
   await openReadyPage(page);
 
   const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
-  expect(initial.pixelHash).toBe("ebee3f1e");
-  const debugColors = await page.locator("#framebuffer").evaluate((canvas) => {
+  expect(initial.stats.inputVertices).toBe(8);
+  expect(initial.pixelHash).toBe("1a480e35");
+  const stageColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
-    const at = (x, y) => Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
-    return {
-      positiveX: at(307, 270),
-      positiveY: at(240, 203),
-      positiveZ: at(206, 304),
-      faceNormal: at(677, 324),
-    };
+    const expected = [
+      [238, 244, 255, 255],
+      [255, 210, 72, 255],
+      [72, 224, 194, 255],
+      [184, 132, 255, 255],
+    ];
+    const counts = Array(expected.length).fill(0);
+    for (let index = 0; index < data.length; index += 4) {
+      expected.forEach((color, colorIndex) => {
+        if (color.every((channel, offset) => data[index + offset] === channel)) {
+          counts[colorIndex] += 1;
+        }
+      });
+    }
+    return counts;
   });
-  expect(debugColors).toEqual({
-    positiveX: [255, 64, 64, 255],
-    positiveY: [64, 255, 128, 255],
-    positiveZ: [64, 128, 255, 255],
-    faceNormal: [255, 210, 72, 255],
-  });
+  expect(stageColorCounts.every((count) => count > 0)).toBe(true);
+  await expect(page.locator("#coordinate-debug")).toContainText("선택 정점 v6");
+  await expect(page.locator("#coordinate-debug")).toContainText("invalid values: 0");
   const disabled = await page.evaluate(() => {
     window.__softRasterizer.setDebugLinesEnabled(false);
     return window.__softRasterizer.advanceFrame(0);
@@ -247,6 +253,22 @@ test("debug_lines: 축과 법선 debug 선이 결정적으로 켜지고 꺼진�
   });
   expect(restored.stats.debugPixels).toBe(initial.stats.debugPixels);
   expect(restored.pixelHash).toBe(initial.pixelHash);
+  const rotated = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
+  expect(rotated.pixelHash).not.toBe(initial.pixelHash);
+  await expect(page.locator("#coordinate-debug")).toContainText("model Y 0.075 rad");
+
+  const invalid = await page.evaluate(() => {
+    window.__softRasterizer.setModelRotationY(Number.NaN);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(invalid.stats.invalidValues).toBe(24);
+  await expect(page.locator("#coordinate-debug")).toContainText("첫 공간: World");
+  const recovered = await page.evaluate(() => {
+    window.__softRasterizer.setModelRotationY(0);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(recovered.stats.invalidValues).toBe(0);
+  expect(recovered.pixelHash).toBe(initial.pixelHash);
   await expect(page.locator("#line-algorithm")).toHaveText("All-octants Bresenham (Rust)");
   await expect(page.locator("#math-convention")).toHaveText("열벡터 · LH · +Z 전방");
 
@@ -254,12 +276,15 @@ test("debug_lines: 축과 법선 debug 선이 결정적으로 켜지고 꺼진�
   await mkdir(screenshotDirectory, { recursive: true });
   const screenshotPath = path.join(
     screenshotDirectory,
-    `${EXECUTION_MODE}-${testInfo.project.name}-chapter5-math-debug.png`,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter6-coordinate-spaces.png`,
   );
   await page.locator("main").screenshot({ path: screenshotPath });
-  await testInfo.attach("chapter5-math-debug", { path: screenshotPath, contentType: "image/png" });
+  await testInfo.attach("chapter6-coordinate-spaces", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
   expect(browserLog.errors).toEqual([]);
-  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath);
+  recordEvidence(testInfo, recovered, 0, browserLog, screenshotPath, { stageColorCounts });
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({
@@ -275,7 +300,7 @@ test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하
   const before = await page.evaluate(() => window.__softRasterizer.snapshot());
   expect(before.lastFrameMetrics).toMatchObject({
     highLevelRenderCalls: 1,
-    wasmBoundaryCalls: 5,
+    wasmBoundaryCalls: 6,
   });
   for (const value of [
     before.lastFrameMetrics.inputMs,
@@ -294,11 +319,11 @@ test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하
   const after = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.05));
   expect(after.lastFrameMetrics).toMatchObject({
     highLevelRenderCalls: 1,
-    wasmBoundaryCalls: 5,
+    wasmBoundaryCalls: 6,
   });
   expect(after.stats.inputBits).toBe(0);
   await expect(page.locator("#high-level-calls")).toHaveText("1");
-  await expect(page.locator("#wasm-boundary-calls")).toHaveText("5");
+  await expect(page.locator("#wasm-boundary-calls")).toHaveText("6");
   await expect(page.locator("#frame-time")).toHaveText(/^\d+\.\d{3} ms$/);
   const constructorError = await page.evaluate(() =>
     window.__softRasterizer.invalidConstructorError(),

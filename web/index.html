@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 5장</title>
+    <title>소프트웨어 래스터라이저 · 6장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -75,16 +75,34 @@
         margin-top: 12px;
         color: #ff9f9f;
       }
+
+      .space-legend {
+        margin: 12px 0 0;
+        color: #dbe7fb;
+      }
+
+      #coordinate-debug {
+        overflow-x: auto;
+        margin: 12px 0 0;
+        padding: 12px;
+        border: 1px solid #43516b;
+        background: #101a2b;
+        color: #dbe7fb;
+        font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+        white-space: pre;
+      }
     </style>
   </head>
   <body>
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>5장 · 벡터와 행렬</h1>
+        <h1>6장 · 좌표 공간과 MVP 변환</h1>
       </div>
-      <p>Rust core의 열벡터·LH/+Z 규약으로 축과 삼각형 법선 debug 선을 그립니다.</p>
+      <p>Rust core가 회전 큐브의 Object → World → View → Clip 단계를 계산합니다.</p>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
+      <p class="space-legend">Object 흰색 · World 노랑 · View 청록 · Clip 보라 · 선택 정점 흰색</p>
+      <pre id="coordinate-debug" aria-label="선택 정점 좌표와 공간별 범위">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
         <dt>내부 해상도</dt>
         <dd id="internal-size">초기화 중</dd>

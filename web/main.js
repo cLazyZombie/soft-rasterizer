@@ -70,6 +70,7 @@ async function bootstrap() {
   let resizeScheduled = false;
   let currentSize = initialSize;
   let lastFrameMetrics = null;
+  let coordinateDebugText = "좌표 계산 대기 중";
 
   const updateStatus = () => {
     document.querySelector("#internal-size").textContent = `${currentSize.width} × ${currentSize.height} px`;
@@ -79,6 +80,7 @@ async function bootstrap() {
     document.querySelector("#framebuffer-mib").textContent = `${framebufferMiB(currentSize).toFixed(2)} MiB`;
     document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
+    document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
       document.querySelector("#high-level-calls").textContent = String(
@@ -109,6 +111,7 @@ async function bootstrap() {
     const inputEnd = performance.now();
     const updateStart = performance.now();
     renderer.update_and_render(dtSeconds, packedInput);
+    coordinateDebugText = renderer.coordinate_debug_text();
     const updateEnd = performance.now();
     updateCalls += 1;
     const presentStart = performance.now();
@@ -116,7 +119,7 @@ async function bootstrap() {
     const presentEnd = performance.now();
     lastFrameMetrics = {
       highLevelRenderCalls: 1,
-      wasmBoundaryCalls: 1 + presentBoundaryCalls,
+      wasmBoundaryCalls: 2 + presentBoundaryCalls,
       inputMs: inputEnd - inputStart,
       updateMs: updateEnd - updateStart,
       presentMs: presentEnd - presentStart,
@@ -189,6 +192,9 @@ async function bootstrap() {
         applyDisplayResize,
         setDebugLinesEnabled(enabled) {
           renderer.set_debug_lines_enabled(enabled);
+        },
+        setModelRotationY(rotationYRadians) {
+          renderer.set_model_rotation_y(rotationYRadians);
         },
         growMemory(pages = 1) {
           const previousBuffer = wasm.memory.buffer;
