@@ -56,12 +56,12 @@ pnpm run verify
 
 `pnpm run verify`는 frozen install부터 format, 전체 headless E2E, Rust 중복 검사, 마지막 clean coverage까지 저장소 표준 순서로 실행합니다. 실제 창 lifecycle과 DPR 경계를 확인할 때는 test automation 빌드까지 포함하는 `pnpm run e2e:headed`를 사용합니다.
 
-Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source marker로만 표현합니다. 한 줄은 `LCOV_EXCL_LINE`, 최소 범위는 `LCOV_EXCL_START`/`LCOV_EXCL_STOP`, 파일 전체는 첫 번째 비어 있지 않은 줄의 `LCOV_EXCL_FILE`을 사용합니다. `LINE`, `START`, `FILE` marker에는 같은 줄의 사유가 필요합니다. 자세한 계약은 [coverage 제외 결정](docs/decisions/coverage-exclusions.md)을 따릅니다.
+Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source marker로만 표현합니다. 한 줄은 `LCOV_EXCL_LINE`, 최소 범위는 `LCOV_EXCL_START`/`LCOV_EXCL_STOP`, 파일 전체는 첫 번째 비어 있지 않은 줄의 `LCOV_EXCL_FILE`을 사용합니다. `LINE`, `START`, `FILE` marker에는 같은 줄의 사유가 필요합니다. 자세한 계약은 [coverage 제외 결정](doc/decisions/coverage-exclusions.md)을 따릅니다.
 
 ## 먼저 읽기
 
 - [전체 과정 소개와 목차](doc/00-들어가며.md)
-- [좌표·카메라·깊이 결정](docs/decisions/coordinates.md)
+- [좌표·카메라·깊이 결정](doc/decisions/coordinates.md)
 - [코딩 에이전트와 장별로 일하는 방법](doc/appendix-a-코딩-에이전트와-장별로-일하는-방법.md)
 - [최소 공개 계약과 데이터 구조](doc/appendix-b-최소-공개-계약과-데이터-구조.md)
 - [수학과 알고리즘 빠른 참조](doc/appendix-c-수학과-알고리즘-빠른-참조.md)
@@ -76,7 +76,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - screen y-down, `orient2d > 0` front face, 고정소수점 top-left coverage
 - Rust/Wasm이 픽셀을 만들고 Canvas 2D는 완성된 RGBA8 이미지만 표시
 
-세부 수식과 외부 에셋 변환 규칙은 [좌표계 결정 문서](docs/decisions/coordinates.md)를 기준으로 합니다.
+세부 수식과 외부 에셋 변환 규칙은 [좌표계 결정 문서](doc/decisions/coordinates.md)를 기준으로 합니다.
 
 ## 교재
 
@@ -137,7 +137,7 @@ renderer-core/    순수 Rust 수학·장면·클리핑·래스터화·프레임
 renderer-wasm/    renderer-core를 감싸는 얇은 wasm-bindgen adapter
 web/              Canvas 2D 표시, rAF, 입력, 파일·이미지 디코딩
 tests/            결정적 fixture, golden, browser 통합 검사
-docs/decisions/   결과 전체에 영향을 주는 확정 규약
+doc/decisions/    결과 전체에 영향을 주는 확정 규약
 ```
 
 구현과 검증 명령은 [저장소 작업 지침](AGENTS.md)의 canonical `pnpm` 진입점에 연결되어 있습니다.

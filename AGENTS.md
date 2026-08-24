@@ -12,7 +12,7 @@
 - 증상별 진단 순서: `doc/appendix-d-화면-증상으로-찾는-오류-단계.md`
 - 최종 평가 기준: `doc/appendix-e-최종-capstone-평가표.md`
 
-작업을 시작하기 전에 현재 장과 직접 관련된 문서를 읽는다. 문서 전체를 한 번에 구현 범위로 간주하지 않는다. 현재 코드, 테스트 또는 `docs/decisions/`의 확정된 결정이 교재와 다르면 조용히 한쪽에 맞추지 말고 차이와 영향 범위를 먼저 밝힌다.
+작업을 시작하기 전에 현재 장과 직접 관련된 문서를 읽는다. 문서 전체를 한 번에 구현 범위로 간주하지 않는다. 현재 코드, 테스트 또는 `doc/decisions/`의 확정된 결정이 교재와 다르면 조용히 한쪽에 맞추지 말고 차이와 영향 범위를 먼저 밝힌다.
 
 ## 작업 시작 원칙
 
@@ -42,7 +42,7 @@
 - `renderer-wasm/`: `renderer-core`를 감싸는 얇은 `wasm-bindgen` adapter. 생성자, 프레임 단위 호출, resize, asset upload와 작은 getter만 노출한다.
 - `web/`: DOM/Canvas, 파일과 이미지 디코딩, `requestAnimationFrame`, Pointer/Keyboard 이벤트, UI와 표시를 담당한다. 픽셀 생성이나 삼각형 채우기를 대신하지 않는다.
 - `tests/`: 작은 결정적 scene, golden 결과와 브라우저 통합 검사를 둔다.
-- `docs/decisions/`: 좌표, 깊이, 색, 샘플링처럼 결과 전체에 영향을 주는 확정 규약을 기록한다.
+- `doc/decisions/`: 좌표, 깊이, 색, 샘플링처럼 결과 전체에 영향을 주는 확정 규약을 기록한다.
 
 다음 경계는 유지한다.
 
