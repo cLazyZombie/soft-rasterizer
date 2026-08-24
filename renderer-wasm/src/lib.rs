@@ -1,9 +1,10 @@
 //! `renderer-core`를 브라우저가 프레임 단위로 호출할 수 있게 하는 얇은 어댑터.
 
-use renderer_core::{FrameStats, Renderer as CoreRenderer};
+use renderer_core::{FrameStats, InputSnapshot, Renderer as CoreRenderer};
 use wasm_bindgen::prelude::*;
 
 #[wasm_bindgen]
+#[derive(Debug)]
 pub struct Renderer {
     core: CoreRenderer,
     last_error: String,
@@ -12,13 +13,13 @@ pub struct Renderer {
 #[wasm_bindgen]
 impl Renderer {
     #[wasm_bindgen(constructor)]
-    pub fn new(width: u32, height: u32) -> Self {
+    pub fn new(width: u32, height: u32) -> Result<Self, String> {
         let core = CoreRenderer::new(width as usize, height as usize)
-            .unwrap_or_else(|error| panic!("Renderer 생성 실패: {error}"));
-        Self {
+            .map_err(|error| error.to_string())?;
+        Ok(Self {
             core,
             last_error: String::new(),
-        }
+        })
     }
 
     pub fn resize(&mut self, width: u32, height: u32) -> bool {
@@ -34,8 +35,9 @@ impl Renderer {
         }
     }
 
-    pub fn update_and_render(&mut self, dt_seconds: f32) {
-        self.core.update_and_render(dt_seconds);
+    pub fn update_and_render(&mut self, dt_seconds: f32, packed_input: u32) {
+        self.core
+            .update_and_render(dt_seconds, InputSnapshot::from_packed(packed_input));
     }
 
     pub fn width(&self) -> u32 {
@@ -68,6 +70,10 @@ impl Renderer {
 
     pub fn stats_dt_seconds(&self) -> f32 {
         self.stats().dt_seconds
+    }
+
+    pub fn stats_input_bits(&self) -> u32 {
+        self.stats().input_bits
     }
 
     pub fn stats_input_vertices(&self) -> u32 {
@@ -107,17 +113,18 @@ mod tests {
     use renderer_core::MAX_PIXEL_COUNT;
 
     #[test]
-    fn adapter_exposes_framebuffer_and_zeroed_chapter_one_stats() {
-        let mut renderer = Renderer::new(3, 2);
+    fn adapter_exposes_framebuffer_input_and_zeroed_pipeline_stats() {
+        let mut renderer = Renderer::new(3, 2).expect("adapter should be valid");
         assert_eq!((renderer.width(), renderer.height()), (3, 2));
         assert!(!renderer.framebuffer_ptr().is_null());
         assert_eq!(renderer.framebuffer_len(), 24);
         assert_eq!(renderer.framebuffer_generation(), 0);
         assert_eq!(renderer.last_error(), "");
 
-        renderer.update_and_render(0.016);
+        renderer.update_and_render(0.016, 0xa5);
         assert_eq!(renderer.stats_frame_index(), 1);
         assert_eq!(renderer.stats_dt_seconds(), 0.016);
+        assert_eq!(renderer.stats_input_bits(), 0xa5);
         assert_eq!(renderer.stats_input_vertices(), 0);
         assert_eq!(renderer.stats_input_triangles(), 0);
         assert_eq!(renderer.stats_clipped_triangles(), 0);
@@ -128,7 +135,7 @@ mod tests {
 
     #[test]
     fn adapter_resize_reports_error_without_destroying_valid_target() {
-        let mut renderer = Renderer::new(3, 2);
+        let mut renderer = Renderer::new(3, 2).expect("adapter should be valid");
         assert!(!renderer.resize((MAX_PIXEL_COUNT + 1) as u32, 1));
         assert!(renderer.last_error().contains("최대 허용치"));
         assert_eq!((renderer.width(), renderer.height()), (3, 2));
@@ -141,8 +148,8 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "Renderer 생성 실패")]
-    fn adapter_constructor_rejects_zero_dimensions() {
-        Renderer::new(0, 1);
+    fn adapter_constructor_returns_explicit_error_for_zero_dimensions() {
+        let error = Renderer::new(0, 1).unwrap_err();
+        assert!(error.contains("0보다"));
     }
 }

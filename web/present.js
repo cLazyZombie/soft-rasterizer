@@ -15,10 +15,15 @@ export class FramebufferPresenter {
   }
 
   present() {
+    let wasmBoundaryCalls = 0;
     const width = this.#renderer.width();
+    wasmBoundaryCalls += 1;
     const height = this.#renderer.height();
+    wasmBoundaryCalls += 1;
     const pointer = this.#renderer.framebuffer_ptr();
+    wasmBoundaryCalls += 1;
     const length = this.#renderer.framebuffer_len();
+    wasmBoundaryCalls += 1;
     const expectedLength = width * height * 4;
     if (length !== expectedLength) {
       throw new Error(`프레임버퍼 길이 불일치: expected=${expectedLength}, actual=${length}`);
@@ -39,6 +44,7 @@ export class FramebufferPresenter {
     }
 
     this.#context.putImageData(new ImageData(this.#view, width, height), 0, 0);
+    return wasmBoundaryCalls;
   }
 
   get viewRebuilds() {

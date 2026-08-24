@@ -16,6 +16,7 @@ function rendererStats(renderer) {
   return {
     frameIndex: renderer.stats_frame_index(),
     dtSeconds: renderer.stats_dt_seconds(),
+    inputBits: renderer.stats_input_bits(),
     inputVertices: renderer.stats_input_vertices(),
     inputTriangles: renderer.stats_input_triangles(),
     clippedTriangles: renderer.stats_clipped_triangles(),
@@ -23,6 +24,15 @@ function rendererStats(renderer) {
     shadedSamples: renderer.stats_shaded_samples(),
     invalidValues: renderer.stats_invalid_values(),
   };
+}
+
+function collectInputSnapshot() {
+  // 2장은 프레임 입력의 ABI만 고정한다. 키/포인터 의미와 event collector는 20장 범위다.
+  return 0;
+}
+
+function formatMilliseconds(value) {
+  return `${value.toFixed(3)} ms`;
 }
 
 function canvasPixelHash(context, width, height) {
@@ -53,26 +63,64 @@ async function bootstrap() {
   let updateCalls = 0;
   let resizeEvents = 0;
   let resizeScheduled = false;
+  let currentSize = initialSize;
+  let lastFrameMetrics = null;
 
   const updateStatus = () => {
-    document.querySelector("#internal-size").textContent = `${renderer.width()} × ${renderer.height()} px`;
+    document.querySelector("#internal-size").textContent = `${currentSize.width} × ${currentSize.height} px`;
     document.querySelector("#css-size").textContent = `${canvas.clientWidth} × ${canvas.clientHeight} CSS px`;
     document.querySelector("#display-scale").textContent = `${window.devicePixelRatio || 1}× (논리 해상도 사용)`;
     document.querySelector("#present-path").textContent = "Rust/Wasm RGBA8 → Canvas 2D";
-    document.querySelector("#frame-index").textContent = String(renderer.stats_frame_index());
+    document.querySelector("#frame-index").textContent = String(updateCalls);
+    if (lastFrameMetrics !== null) {
+      document.querySelector("#high-level-calls").textContent = String(
+        lastFrameMetrics.highLevelRenderCalls,
+      );
+      document.querySelector("#wasm-boundary-calls").textContent = String(
+        lastFrameMetrics.wasmBoundaryCalls,
+      );
+      document.querySelector("#input-time").textContent = formatMilliseconds(
+        lastFrameMetrics.inputMs,
+      );
+      document.querySelector("#update-time").textContent = formatMilliseconds(
+        lastFrameMetrics.updateMs,
+      );
+      document.querySelector("#present-time").textContent = formatMilliseconds(
+        lastFrameMetrics.presentMs,
+      );
+      document.querySelector("#frame-time").textContent = formatMilliseconds(
+        lastFrameMetrics.totalMs,
+      );
+    }
   };
 
   const renderFrame = (dtSeconds) => {
-    renderer.update_and_render(dtSeconds);
+    const frameStart = performance.now();
+    const inputStart = performance.now();
+    const packedInput = collectInputSnapshot();
+    const inputEnd = performance.now();
+    const updateStart = performance.now();
+    renderer.update_and_render(dtSeconds, packedInput);
+    const updateEnd = performance.now();
     updateCalls += 1;
-    presenter.present();
+    const presentStart = performance.now();
+    const presentBoundaryCalls = presenter.present();
+    const presentEnd = performance.now();
+    lastFrameMetrics = {
+      highLevelRenderCalls: 1,
+      wasmBoundaryCalls: 1 + presentBoundaryCalls,
+      inputMs: inputEnd - inputStart,
+      updateMs: updateEnd - updateStart,
+      presentMs: presentEnd - presentStart,
+      totalMs: presentEnd - frameStart,
+    };
     updateStatus();
   };
 
   const applyDisplayResize = () => {
     resizeScheduled = false;
     const size = logicalRenderSize(canvas);
-    if (size.width === renderer.width() && size.height === renderer.height()) {
+    if (size.width === currentSize.width && size.height === currentSize.height) {
       updateStatus();
       return;
     }
@@ -82,6 +130,7 @@ async function bootstrap() {
     }
     canvas.width = size.width;
     canvas.height = size.height;
+    currentSize = size;
     resizeEvents += 1;
     presenter.present();
     updateStatus();
@@ -106,6 +155,7 @@ async function bootstrap() {
     framebufferGeneration: renderer.framebuffer_generation(),
     typedArrayViewRebuilds: presenter.viewRebuilds,
     updateAndRenderCalls: updateCalls,
+    lastFrameMetrics,
     resizeEvents,
     contextKind: "2d",
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
@@ -136,6 +186,15 @@ async function bootstrap() {
             currentPages: wasm.memory.buffer.byteLength / 65_536,
             bufferChanged: wasm.memory.buffer !== previousBuffer,
           };
+        },
+        invalidConstructorError() {
+          try {
+            const unexpectedRenderer = new Renderer(0, 1);
+            unexpectedRenderer.free();
+            return null;
+          } catch (error) {
+            return String(error);
+          }
         },
         snapshot,
       });

@@ -1,6 +1,6 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 1장에서는 색/깊이 버퍼의 소유권, clear, resize와 프레임 통계만 다룬다.
+//! 2장에서는 브라우저 타입 없이 프레임 입력을 받고, 한 번의 호출로 렌더링한다.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -84,6 +84,7 @@ impl RenderTarget {
 pub struct FrameStats {
     pub frame_index: u32,
     pub dt_seconds: f32,
+    pub input_bits: u32,
     pub input_vertices: u32,
     pub input_triangles: u32,
     pub clipped_triangles: u32,
@@ -92,7 +93,25 @@ pub struct FrameStats {
     pub invalid_values: u32,
 }
 
-/// 렌더 타깃과 시간 상태를 소유하는 1장 Renderer다.
+/// 아직 의미를 부여하지 않은 장치 입력을 한 프레임 단위로 전달하는 작은 값이다.
+///
+/// 실제 키/포인터 비트 배치는 입력 카메라를 구현하는 20장에서 정한다.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct InputSnapshot {
+    packed_bits: u32,
+}
+
+impl InputSnapshot {
+    pub const fn from_packed(packed_bits: u32) -> Self {
+        Self { packed_bits }
+    }
+
+    pub const fn packed_bits(self) -> u32 {
+        self.packed_bits
+    }
+}
+
+/// 렌더 타깃과 시간 상태를 소유하는 2장 Renderer다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -121,7 +140,7 @@ impl Renderer {
         Ok(())
     }
 
-    pub fn update_and_render(&mut self, dt_seconds: f32) -> FrameStats {
+    pub fn update_and_render(&mut self, dt_seconds: f32, input: InputSnapshot) -> FrameStats {
         let (dt_seconds, invalid_dt) = sanitize_dt(dt_seconds);
         self.elapsed_seconds =
             (self.elapsed_seconds + dt_seconds).rem_euclid(BACKGROUND_CYCLE_SECONDS);
@@ -129,6 +148,7 @@ impl Renderer {
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
+            input_bits: input.packed_bits(),
             invalid_values: u32::from(invalid_dt),
             ..FrameStats::default()
         };
@@ -290,9 +310,10 @@ mod tests {
         let mut renderer = Renderer::new(1, 1).expect("renderer should be valid");
         assert_eq!(renderer.color_buffer(), [24, 48, 88, 255]);
 
-        let first = renderer.update_and_render(0.25);
+        let first = renderer.update_and_render(0.25, InputSnapshot::from_packed(0xa5));
         assert_eq!(first.frame_index, 1);
         assert_eq!(first.dt_seconds, 0.1);
+        assert_eq!(first.input_bits, 0xa5);
         assert_eq!(first.input_vertices, 0);
         assert_eq!(first.input_triangles, 0);
         assert_eq!(first.clipped_triangles, 0);
@@ -302,11 +323,11 @@ mod tests {
         assert_eq!(renderer.stats(), first);
         assert_eq!(renderer.color_buffer(), [24, 58, 88, 255]);
 
-        let negative = renderer.update_and_render(-1.0);
+        let negative = renderer.update_and_render(-1.0, InputSnapshot::default());
         assert_eq!(negative.dt_seconds, 0.0);
         assert_eq!(negative.invalid_values, 0);
         for invalid_dt in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-            let stats = renderer.update_and_render(invalid_dt);
+            let stats = renderer.update_and_render(invalid_dt, InputSnapshot::default());
             assert_eq!(stats.dt_seconds, 0.0);
             assert_eq!(stats.invalid_values, 1);
         }
@@ -317,5 +338,12 @@ mod tests {
         assert_eq!(background_rgb(1.0), [24, 144, 88]);
         assert_eq!(background_rgb(1.5), [24, 96, 88]);
         assert_eq!(background_rgb(2.0), [24, 48, 88]);
+    }
+
+    #[test]
+    fn input_snapshot_round_trips_all_packed_bits() {
+        let snapshot = InputSnapshot::from_packed(u32::MAX);
+        assert_eq!(snapshot.packed_bits(), u32::MAX);
+        assert_eq!(InputSnapshot::default().packed_bits(), 0);
     }
 }

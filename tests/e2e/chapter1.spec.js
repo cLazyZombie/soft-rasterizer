@@ -55,6 +55,7 @@ function recordEvidence(testInfo, snapshot, fixedDtSeconds, browserLog, screensh
       pixelHash: snapshot.pixelHash,
       framebufferGeneration: snapshot.framebufferGeneration,
       typedArrayViewRebuilds: snapshot.typedArrayViewRebuilds,
+      lastFrameMetrics: snapshot.lastFrameMetrics,
       screenshotPath,
       diffPath: null,
       consoleLog: browserLog.entries,
@@ -81,6 +82,7 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   expect(initial.contextKind).toBe("2d");
   expect(initial.stats).toMatchObject({
     frameIndex: 1,
+    inputBits: 0,
     inputVertices: 0,
     inputTriangles: 0,
     clippedTriangles: 0,
@@ -142,6 +144,61 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   recordEvidence(testInfo, afterAdvance, 0.1, browserLog, screenshotPath, {
     requestedCanvasContexts: requestedContexts,
   });
+});
+
+test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "wasm_boundary" },
+    { type: "steps", description: "8" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  const before = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(before.lastFrameMetrics).toMatchObject({
+    highLevelRenderCalls: 1,
+    wasmBoundaryCalls: 5,
+  });
+  for (const value of [
+    before.lastFrameMetrics.inputMs,
+    before.lastFrameMetrics.updateMs,
+    before.lastFrameMetrics.presentMs,
+    before.lastFrameMetrics.totalMs,
+  ]) {
+    expect(Number.isFinite(value)).toBe(true);
+    expect(value).toBeGreaterThanOrEqual(0);
+  }
+
+  await page.setViewportSize({ width: 700, height: 600 });
+  await expect
+    .poll(async () => page.evaluate(() => window.__softRasterizer.snapshot()))
+    .toMatchObject({ internalSize: [668, 376], resizeEvents: 1 });
+  const after = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.05));
+  expect(after.lastFrameMetrics).toMatchObject({
+    highLevelRenderCalls: 1,
+    wasmBoundaryCalls: 5,
+  });
+  expect(after.stats.inputBits).toBe(0);
+  await expect(page.locator("#high-level-calls")).toHaveText("1");
+  await expect(page.locator("#wasm-boundary-calls")).toHaveText("5");
+  await expect(page.locator("#frame-time")).toHaveText(/^\d+\.\d{3} ms$/);
+  const constructorError = await page.evaluate(() =>
+    window.__softRasterizer.invalidConstructorError(),
+  );
+  expect(constructorError).toContain("0보다");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter2-boundary.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter2-boundary", { path: screenshotPath, contentType: "image/png" });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, after, 0.05, browserLog, screenshotPath, { constructorError });
 });
 
 test("resize_memory_view: CSS 논리 해상도로 resize하고 Wasm view를 재생성한다", async ({
