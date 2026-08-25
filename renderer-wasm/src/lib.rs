@@ -99,6 +99,14 @@ impl Renderer {
         self.stats().input_triangles
     }
 
+    pub fn stats_transformed_vertices(&self) -> u32 {
+        self.stats().transformed_vertices
+    }
+
+    pub fn stats_submitted_triangles(&self) -> u32 {
+        self.stats().submitted_triangles
+    }
+
     pub fn stats_clipped_triangles(&self) -> u32 {
         self.stats().clipped_triangles
     }
@@ -159,9 +167,12 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             )
         },
     );
+    let attributes = snapshot.selected_attributes;
     format!(
         "LH/+Z 카메라 · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}\n\
+         indexed cube mesh · vertices {} · indices {} · triangles {} · material {}\n\
          선택 정점 v{} · model Y {:.3} rad\n\
+         normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
          w_clip {:.3} · NDC {} · Screen {}\n\
          clip 거리 [x+w, w-x, y+w, w-y, z, w-z]\n\
@@ -173,8 +184,21 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.near,
         snapshot.far,
         snapshot.aspect,
+        snapshot.mesh_vertices,
+        snapshot.mesh_indices,
+        snapshot.mesh_triangles,
+        snapshot.material_id,
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
+        attributes.normal_world.x,
+        attributes.normal_world.y,
+        attributes.normal_world.z,
+        attributes.uv.x,
+        attributes.uv.y,
+        attributes.color.x,
+        attributes.color.y,
+        attributes.color.z,
+        attributes.color.w,
         format_vec4(trace.value(CoordinateSpace::Object)),
         format_vec4(trace.value(CoordinateSpace::World)),
         format_vec4(trace.value(CoordinateSpace::View)),
@@ -208,7 +232,7 @@ mod tests {
     use renderer_core::MAX_PIXEL_COUNT;
 
     #[test]
-    fn adapter_exposes_framebuffer_input_and_zeroed_pipeline_stats() {
+    fn adapter_exposes_framebuffer_input_and_mesh_pipeline_stats() {
         let mut renderer = Renderer::new(3, 2).expect("adapter should be valid");
         assert_eq!((renderer.width(), renderer.height()), (3, 2));
         assert!(!renderer.framebuffer_ptr().is_null());
@@ -220,8 +244,10 @@ mod tests {
         assert_eq!(renderer.stats_frame_index(), 1);
         assert_eq!(renderer.stats_dt_seconds(), 0.016);
         assert_eq!(renderer.stats_input_bits(), 0xa5);
-        assert_eq!(renderer.stats_input_vertices(), 8);
-        assert_eq!(renderer.stats_input_triangles(), 0);
+        assert_eq!(renderer.stats_input_vertices(), 24);
+        assert_eq!(renderer.stats_input_triangles(), 12);
+        assert_eq!(renderer.stats_transformed_vertices(), 24);
+        assert_eq!(renderer.stats_submitted_triangles(), 12);
         assert_eq!(renderer.stats_clipped_triangles(), 0);
         assert_eq!(renderer.stats_rasterized_triangles(), 0);
         assert_eq!(renderer.stats_shaded_samples(), 0);
@@ -265,6 +291,9 @@ mod tests {
         renderer.update_and_render(0.0, 0);
         let text = renderer.coordinate_debug_text();
         assert!(text.contains("선택 정점 v6"));
+        assert!(text.contains("indexed cube mesh · vertices 24 · indices 36 · triangles 12"));
+        assert!(text.contains("normal ("));
+        assert!(text.contains("UV ("));
         assert!(text.contains("LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0"));
         assert!(text.contains("w_clip"));
         assert!(text.contains("NDC ("));
@@ -275,7 +304,7 @@ mod tests {
 
         renderer.set_model_rotation_y(f32::NAN);
         renderer.update_and_render(0.0, 0);
-        assert_eq!(renderer.stats_invalid_values(), 32);
+        assert_eq!(renderer.stats_invalid_values(), 96);
         assert!(
             renderer
                 .coordinate_debug_text()
@@ -284,7 +313,7 @@ mod tests {
         assert!(
             renderer
                 .coordinate_debug_text()
-                .contains("invalid values: 24 · projection failures: 8 · 첫 공간: World")
+                .contains("invalid values: 72 · projection failures: 24 · 첫 공간: World")
         );
 
         renderer.set_model_rotation_y(0.0);

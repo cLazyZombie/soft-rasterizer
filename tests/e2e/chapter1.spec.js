@@ -83,8 +83,10 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
   expect(initial.stats).toMatchObject({
     frameIndex: 1,
     inputBits: 0,
-    inputVertices: 8,
-    inputTriangles: 0,
+    inputVertices: 24,
+    inputTriangles: 12,
+    transformedVertices: 24,
+    submittedTriangles: 12,
     clippedTriangles: 0,
     rasterizedTriangles: 0,
     shadedSamples: 0,
@@ -206,25 +208,30 @@ test("framebuffer_pattern: RGBA gradient와 8x8 checker가 정확하다", async 
   recordEvidence(testInfo, snapshot, 0, browserLog, screenshotPath);
 });
 
-test("camera_projection: LH/+Z 카메라로 wireframe 큐브를 원근 투영한다", async ({
+test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표시한다", async ({
   page,
 }, testInfo) => {
   testInfo.annotations.push(
-    { type: "scenario", description: "camera_projection" },
-    { type: "steps", description: "14" },
+    { type: "scenario", description: "indexed_mesh" },
+    { type: "steps", description: "17" },
   );
   const browserLog = observeBrowserLog(page);
   await openReadyPage(page);
 
   const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
-  expect(initial.stats.inputVertices).toBe(8);
-  expect(initial.pixelHash).toBe("bdd26e0f");
+  expect(initial.stats).toMatchObject({
+    inputVertices: 24,
+    inputTriangles: 12,
+    transformedVertices: 24,
+    submittedTriangles: 12,
+  });
+  expect(initial.pixelHash).toBe("5e1a84c6");
   const projectionColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     const expected = [
       [238, 244, 255, 255],
-      [255, 210, 72, 255],
+      [255, 89, 64, 255],
     ];
     const counts = Array(expected.length).fill(0);
     for (let index = 0; index < data.length; index += 4) {
@@ -241,6 +248,11 @@ test("camera_projection: LH/+Z 카메라로 wireframe 큐브를 원근 투영한
     "LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0",
   );
   await expect(page.locator("#coordinate-debug")).toContainText("선택 정점 v6");
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "indexed cube mesh · vertices 24 · indices 36 · triangles 12 · material 0",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText("normal (");
+  await expect(page.locator("#coordinate-debug")).toContainText("UV (");
   await expect(page.locator("#coordinate-debug")).toContainText("w_clip");
   await expect(page.locator("#coordinate-debug")).toContainText("NDC (");
   await expect(page.locator("#coordinate-debug")).toContainText("Screen (");
@@ -266,9 +278,9 @@ test("camera_projection: LH/+Z 카메라로 wireframe 큐브를 원근 투영한
     window.__softRasterizer.setModelRotationY(Number.NaN);
     return window.__softRasterizer.advanceFrame(0);
   });
-  expect(invalid.stats.invalidValues).toBe(32);
+  expect(invalid.stats.invalidValues).toBe(96);
   await expect(page.locator("#coordinate-debug")).toContainText("NDC invalid · Screen invalid");
-  await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 8");
+  await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 24");
   await expect(page.locator("#coordinate-debug")).toContainText("첫 공간: World");
   const recovered = await page.evaluate(() => {
     window.__softRasterizer.setModelRotationY(0);
@@ -283,10 +295,10 @@ test("camera_projection: LH/+Z 카메라로 wireframe 큐브를 원근 투영한
   await mkdir(screenshotDirectory, { recursive: true });
   const screenshotPath = path.join(
     screenshotDirectory,
-    `${EXECUTION_MODE}-${testInfo.project.name}-chapter7-camera-projection.png`,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter8-indexed-mesh.png`,
   );
   await page.locator("main").screenshot({ path: screenshotPath });
-  await testInfo.attach("chapter7-camera-projection", {
+  await testInfo.attach("chapter8-indexed-mesh", {
     path: screenshotPath,
     contentType: "image/png",
   });

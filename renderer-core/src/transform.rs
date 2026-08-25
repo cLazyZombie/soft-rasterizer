@@ -96,6 +96,13 @@ impl TransformPipeline {
     pub fn transform_mvp(self, object_pos: ObjectPosition) -> ClipPosition {
         ClipPosition(self.model_view_projection * Vec4::point(object_pos.0))
     }
+
+    /// 8장 정점 단계가 translation을 제외한 model 변환을 normal에 적용한다.
+    ///
+    /// non-uniform scale의 inverse-transpose 보정은 조명을 도입하는 18장 범위다.
+    pub fn transform_model_direction(self, object_direction: Vec3) -> Vec4 {
+        self.model.transform_direction(object_direction)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -287,6 +294,10 @@ mod tests {
         assert_eq!(
             pipeline.model_view_projection,
             projection * view * pipeline.model
+        );
+        assert_eq!(
+            pipeline.transform_model_direction(Vec3::Y),
+            pipeline.model.transform_direction(Vec3::Y)
         );
     }
 

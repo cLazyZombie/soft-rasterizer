@@ -19,6 +19,8 @@ function rendererStats(renderer) {
     inputBits: renderer.stats_input_bits(),
     inputVertices: renderer.stats_input_vertices(),
     inputTriangles: renderer.stats_input_triangles(),
+    transformedVertices: renderer.stats_transformed_vertices(),
+    submittedTriangles: renderer.stats_submitted_triangles(),
     clippedTriangles: renderer.stats_clipped_triangles(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),

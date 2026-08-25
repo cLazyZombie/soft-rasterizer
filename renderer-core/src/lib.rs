@@ -1,9 +1,10 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 7장까지 RGBA8 프레임버퍼에 LH/+Z 원근 투영 wireframe 큐브를 그린다.
+//! 8장까지 RGBA8 프레임버퍼에 indexed mesh wireframe 큐브를 그린다.
 
 pub mod camera;
 pub mod math;
+pub mod mesh;
 pub mod transform;
 
 use std::error::Error;
@@ -12,7 +13,8 @@ use std::fmt::{Display, Formatter};
 use camera::{
     NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
 };
-use math::Vec3;
+use math::{Vec3, Vec4};
+use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 #[cfg(test)]
 use transform::CoordinateSpace;
 use transform::{
@@ -31,30 +33,6 @@ const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
 const CAMERA_FOV_Y_RADIANS: f32 = std::f32::consts::FRAC_PI_3;
 const CAMERA_NEAR: f32 = 0.1;
 const CAMERA_FAR: f32 = 100.0;
-const CUBE_OBJECT_POSITIONS: [ObjectPosition; 8] = [
-    ObjectPosition(Vec3::new(-0.5, -0.5, -0.5)),
-    ObjectPosition(Vec3::new(0.5, -0.5, -0.5)),
-    ObjectPosition(Vec3::new(0.5, 0.5, -0.5)),
-    ObjectPosition(Vec3::new(-0.5, 0.5, -0.5)),
-    ObjectPosition(Vec3::new(-0.5, -0.5, 0.5)),
-    ObjectPosition(Vec3::new(0.5, -0.5, 0.5)),
-    ObjectPosition(Vec3::new(0.5, 0.5, 0.5)),
-    ObjectPosition(Vec3::new(-0.5, 0.5, 0.5)),
-];
-const CUBE_EDGES: [(usize, usize); 12] = [
-    (0, 1),
-    (1, 2),
-    (2, 3),
-    (3, 0),
-    (4, 5),
-    (5, 6),
-    (6, 7),
-    (7, 4),
-    (0, 4),
-    (1, 5),
-    (2, 6),
-    (3, 7),
-];
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Color {
@@ -283,6 +261,8 @@ pub struct FrameStats {
     pub input_bits: u32,
     pub input_vertices: u32,
     pub input_triangles: u32,
+    pub transformed_vertices: u32,
+    pub submitted_triangles: u32,
     pub clipped_triangles: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
@@ -308,59 +288,73 @@ impl InputSnapshot {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct CoordinateScene {
-    rotation_y_radians: f32,
-    traces: [VertexTrace; CUBE_OBJECT_POSITIONS.len()],
-    ndc_positions: [Option<NdcPosition>; CUBE_OBJECT_POSITIONS.len()],
-    viewport_positions: [Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
+#[derive(Clone, Debug, PartialEq)]
+struct MeshScene {
+    traces: Vec<VertexTrace>,
+    clip_vertices: Vec<ClipVertex>,
+    ndc_positions: Vec<Option<NdcPosition>>,
+    viewport_positions: Vec<Option<ViewportPosition>>,
     diagnostics: CoordinateDiagnostics,
     projection_failures: u32,
     aspect: f32,
 }
 
-impl CoordinateScene {
-    fn new(rotation_y_radians: f32, width: usize, height: usize) -> Self {
-        let transform = Transform {
-            translation: Vec3::ZERO,
-            rotation_radians: Vec3::new(0.45, rotation_y_radians, 0.0),
-            scale: Vec3::new(1.25, 1.25, 1.25),
+impl MeshScene {
+    fn new(mesh: &Mesh, model: Transform, width: usize, height: usize) -> Self {
+        let vertex_count = mesh.vertices().len();
+        let mut scene = Self {
+            traces: Vec::with_capacity(vertex_count),
+            clip_vertices: Vec::with_capacity(vertex_count),
+            ndc_positions: Vec::with_capacity(vertex_count),
+            viewport_positions: Vec::with_capacity(vertex_count),
+            diagnostics: CoordinateDiagnostics::from_traces(&[]),
+            projection_failures: 0,
+            aspect: 1.0,
         };
+        scene.rebuild(mesh, model, width, height);
+        scene
+    }
+
+    fn rebuild(&mut self, mesh: &Mesh, model: Transform, width: usize, height: usize) {
         let aspect = width as f32 / height as f32;
         let view = look_at_lh(CAMERA_EYE, CAMERA_TARGET, CAMERA_WORLD_UP)
             .expect("고정 카메라 view 계약은 항상 유효해야 한다");
         let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
             .expect("유효한 렌더 타깃의 고정 projection 계약은 항상 유효해야 한다");
-        let pipeline = TransformPipeline::new(transform.model_matrix(), view, projection);
-        let traces = CUBE_OBJECT_POSITIONS.map(|object_pos| pipeline.trace(object_pos));
-        let ndc_positions = traces.map(|trace| perspective_divide(trace.clip_pos).ok());
-        let viewport_positions = ndc_positions.map(|ndc_position| {
-            ndc_position.and_then(|ndc| viewport(ndc, width as f32, height as f32).ok())
-        });
-        let diagnostics = CoordinateDiagnostics::from_traces(&traces);
-        let projection_failures = ndc_positions
+        let pipeline = TransformPipeline::new(model.model_matrix(), view, projection);
+        self.traces.clear();
+        self.clip_vertices.clear();
+        self.ndc_positions.clear();
+        self.viewport_positions.clear();
+        for vertex in mesh.vertices() {
+            let trace = pipeline.trace(ObjectPosition(vertex.position_object));
+            let normal = pipeline.transform_model_direction(vertex.normal_object);
+            let raw_normal = Vec3::new(normal.x, normal.y, normal.z);
+            self.clip_vertices.push(ClipVertex {
+                clip_pos: trace.clip_pos,
+                world_pos: Vec3::new(
+                    trace.world_pos.0.x,
+                    trace.world_pos.0.y,
+                    trace.world_pos.0.z,
+                ),
+                normal_world: raw_normal.normalized().unwrap_or(raw_normal),
+                uv: vertex.uv,
+                color: vertex.color,
+            });
+            let ndc = perspective_divide(trace.clip_pos).ok();
+            self.viewport_positions.push(
+                ndc.and_then(|position| viewport(position, width as f32, height as f32).ok()),
+            );
+            self.ndc_positions.push(ndc);
+            self.traces.push(trace);
+        }
+        self.diagnostics = CoordinateDiagnostics::from_traces(&self.traces);
+        self.projection_failures = self
+            .ndc_positions
             .iter()
             .filter(|position| position.is_none())
             .count() as u32;
-        Self {
-            rotation_y_radians,
-            traces,
-            ndc_positions,
-            viewport_positions,
-            diagnostics,
-            projection_failures,
-            aspect,
-        }
-    }
-
-    fn advance(&mut self, dt_seconds: f32, width: usize, height: usize) {
-        let rotation_y_radians = if self.rotation_y_radians.is_finite() {
-            (self.rotation_y_radians + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
-                .rem_euclid(std::f32::consts::TAU)
-        } else {
-            self.rotation_y_radians
-        };
-        *self = Self::new(rotation_y_radians, width, height);
+        self.aspect = aspect;
     }
 }
 
@@ -370,6 +364,7 @@ pub struct CoordinateDebugSnapshot {
     pub rotation_y_radians: f32,
     pub selected_vertex_index: usize,
     pub selected_vertex: VertexTrace,
+    pub selected_attributes: ClipVertex,
     pub selected_ndc: Option<NdcPosition>,
     pub selected_viewport: Option<ViewportPosition>,
     pub clip_plane_distances: ClipPlaneDistances,
@@ -379,33 +374,53 @@ pub struct CoordinateDebugSnapshot {
     pub near: f32,
     pub far: f32,
     pub aspect: f32,
+    pub mesh_vertices: u32,
+    pub mesh_indices: u32,
+    pub mesh_triangles: u32,
+    pub material_id: u32,
 }
 
-/// 렌더 타깃과 3-7장 debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-8장 indexed mesh debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
     stats: FrameStats,
     framebuffer_generation: u32,
     debug_lines_enabled: bool,
-    coordinate_scene: CoordinateScene,
+    mesh: Mesh,
+    draw_item: DrawItem,
+    mesh_scene: MeshScene,
 }
 
 impl Renderer {
     pub fn new(width: usize, height: usize) -> Result<Self, RenderTargetError> {
         let target = RenderTarget::new(width, height)?;
-        let coordinate_scene = CoordinateScene::new(0.0, width, height);
+        let mesh = unit_cube_mesh();
+        let draw_item = DrawItem::new(
+            MeshId(0),
+            MaterialId(0),
+            Transform {
+                translation: Vec3::ZERO,
+                rotation_radians: Vec3::new(0.45, 0.0, 0.0),
+                scale: Vec3::new(1.25, 1.25, 1.25),
+            },
+        );
+        let mesh_scene = MeshScene::new(&mesh, draw_item.model, width, height);
         let mut renderer = Self {
             target,
             stats: FrameStats::default(),
             framebuffer_generation: 0,
             debug_lines_enabled: true,
-            coordinate_scene,
+            mesh,
+            draw_item,
+            mesh_scene,
         };
         draw_frame(
             &mut renderer.target,
             renderer.debug_lines_enabled,
-            &renderer.coordinate_scene.viewport_positions,
+            &renderer.mesh,
+            &renderer.mesh_scene.viewport_positions,
+            &renderer.mesh_scene.clip_vertices,
         );
         Ok(renderer)
     }
@@ -415,39 +430,56 @@ impl Renderer {
             return Ok(());
         }
         let mut replacement = RenderTarget::new(width, height)?;
-        let replacement_scene =
-            CoordinateScene::new(self.coordinate_scene.rotation_y_radians, width, height);
+        let replacement_scene = MeshScene::new(&self.mesh, self.draw_item.model, width, height);
         draw_frame(
             &mut replacement,
             self.debug_lines_enabled,
+            &self.mesh,
             &replacement_scene.viewport_positions,
+            &replacement_scene.clip_vertices,
         );
         self.target = replacement;
-        self.coordinate_scene = replacement_scene;
+        self.mesh_scene = replacement_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
 
     pub fn update_and_render(&mut self, dt_seconds: f32, input: InputSnapshot) -> FrameStats {
         let (dt_seconds, invalid_dt) = sanitize_dt(dt_seconds);
-        self.coordinate_scene
-            .advance(dt_seconds, self.target.width(), self.target.height());
+        let rotation_y = self.draw_item.model.rotation_radians.y;
+        self.draw_item.model.rotation_radians.y = if rotation_y.is_finite() {
+            (rotation_y + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
+                .rem_euclid(std::f32::consts::TAU)
+        } else {
+            rotation_y
+        };
+        self.mesh_scene.rebuild(
+            &self.mesh,
+            self.draw_item.model,
+            self.target.width(),
+            self.target.height(),
+        );
         let debug_pixels = draw_frame(
             &mut self.target,
             self.debug_lines_enabled,
-            &self.coordinate_scene.viewport_positions,
+            &self.mesh,
+            &self.mesh_scene.viewport_positions,
+            &self.mesh_scene.clip_vertices,
         );
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
             input_bits: input.packed_bits(),
-            input_vertices: CUBE_OBJECT_POSITIONS.len() as u32,
+            input_vertices: self.mesh.vertices().len() as u32,
+            input_triangles: self.mesh.triangle_count() as u32,
+            transformed_vertices: self.mesh_scene.traces.len() as u32,
+            submitted_triangles: self.mesh.triangle_count() as u32,
             debug_pixels,
             invalid_values: self
-                .coordinate_scene
+                .mesh_scene
                 .diagnostics
                 .invalid_values
-                .saturating_add(self.coordinate_scene.projection_failures)
+                .saturating_add(self.mesh_scene.projection_failures)
                 .saturating_add(u32::from(invalid_dt)),
             ..FrameStats::default()
         };
@@ -463,8 +495,10 @@ impl Renderer {
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
-        self.coordinate_scene = CoordinateScene::new(
-            rotation_y_radians,
+        self.draw_item.model.rotation_radians.y = rotation_y_radians;
+        self.mesh_scene.rebuild(
+            &self.mesh,
+            self.draw_item.model,
             self.target.width(),
             self.target.height(),
         );
@@ -495,20 +529,25 @@ impl Renderer {
     }
 
     pub fn coordinate_debug_snapshot(&self) -> CoordinateDebugSnapshot {
-        let selected_vertex = self.coordinate_scene.traces[SELECTED_VERTEX_INDEX];
+        let selected_vertex = self.mesh_scene.traces[SELECTED_VERTEX_INDEX];
         CoordinateDebugSnapshot {
-            rotation_y_radians: self.coordinate_scene.rotation_y_radians,
+            rotation_y_radians: self.draw_item.model.rotation_radians.y,
             selected_vertex_index: SELECTED_VERTEX_INDEX,
             selected_vertex,
-            selected_ndc: self.coordinate_scene.ndc_positions[SELECTED_VERTEX_INDEX],
-            selected_viewport: self.coordinate_scene.viewport_positions[SELECTED_VERTEX_INDEX],
+            selected_attributes: self.mesh_scene.clip_vertices[SELECTED_VERTEX_INDEX],
+            selected_ndc: self.mesh_scene.ndc_positions[SELECTED_VERTEX_INDEX],
+            selected_viewport: self.mesh_scene.viewport_positions[SELECTED_VERTEX_INDEX],
             clip_plane_distances: ClipPlaneDistances::from_position(selected_vertex.clip_pos),
-            diagnostics: self.coordinate_scene.diagnostics,
-            projection_failures: self.coordinate_scene.projection_failures,
+            diagnostics: self.mesh_scene.diagnostics,
+            projection_failures: self.mesh_scene.projection_failures,
             fov_y_radians: CAMERA_FOV_Y_RADIANS,
             near: CAMERA_NEAR,
             far: CAMERA_FAR,
-            aspect: self.coordinate_scene.aspect,
+            aspect: self.mesh_scene.aspect,
+            mesh_vertices: self.mesh.vertices().len() as u32,
+            mesh_indices: self.mesh.indices().len() as u32,
+            mesh_triangles: self.mesh.triangle_count() as u32,
+            material_id: self.draw_item.material_id.0,
         }
     }
 }
@@ -516,11 +555,13 @@ impl Renderer {
 fn draw_frame(
     target: &mut RenderTarget,
     debug_lines_enabled: bool,
-    viewport_positions: &[Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
+    mesh: &Mesh,
+    viewport_positions: &[Option<ViewportPosition>],
+    clip_vertices: &[ClipVertex],
 ) -> u32 {
     target.render_gradient_checker();
     if debug_lines_enabled {
-        draw_debug_scene(target, viewport_positions)
+        draw_debug_scene(target, mesh, viewport_positions, clip_vertices)
     } else {
         0
     }
@@ -528,7 +569,9 @@ fn draw_frame(
 
 fn draw_debug_scene(
     target: &mut RenderTarget,
-    viewport_positions: &[Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
+    mesh: &Mesh,
+    viewport_positions: &[Option<ViewportPosition>],
+    clip_vertices: &[ClipVertex],
 ) -> u32 {
     let width = target.width() as i32;
     let height = target.height() as i32;
@@ -560,15 +603,18 @@ fn draw_debug_scene(
         ));
     }
 
-    let cube = Color::rgb(255, 210, 72);
-    for (first, second) in CUBE_EDGES {
-        let first = viewport_positions[first].map(viewport_screen_point);
-        let second = viewport_positions[second].map(viewport_screen_point);
-        if let (Some(first), Some(second)) = (first, second) {
-            written = written.saturating_add(target.draw_line_bresenham(first, second, cube));
-        }
-    }
-    if let Some(selected) = viewport_positions[SELECTED_VERTEX_INDEX].map(viewport_screen_point) {
+    written = written.saturating_add(draw_mesh_wireframe(
+        target,
+        mesh,
+        viewport_positions,
+        clip_vertices,
+    ));
+    if let Some(selected) = viewport_positions
+        .get(SELECTED_VERTEX_INDEX)
+        .copied()
+        .flatten()
+        .map(viewport_screen_point)
+    {
         written = written.saturating_add(target.draw_point(selected, white));
     }
 
@@ -579,6 +625,40 @@ fn draw_debug_scene(
         white,
     ));
     written
+}
+
+fn draw_mesh_wireframe(
+    target: &mut RenderTarget,
+    mesh: &Mesh,
+    viewport_positions: &[Option<ViewportPosition>],
+    clip_vertices: &[ClipVertex],
+) -> u32 {
+    let mut written = 0_u32;
+    for triangle in mesh.triangles() {
+        let positions = triangle.map(|index| {
+            viewport_positions
+                .get(index)
+                .copied()
+                .flatten()
+                .map(viewport_screen_point)
+        });
+        let [Some(first), Some(second), Some(third)] = positions else {
+            continue;
+        };
+        let edge_colors = triangle.map(|index| {
+            clip_vertices
+                .get(index)
+                .map_or(Color::rgb(255, 210, 72), |vertex| debug_color(vertex.color))
+        });
+        written = written
+            .saturating_add(target.draw_wireframe_triangle([first, second, third], edge_colors));
+    }
+    written
+}
+
+fn debug_color(color: Vec4) -> Color {
+    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
+    Color::rgb(channel(color.x), channel(color.y), channel(color.z))
 }
 
 fn viewport_screen_point(position: ViewportPosition) -> ScreenPoint {
@@ -877,13 +957,18 @@ mod tests {
         let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
         let color_pointer = renderer.color_buffer().as_ptr();
         let depth_pointer = renderer.depth_buffer().as_ptr();
+        let trace_cache_pointer = renderer.mesh_scene.traces.as_ptr();
+        let clip_cache_pointer = renderer.mesh_scene.clip_vertices.as_ptr();
+        let viewport_cache_pointer = renderer.mesh_scene.viewport_positions.as_ptr();
 
         let first = renderer.update_and_render(0.25, InputSnapshot::from_packed(0xa5));
         assert_eq!(first.frame_index, 1);
         assert_eq!(first.dt_seconds, 0.1);
         assert_eq!(first.input_bits, 0xa5);
-        assert_eq!(first.input_vertices, 8);
-        assert_eq!(first.input_triangles, 0);
+        assert_eq!(first.input_vertices, 24);
+        assert_eq!(first.input_triangles, 12);
+        assert_eq!(first.transformed_vertices, 24);
+        assert_eq!(first.submitted_triangles, 12);
         assert_eq!(first.clipped_triangles, 0);
         assert_eq!(first.rasterized_triangles, 0);
         assert_eq!(first.shaded_samples, 0);
@@ -892,6 +977,15 @@ mod tests {
         assert_eq!(renderer.stats(), first);
         assert_eq!(renderer.color_buffer().as_ptr(), color_pointer);
         assert_eq!(renderer.depth_buffer().as_ptr(), depth_pointer);
+        assert_eq!(renderer.mesh_scene.traces.as_ptr(), trace_cache_pointer);
+        assert_eq!(
+            renderer.mesh_scene.clip_vertices.as_ptr(),
+            clip_cache_pointer
+        );
+        assert_eq!(
+            renderer.mesh_scene.viewport_positions.as_ptr(),
+            viewport_cache_pointer
+        );
 
         renderer.set_debug_lines_enabled(false);
         let negative = renderer.update_and_render(-1.0, InputSnapshot::default());
@@ -920,15 +1014,15 @@ mod tests {
     }
 
     #[test]
-    fn chapter_seven_perspective_wireframe_matches_64_by_64_golden_hash() {
+    fn chapter_eight_indexed_mesh_wireframe_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x8674_5125);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf1ef_5933);
     }
 
     #[test]
-    fn chapter_seven_scene_contains_projected_cube_and_selected_vertex_colors() {
+    fn chapter_eight_scene_contains_projected_mesh_and_selected_vertex_colors() {
         let renderer = Renderer::new(64, 64).expect("debug renderer should be valid");
-        for expected in [[238, 244, 255, 255], [255, 210, 72, 255]] {
+        for expected in [[238, 244, 255, 255], [255, 89, 64, 255]] {
             assert!(
                 renderer
                     .color_buffer()
@@ -937,6 +1031,40 @@ mod tests {
                 "missing stage color {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn empty_and_degenerate_meshes_draw_as_safe_no_op_or_point_wireframe() {
+        let empty = Mesh::new(vec![], vec![]).unwrap();
+        let empty_scene = MeshScene::new(&empty, Transform::IDENTITY, 64, 64);
+        let mut target = RenderTarget::new(64, 64).unwrap();
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                &empty,
+                &empty_scene.viewport_positions,
+                &empty_scene.clip_vertices,
+            ),
+            0
+        );
+
+        let vertex = mesh::Vertex::new(
+            Vec3::ZERO,
+            Vec3::Z,
+            math::Vec2::ZERO,
+            Vec4::new(1.0, 1.0, 1.0, 1.0),
+        );
+        let degenerate = Mesh::new(vec![vertex], vec![0, 0, 0]).unwrap();
+        let degenerate_scene = MeshScene::new(&degenerate, Transform::IDENTITY, 64, 64);
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                &degenerate,
+                &degenerate_scene.viewport_positions,
+                &degenerate_scene.clip_vertices,
+            ),
+            3
+        );
     }
 
     #[test]
@@ -972,7 +1100,10 @@ mod tests {
 
         let stats = renderer.update_and_render(0.1, InputSnapshot::default());
         let rotated = renderer.coordinate_debug_snapshot();
-        assert_eq!(stats.input_vertices, 8);
+        assert_eq!(stats.input_vertices, 24);
+        assert_eq!(stats.input_triangles, 12);
+        assert_eq!(stats.transformed_vertices, 24);
+        assert_eq!(stats.submitted_triangles, 12);
         assert_eq!(stats.invalid_values, 0);
         assert_eq!(
             rotated.selected_vertex.object_pos,
@@ -1004,8 +1135,8 @@ mod tests {
         renderer.set_model_rotation_y(f32::NAN);
         let invalid = renderer.update_and_render(0.0, InputSnapshot::default());
         let invalid_snapshot = renderer.coordinate_debug_snapshot();
-        assert_eq!(invalid.invalid_values, 32);
-        assert_eq!(invalid_snapshot.projection_failures, 8);
+        assert_eq!(invalid.invalid_values, 96);
+        assert_eq!(invalid_snapshot.projection_failures, 24);
         assert_eq!(invalid_snapshot.selected_ndc, None);
         assert_eq!(invalid_snapshot.selected_viewport, None);
         assert_eq!(

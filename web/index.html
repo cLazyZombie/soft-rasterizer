@@ -97,11 +97,11 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>7장 · 카메라와 원근 투영</h1>
+        <h1>8장 · Mesh, 인덱스, 정점 속성</h1>
       </div>
-      <p>Rust core의 LH/+Z 카메라와 0..1 깊이 투영으로 wireframe 큐브를 표시합니다.</p>
+      <p>Rust core의 검증된 24정점/36인덱스 mesh를 정점별로 한 번 변환해 wireframe 큐브로 표시합니다.</p>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
-      <p class="space-legend">원근 투영 cube 노랑 · 선택 정점 흰색 · 화면 좌표는 y-down</p>
+      <p class="space-legend">면별 정점 색 wireframe · 선택 정점 흰색 · 화면 좌표는 y-down</p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
         <dt>내부 해상도</dt>
