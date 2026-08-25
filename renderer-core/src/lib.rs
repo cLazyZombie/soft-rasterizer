@@ -1,17 +1,23 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 6장까지 RGBA8 프레임버퍼에 좌표 공간별 회전 큐브와 변환 진단을 그린다.
+//! 7장까지 RGBA8 프레임버퍼에 LH/+Z 원근 투영 wireframe 큐브를 그린다.
 
+pub mod camera;
 pub mod math;
 pub mod transform;
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use math::{Mat4, Vec3, Vec4};
+use camera::{
+    NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
+};
+use math::Vec3;
+#[cfg(test)]
+use transform::CoordinateSpace;
 use transform::{
-    ClipPlaneDistances, CoordinateDiagnostics, CoordinateSpace, ObjectPosition, Transform,
-    TransformPipeline, VertexTrace, vec4_is_finite,
+    ClipPlaneDistances, CoordinateDiagnostics, ObjectPosition, Transform, TransformPipeline,
+    VertexTrace,
 };
 
 /// 4096 × 4096 RGBA8와 깊이 버퍼까지만 허용한다.
@@ -19,6 +25,12 @@ pub const MAX_PIXEL_COUNT: usize = 16_777_216;
 const MAX_FRAME_DT_SECONDS: f32 = 0.1;
 const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
 const SELECTED_VERTEX_INDEX: usize = 6;
+const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
+const CAMERA_TARGET: Vec3 = Vec3::ZERO;
+const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
+const CAMERA_FOV_Y_RADIANS: f32 = std::f32::consts::FRAC_PI_3;
+const CAMERA_NEAR: f32 = 0.1;
+const CAMERA_FAR: f32 = 100.0;
 const CUBE_OBJECT_POSITIONS: [ObjectPosition; 8] = [
     ObjectPosition(Vec3::new(-0.5, -0.5, -0.5)),
     ObjectPosition(Vec3::new(0.5, -0.5, -0.5)),
@@ -300,35 +312,55 @@ impl InputSnapshot {
 struct CoordinateScene {
     rotation_y_radians: f32,
     traces: [VertexTrace; CUBE_OBJECT_POSITIONS.len()],
+    ndc_positions: [Option<NdcPosition>; CUBE_OBJECT_POSITIONS.len()],
+    viewport_positions: [Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
     diagnostics: CoordinateDiagnostics,
+    projection_failures: u32,
+    aspect: f32,
 }
 
 impl CoordinateScene {
-    fn new(rotation_y_radians: f32) -> Self {
+    fn new(rotation_y_radians: f32, width: usize, height: usize) -> Self {
         let transform = Transform {
-            translation: Vec3::new(0.0, 0.0, 0.5),
+            translation: Vec3::ZERO,
             rotation_radians: Vec3::new(0.45, rotation_y_radians, 0.0),
-            scale: Vec3::new(0.55, 0.55, 0.55),
+            scale: Vec3::new(1.25, 1.25, 1.25),
         };
-        let pipeline =
-            TransformPipeline::new(transform.model_matrix(), Mat4::identity(), Mat4::identity());
+        let aspect = width as f32 / height as f32;
+        let view = look_at_lh(CAMERA_EYE, CAMERA_TARGET, CAMERA_WORLD_UP)
+            .expect("고정 카메라 view 계약은 항상 유효해야 한다");
+        let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
+            .expect("유효한 렌더 타깃의 고정 projection 계약은 항상 유효해야 한다");
+        let pipeline = TransformPipeline::new(transform.model_matrix(), view, projection);
         let traces = CUBE_OBJECT_POSITIONS.map(|object_pos| pipeline.trace(object_pos));
+        let ndc_positions = traces.map(|trace| perspective_divide(trace.clip_pos).ok());
+        let viewport_positions = ndc_positions.map(|ndc_position| {
+            ndc_position.and_then(|ndc| viewport(ndc, width as f32, height as f32).ok())
+        });
         let diagnostics = CoordinateDiagnostics::from_traces(&traces);
+        let projection_failures = ndc_positions
+            .iter()
+            .filter(|position| position.is_none())
+            .count() as u32;
         Self {
             rotation_y_radians,
             traces,
+            ndc_positions,
+            viewport_positions,
             diagnostics,
+            projection_failures,
+            aspect,
         }
     }
 
-    fn advance(&mut self, dt_seconds: f32) {
+    fn advance(&mut self, dt_seconds: f32, width: usize, height: usize) {
         let rotation_y_radians = if self.rotation_y_radians.is_finite() {
             (self.rotation_y_radians + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
                 .rem_euclid(std::f32::consts::TAU)
         } else {
             self.rotation_y_radians
         };
-        *self = Self::new(rotation_y_radians);
+        *self = Self::new(rotation_y_radians, width, height);
     }
 }
 
@@ -338,11 +370,18 @@ pub struct CoordinateDebugSnapshot {
     pub rotation_y_radians: f32,
     pub selected_vertex_index: usize,
     pub selected_vertex: VertexTrace,
+    pub selected_ndc: Option<NdcPosition>,
+    pub selected_viewport: Option<ViewportPosition>,
     pub clip_plane_distances: ClipPlaneDistances,
     pub diagnostics: CoordinateDiagnostics,
+    pub projection_failures: u32,
+    pub fov_y_radians: f32,
+    pub near: f32,
+    pub far: f32,
+    pub aspect: f32,
 }
 
-/// 렌더 타깃과 3-6장 debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-7장 debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -354,9 +393,10 @@ pub struct Renderer {
 
 impl Renderer {
     pub fn new(width: usize, height: usize) -> Result<Self, RenderTargetError> {
-        let coordinate_scene = CoordinateScene::new(0.0);
+        let target = RenderTarget::new(width, height)?;
+        let coordinate_scene = CoordinateScene::new(0.0, width, height);
         let mut renderer = Self {
-            target: RenderTarget::new(width, height)?,
+            target,
             stats: FrameStats::default(),
             framebuffer_generation: 0,
             debug_lines_enabled: true,
@@ -365,7 +405,7 @@ impl Renderer {
         draw_frame(
             &mut renderer.target,
             renderer.debug_lines_enabled,
-            &renderer.coordinate_scene.traces,
+            &renderer.coordinate_scene.viewport_positions,
         );
         Ok(renderer)
     }
@@ -375,23 +415,27 @@ impl Renderer {
             return Ok(());
         }
         let mut replacement = RenderTarget::new(width, height)?;
+        let replacement_scene =
+            CoordinateScene::new(self.coordinate_scene.rotation_y_radians, width, height);
         draw_frame(
             &mut replacement,
             self.debug_lines_enabled,
-            &self.coordinate_scene.traces,
+            &replacement_scene.viewport_positions,
         );
         self.target = replacement;
+        self.coordinate_scene = replacement_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
 
     pub fn update_and_render(&mut self, dt_seconds: f32, input: InputSnapshot) -> FrameStats {
         let (dt_seconds, invalid_dt) = sanitize_dt(dt_seconds);
-        self.coordinate_scene.advance(dt_seconds);
+        self.coordinate_scene
+            .advance(dt_seconds, self.target.width(), self.target.height());
         let debug_pixels = draw_frame(
             &mut self.target,
             self.debug_lines_enabled,
-            &self.coordinate_scene.traces,
+            &self.coordinate_scene.viewport_positions,
         );
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
@@ -403,6 +447,7 @@ impl Renderer {
                 .coordinate_scene
                 .diagnostics
                 .invalid_values
+                .saturating_add(self.coordinate_scene.projection_failures)
                 .saturating_add(u32::from(invalid_dt)),
             ..FrameStats::default()
         };
@@ -418,7 +463,11 @@ impl Renderer {
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
-        self.coordinate_scene = CoordinateScene::new(rotation_y_radians);
+        self.coordinate_scene = CoordinateScene::new(
+            rotation_y_radians,
+            self.target.width(),
+            self.target.height(),
+        );
     }
 
     pub const fn width(&self) -> usize {
@@ -451,8 +500,15 @@ impl Renderer {
             rotation_y_radians: self.coordinate_scene.rotation_y_radians,
             selected_vertex_index: SELECTED_VERTEX_INDEX,
             selected_vertex,
+            selected_ndc: self.coordinate_scene.ndc_positions[SELECTED_VERTEX_INDEX],
+            selected_viewport: self.coordinate_scene.viewport_positions[SELECTED_VERTEX_INDEX],
             clip_plane_distances: ClipPlaneDistances::from_position(selected_vertex.clip_pos),
             diagnostics: self.coordinate_scene.diagnostics,
+            projection_failures: self.coordinate_scene.projection_failures,
+            fov_y_radians: CAMERA_FOV_Y_RADIANS,
+            near: CAMERA_NEAR,
+            far: CAMERA_FAR,
+            aspect: self.coordinate_scene.aspect,
         }
     }
 }
@@ -460,11 +516,11 @@ impl Renderer {
 fn draw_frame(
     target: &mut RenderTarget,
     debug_lines_enabled: bool,
-    traces: &[VertexTrace; CUBE_OBJECT_POSITIONS.len()],
+    viewport_positions: &[Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
 ) -> u32 {
     target.render_gradient_checker();
     if debug_lines_enabled {
-        draw_debug_scene(target, traces)
+        draw_debug_scene(target, viewport_positions)
     } else {
         0
     }
@@ -472,7 +528,7 @@ fn draw_frame(
 
 fn draw_debug_scene(
     target: &mut RenderTarget,
-    traces: &[VertexTrace; CUBE_OBJECT_POSITIONS.len()],
+    viewport_positions: &[Option<ViewportPosition>; CUBE_OBJECT_POSITIONS.len()],
 ) -> u32 {
     let width = target.width() as i32;
     let height = target.height() as i32;
@@ -504,29 +560,16 @@ fn draw_debug_scene(
         ));
     }
 
-    let cube_scale = (shortest_side / 7).max(8) as f32;
-    let spaces_and_colors = [
-        (CoordinateSpace::Object, Color::rgb(238, 244, 255)),
-        (CoordinateSpace::World, Color::rgb(255, 210, 72)),
-        (CoordinateSpace::View, Color::rgb(72, 224, 194)),
-        (CoordinateSpace::Clip, Color::rgb(184, 132, 255)),
-    ];
-    for (stage_index, (space, color)) in spaces_and_colors.into_iter().enumerate() {
-        let origin = ScreenPoint::new(width * (2 * stage_index as i32 + 1) / 8, height / 2);
-        for (first, second) in CUBE_EDGES {
-            let first = project_debug_position(origin, traces[first].value(space), cube_scale);
-            let second = project_debug_position(origin, traces[second].value(space), cube_scale);
-            if let (Some(first), Some(second)) = (first, second) {
-                written = written.saturating_add(target.draw_line_bresenham(first, second, color));
-            }
+    let cube = Color::rgb(255, 210, 72);
+    for (first, second) in CUBE_EDGES {
+        let first = viewport_positions[first].map(viewport_screen_point);
+        let second = viewport_positions[second].map(viewport_screen_point);
+        if let (Some(first), Some(second)) = (first, second) {
+            written = written.saturating_add(target.draw_line_bresenham(first, second, cube));
         }
-        if let Some(selected) = project_debug_position(
-            origin,
-            traces[SELECTED_VERTEX_INDEX].value(space),
-            cube_scale,
-        ) {
-            written = written.saturating_add(target.draw_point(selected, white));
-        }
+    }
+    if let Some(selected) = viewport_positions[SELECTED_VERTEX_INDEX].map(viewport_screen_point) {
+        written = written.saturating_add(target.draw_point(selected, white));
     }
 
     let inset = (shortest_side / 32).max(2);
@@ -538,17 +581,8 @@ fn draw_debug_scene(
     written
 }
 
-/// 7장의 원근/viewport보다 앞선 값들을 나란히 관찰하기 위한 고정 debug 투영이다.
-fn project_debug_position(origin: ScreenPoint, position: Vec4, scale: f32) -> Option<ScreenPoint> {
-    if !vec4_is_finite(position) {
-        return None;
-    }
-    let screen_x = (position.x - 0.5 * position.z) * scale;
-    let screen_y = (-position.y + 0.5 * position.z) * scale;
-    Some(ScreenPoint::new(
-        origin.x + screen_x.round() as i32,
-        origin.y + screen_y.round() as i32,
-    ))
+fn viewport_screen_point(position: ViewportPosition) -> ScreenPoint {
+    ScreenPoint::new(position.x.round() as i32, position.y.round() as i32)
 }
 
 fn checked_buffer_lengths(
@@ -584,6 +618,13 @@ fn sanitize_dt(dt_seconds: f32) -> (f32, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 1.0e-5,
+            "expected {expected}, got {actual}"
+        );
+    }
 
     fn pixel(target: &RenderTarget, x: usize, y: usize) -> [u8; 4] {
         let byte_index = 4 * (y * target.width() + x);
@@ -879,20 +920,15 @@ mod tests {
     }
 
     #[test]
-    fn chapter_six_coordinate_space_scene_matches_64_by_64_golden_hash() {
+    fn chapter_seven_perspective_wireframe_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x331b_295b);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x8674_5125);
     }
 
     #[test]
-    fn chapter_six_scene_contains_all_four_space_colors() {
+    fn chapter_seven_scene_contains_projected_cube_and_selected_vertex_colors() {
         let renderer = Renderer::new(64, 64).expect("debug renderer should be valid");
-        for expected in [
-            [238, 244, 255, 255],
-            [255, 210, 72, 255],
-            [72, 224, 194, 255],
-            [184, 132, 255, 255],
-        ] {
+        for expected in [[238, 244, 255, 255], [255, 210, 72, 255]] {
             assert!(
                 renderer
                     .color_buffer()
@@ -909,6 +945,23 @@ mod tests {
         let initial = renderer.coordinate_debug_snapshot();
         assert_eq!(initial.selected_vertex_index, 6);
         assert_eq!(initial.diagnostics.invalid_values, 0);
+        assert_eq!(initial.projection_failures, 0);
+        assert_close(initial.fov_y_radians, std::f32::consts::FRAC_PI_3);
+        assert_eq!(
+            (initial.near, initial.far, initial.aspect),
+            (0.1, 100.0, 1.0)
+        );
+        let initial_ndc = initial
+            .selected_ndc
+            .expect("selected vertex should project");
+        let initial_viewport = initial
+            .selected_viewport
+            .expect("selected vertex should reach the viewport");
+        assert!((-1.0..=1.0).contains(&initial_ndc.0.x));
+        assert!((-1.0..=1.0).contains(&initial_ndc.0.y));
+        assert!((0.0..=1.0).contains(&initial_ndc.0.z));
+        assert!((0.0..=64.0).contains(&initial_viewport.x));
+        assert!((0.0..=64.0).contains(&initial_viewport.y));
         assert!(
             initial
                 .clip_plane_distances
@@ -929,19 +982,32 @@ mod tests {
             rotated.selected_vertex.world_pos,
             initial.selected_vertex.world_pos
         );
-        assert_eq!(
+        assert_ne!(
             rotated.selected_vertex.view_pos.0,
             rotated.selected_vertex.world_pos.0
         );
-        assert_eq!(
-            rotated.selected_vertex.clip_pos.0,
-            rotated.selected_vertex.view_pos.0
+        assert_close(
+            rotated.selected_vertex.clip_pos.0.w,
+            rotated.selected_vertex.view_pos.0.z,
+        );
+
+        renderer
+            .resize(128, 64)
+            .expect("wide resize should succeed");
+        let wide = renderer.coordinate_debug_snapshot();
+        assert_eq!(wide.aspect, 2.0);
+        assert_close(
+            wide.selected_ndc.unwrap().0.x,
+            rotated.selected_ndc.unwrap().0.x * 0.5,
         );
 
         renderer.set_model_rotation_y(f32::NAN);
         let invalid = renderer.update_and_render(0.0, InputSnapshot::default());
         let invalid_snapshot = renderer.coordinate_debug_snapshot();
-        assert_eq!(invalid.invalid_values, 24);
+        assert_eq!(invalid.invalid_values, 32);
+        assert_eq!(invalid_snapshot.projection_failures, 8);
+        assert_eq!(invalid_snapshot.selected_ndc, None);
+        assert_eq!(invalid_snapshot.selected_viewport, None);
         assert_eq!(
             invalid_snapshot.diagnostics.first_invalid_space,
             Some(CoordinateSpace::World)

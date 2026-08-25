@@ -206,12 +206,12 @@ test("framebuffer_pattern: RGBA gradient와 8x8 checker가 정확하다", async 
   recordEvidence(testInfo, snapshot, 0, browserLog, screenshotPath);
 });
 
-test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진단을 표시한다", async ({
+test("camera_projection: LH/+Z 카메라로 wireframe 큐브를 원근 투영한다", async ({
   page,
 }, testInfo) => {
   testInfo.annotations.push(
-    { type: "scenario", description: "coordinate_spaces" },
-    { type: "steps", description: "12" },
+    { type: "scenario", description: "camera_projection" },
+    { type: "steps", description: "14" },
   );
   const browserLog = observeBrowserLog(page);
   await openReadyPage(page);
@@ -219,14 +219,12 @@ test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진�
   const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
   expect(initial.stats.inputVertices).toBe(8);
-  expect(initial.pixelHash).toBe("1a480e35");
-  const stageColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
+  expect(initial.pixelHash).toBe("bdd26e0f");
+  const projectionColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     const expected = [
       [238, 244, 255, 255],
       [255, 210, 72, 255],
-      [72, 224, 194, 255],
-      [184, 132, 255, 255],
     ];
     const counts = Array(expected.length).fill(0);
     for (let index = 0; index < data.length; index += 4) {
@@ -238,8 +236,15 @@ test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진�
     }
     return counts;
   });
-  expect(stageColorCounts.every((count) => count > 0)).toBe(true);
+  expect(projectionColorCounts.every((count) => count > 0)).toBe(true);
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0",
+  );
   await expect(page.locator("#coordinate-debug")).toContainText("선택 정점 v6");
+  await expect(page.locator("#coordinate-debug")).toContainText("w_clip");
+  await expect(page.locator("#coordinate-debug")).toContainText("NDC (");
+  await expect(page.locator("#coordinate-debug")).toContainText("Screen (");
+  await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 0");
   await expect(page.locator("#coordinate-debug")).toContainText("invalid values: 0");
   const disabled = await page.evaluate(() => {
     window.__softRasterizer.setDebugLinesEnabled(false);
@@ -261,7 +266,9 @@ test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진�
     window.__softRasterizer.setModelRotationY(Number.NaN);
     return window.__softRasterizer.advanceFrame(0);
   });
-  expect(invalid.stats.invalidValues).toBe(24);
+  expect(invalid.stats.invalidValues).toBe(32);
+  await expect(page.locator("#coordinate-debug")).toContainText("NDC invalid · Screen invalid");
+  await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 8");
   await expect(page.locator("#coordinate-debug")).toContainText("첫 공간: World");
   const recovered = await page.evaluate(() => {
     window.__softRasterizer.setModelRotationY(0);
@@ -276,15 +283,15 @@ test("coordinate_spaces: 회전 큐브의 Object/World/View/Clip 단계와 진�
   await mkdir(screenshotDirectory, { recursive: true });
   const screenshotPath = path.join(
     screenshotDirectory,
-    `${EXECUTION_MODE}-${testInfo.project.name}-chapter6-coordinate-spaces.png`,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter7-camera-projection.png`,
   );
   await page.locator("main").screenshot({ path: screenshotPath });
-  await testInfo.attach("chapter6-coordinate-spaces", {
+  await testInfo.attach("chapter7-camera-projection", {
     path: screenshotPath,
     contentType: "image/png",
   });
   expect(browserLog.errors).toEqual([]);
-  recordEvidence(testInfo, recovered, 0, browserLog, screenshotPath, { stageColorCounts });
+  recordEvidence(testInfo, recovered, 0, browserLog, screenshotPath, { projectionColorCounts });
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({
@@ -370,6 +377,7 @@ test("resize_memory_view: CSS 논리 해상도로 resize하고 Wasm view를 재�
       framebufferGeneration: 1,
       resizeEvents: 1,
     });
+  await expect(page.locator("#coordinate-debug")).toContainText("aspect 1.777");
 
   const after = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.05));
   expect(after.deviceScaleFactor).toBe(before.deviceScaleFactor);

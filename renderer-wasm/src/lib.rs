@@ -141,20 +141,47 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         .diagnostics
         .first_invalid_space
         .map_or("없음", CoordinateSpace::label);
+    let ndc = snapshot.selected_ndc.map_or_else(
+        || "invalid".to_string(),
+        |position| {
+            format!(
+                "({:.3}, {:.3}, {:.3})",
+                position.0.x, position.0.y, position.0.z
+            )
+        },
+    );
+    let screen = snapshot.selected_viewport.map_or_else(
+        || "invalid".to_string(),
+        |position| {
+            format!(
+                "({:.1}, {:.1}, z={:.3})",
+                position.x, position.y, position.z_ndc
+            )
+        },
+    );
     format!(
-        "선택 정점 v{} · model Y {:.3} rad\n\
+        "LH/+Z 카메라 · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}\n\
+         선택 정점 v{} · model Y {:.3} rad\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
+         w_clip {:.3} · NDC {} · Screen {}\n\
          clip 거리 [x+w, w-x, y+w, w-y, z, w-z]\n\
          [{:.3}, {:.3}, {:.3}, {:.3}, {:.3}, {:.3}]\n\
          Object 범위 {} .. {}\nWorld  범위 {} .. {}\n\
          View   범위 {} .. {}\nClip   범위 {} .. {}\n\
-         invalid values: {} · 첫 공간: {}",
+         invalid values: {} · projection failures: {} · 첫 공간: {}",
+        snapshot.fov_y_radians.to_degrees(),
+        snapshot.near,
+        snapshot.far,
+        snapshot.aspect,
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
         format_vec4(trace.value(CoordinateSpace::Object)),
         format_vec4(trace.value(CoordinateSpace::World)),
         format_vec4(trace.value(CoordinateSpace::View)),
         format_vec4(trace.value(CoordinateSpace::Clip)),
+        trace.clip_pos.0.w,
+        ndc,
+        screen,
         distances[0],
         distances[1],
         distances[2],
@@ -170,6 +197,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         format_vec4(bounds[3].min),
         format_vec4(bounds[3].max),
         snapshot.diagnostics.invalid_values,
+        snapshot.projection_failures,
         first_invalid,
     )
 }
@@ -237,17 +265,26 @@ mod tests {
         renderer.update_and_render(0.0, 0);
         let text = renderer.coordinate_debug_text();
         assert!(text.contains("선택 정점 v6"));
+        assert!(text.contains("LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0"));
+        assert!(text.contains("w_clip"));
+        assert!(text.contains("NDC ("));
+        assert!(text.contains("Screen ("));
         assert!(text.contains("Object"));
         assert!(text.contains("clip 거리"));
-        assert!(text.contains("invalid values: 0 · 첫 공간: 없음"));
+        assert!(text.contains("invalid values: 0 · projection failures: 0 · 첫 공간: 없음"));
 
         renderer.set_model_rotation_y(f32::NAN);
         renderer.update_and_render(0.0, 0);
-        assert_eq!(renderer.stats_invalid_values(), 24);
+        assert_eq!(renderer.stats_invalid_values(), 32);
         assert!(
             renderer
                 .coordinate_debug_text()
-                .contains("invalid values: 24 · 첫 공간: World")
+                .contains("NDC invalid · Screen invalid")
+        );
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("invalid values: 24 · projection failures: 8 · 첫 공간: World")
         );
 
         renderer.set_model_rotation_y(0.0);

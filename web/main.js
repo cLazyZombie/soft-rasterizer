@@ -143,6 +143,7 @@ async function bootstrap() {
     canvas.height = size.height;
     currentSize = size;
     resizeEvents += 1;
+    coordinateDebugText = renderer.coordinate_debug_text();
     presenter.present();
     updateStatus();
   };
