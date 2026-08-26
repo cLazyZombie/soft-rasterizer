@@ -1,7 +1,7 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 23장까지 homogeneous clipping 뒤 scalar mesh pipeline, linear texture/mipmap sampling,
-//! Blinn-Phong 조명, OBJ, alpha queue와 2x SSAA resolve를 조립한다.
+//! 25장까지 homogeneous clipping 뒤 scalar/tiled mesh pipeline, linear texture/mipmap
+//! sampling, Blinn-Phong 조명, OBJ, alpha queue와 2x SSAA resolve를 조립한다.
 
 pub mod camera;
 pub mod camera_control;
@@ -28,8 +28,8 @@ use math::{Mat4, Vec2, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
     AttributeInterpolationMode, CullMode, DepthDebugMode, FaceOrientation, FragmentInput,
-    PipelineDebugMode, ScreenVertex, TriangleDisposition, TriangleSetup, TriangleSetupError,
-    WindingDebugMode, classify_triangle, normalized_channel_to_u8,
+    PipelineDebugMode, RasterPath, ScreenVertex, TriangleDisposition, TriangleSetup,
+    TriangleSetupError, WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
 use texture::{
     AlphaMode, Material, NormalMode, SamplerState, ShaderMode, Texture, TextureColorSpace,
@@ -616,12 +616,17 @@ pub struct FrameStats {
     pub invalid_lod_samples: u32,
     pub overdrawn_pixels: u32,
     pub max_overdraw: u32,
+    pub raster_path: RasterPath,
+    pub tiled_rasterized_triangles: u32,
+    pub tile_visits: u32,
+    pub tile_counter_overflow: bool,
 }
 
 impl FrameStats {
-    /// 한 scalar frame이 15장의 단계별 분류와 제출 순서를 완전히 보존했는지 확인한다.
+    /// 한 scalar/tiled frame이 단계별 분류와 제출 순서를 완전히 보존했는지 확인한다.
     pub const fn pipeline_relations_hold(self) -> bool {
         !self.sample_counter_overflow
+            && !self.tile_counter_overflow
             && self.generated_triangles
                 == self
                     .submitted_triangles
@@ -653,14 +658,23 @@ impl FrameStats {
             && self.max_overdraw <= self.covered_samples
             && ((self.overdrawn_pixels == 0 && self.max_overdraw == 0)
                 || (self.overdrawn_pixels > 0 && self.max_overdraw > 0))
+            && match self.raster_path {
+                RasterPath::Scalar => self.tiled_rasterized_triangles == 0 && self.tile_visits == 0,
+                RasterPath::Tiled16 => {
+                    self.tiled_rasterized_triangles == self.rasterized_triangles
+                        && ((self.rasterized_triangles == 0 && self.tile_visits == 0)
+                            || (self.rasterized_triangles > 0
+                                && self.tile_visits >= self.rasterized_triangles))
+                }
+            }
     }
 }
 
 const fn pipeline_stats_are_consistent_or_overflowed(stats: FrameStats) -> bool {
-    stats.sample_counter_overflow || stats.pipeline_relations_hold()
+    stats.sample_counter_overflow || stats.tile_counter_overflow || stats.pipeline_relations_hold()
 }
 
-/// 18장까지의 고정 scalar pipeline state다. Material은 각 `DrawItem`이 소유하고,
+/// 고정 scalar/tiled pipeline state다. Material은 각 `DrawItem`이 소유하고,
 /// depth는 모든 debug mode에서 같은 strict-less test/write 계약을 사용한다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PipelineState {
@@ -1133,6 +1147,7 @@ pub struct CoordinateDebugSnapshot {
     pub mesh_triangles: u32,
     pub material_id: u32,
     pub pipeline_state: PipelineState,
+    pub raster_path: RasterPath,
     pub debug_lines_enabled: bool,
     pub cull_mode: CullMode,
     pub winding_debug_mode: WindingDebugMode,
@@ -1167,12 +1182,13 @@ fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mu
     materials.get_mut(id.0 as usize)
 }
 
-/// 렌더 타깃과 scalar mesh pipeline/texture/lighting/camera 상태를 소유한다.
+/// 렌더 타깃과 scalar/tiled mesh pipeline/texture/lighting/camera 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
     supersample_target: Option<RenderTarget>,
     quality_mode: QualityMode,
+    raster_path: RasterPath,
     mipmap_enabled: bool,
     mip_debug_enabled: bool,
     stats: FrameStats,
@@ -1310,6 +1326,7 @@ impl Renderer {
             target,
             supersample_target: None,
             quality_mode: QualityMode::NoAa,
+            raster_path: RasterPath::Scalar,
             mipmap_enabled: false,
             mip_debug_enabled: false,
             stats: FrameStats::default(),
@@ -1375,6 +1392,7 @@ impl Renderer {
             blend_color_space: renderer.blend_color_space,
             mipmap_enabled: renderer.mipmap_enabled,
             mip_debug_enabled: renderer.mip_debug_enabled,
+            raster_path: renderer.raster_path,
         };
         draw_frame(
             &mut renderer.target,
@@ -1522,6 +1540,7 @@ impl Renderer {
         let draw_options = FrameDrawOptions {
             debug_lines_enabled: self.debug_lines_enabled,
             pipeline_state: self.pipeline_state,
+            raster_path: self.raster_path,
             uv_checker_enabled: self.perspective_debug_enabled,
             sampled_texture,
             material,
@@ -1562,9 +1581,12 @@ impl Renderer {
                 },
                 &mut self.clipper,
                 &mut self.transparent_scratch,
-                cube_material.alpha_cutoff,
-                self.transparent_sort_enabled,
-                self.blend_color_space,
+                TransparencyDrawOptions {
+                    alpha_cutoff: cube_material.alpha_cutoff,
+                    sort_transparent: self.transparent_sort_enabled,
+                    blend_color_space: self.blend_color_space,
+                    raster_path: self.raster_path,
+                },
             );
         } else {
             draw_frame(
@@ -1751,9 +1773,12 @@ impl Renderer {
                     },
                     &mut self.clipper,
                     &mut self.transparent_scratch,
-                    material.alpha_cutoff,
-                    self.transparent_sort_enabled,
-                    self.blend_color_space,
+                    TransparencyDrawOptions {
+                        alpha_cutoff: material.alpha_cutoff,
+                        sort_transparent: self.transparent_sort_enabled,
+                        blend_color_space: self.blend_color_space,
+                        raster_path: self.raster_path,
+                    },
                 ),
                 0,
             )
@@ -1795,6 +1820,7 @@ impl Renderer {
                         blend_color_space: self.blend_color_space,
                         mipmap_enabled: self.mipmap_enabled,
                         mip_debug_enabled: self.mip_debug_enabled,
+                        raster_path: self.raster_path,
                     },
                     mesh,
                     &mut self.clipper,
@@ -1904,10 +1930,14 @@ impl Renderer {
             invalid_lod_samples: draw_report.invalid_lod_samples,
             overdrawn_pixels,
             max_overdraw,
+            raster_path: self.raster_path,
+            tiled_rasterized_triangles: draw_report.tiled_rasterized_triangles,
+            tile_visits: draw_report.tile_visits,
+            tile_counter_overflow: draw_report.tile_counter_overflow,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
-            "15장 scalar pipeline의 단계별 FrameStats 관계식이 깨졌다: {:?}",
+            "scalar/tiled pipeline의 단계별 FrameStats 관계식이 깨졌다: {:?}",
             self.stats
         );
         self.stats
@@ -2409,6 +2439,14 @@ impl Renderer {
         self.quality_mode
     }
 
+    pub fn set_raster_path(&mut self, path: RasterPath) {
+        self.raster_path = path;
+    }
+
+    pub const fn raster_path(&self) -> RasterPath {
+        self.raster_path
+    }
+
     pub fn render_dimensions_public(&self) -> (usize, usize) {
         self.render_dimensions()
     }
@@ -2550,6 +2588,7 @@ impl Renderer {
             mesh_triangles: mesh.triangle_count() as u32,
             material_id,
             pipeline_state: self.pipeline_state,
+            raster_path: self.raster_path,
             debug_lines_enabled: self.debug_lines_enabled,
             cull_mode: self.pipeline_state.cull_mode,
             winding_debug_mode: match self.pipeline_state.debug_mode {
@@ -2825,6 +2864,9 @@ struct FrameDrawReport {
     min_mip_level: u32,
     max_mip_level: u32,
     invalid_lod_samples: u32,
+    tiled_rasterized_triangles: u32,
+    tile_visits: u32,
+    tile_counter_overflow: bool,
 }
 
 impl FrameDrawReport {
@@ -2912,6 +2954,15 @@ impl FrameDrawReport {
         self.invalid_lod_samples = self
             .invalid_lod_samples
             .saturating_add(other.invalid_lod_samples);
+        self.tiled_rasterized_triangles = self
+            .tiled_rasterized_triangles
+            .saturating_add(other.tiled_rasterized_triangles);
+        self.tile_counter_overflow |= other.tile_counter_overflow;
+        add_sample_counter(
+            &mut self.tile_visits,
+            other.tile_visits,
+            &mut self.tile_counter_overflow,
+        );
     }
 }
 
@@ -2928,6 +2979,7 @@ struct FrameDrawOptions<'a> {
     blend_color_space: BlendColorSpace,
     mipmap_enabled: bool,
     mip_debug_enabled: bool,
+    raster_path: RasterPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2962,6 +3014,7 @@ struct RasterDrawOptions<'a> {
     blend_color_space: BlendColorSpace,
     mipmap_enabled: bool,
     mip_debug_enabled: bool,
+    raster_path: RasterPath,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2985,6 +3038,7 @@ impl<'a> FrameDrawOptions<'a> {
             blend_color_space: self.blend_color_space,
             mipmap_enabled: self.mipmap_enabled,
             mip_debug_enabled: self.mip_debug_enabled,
+            raster_path: self.raster_path,
         }
     }
 }
@@ -3126,14 +3180,20 @@ struct TransparencyFixture<'a> {
     cutout_texture: &'a Texture,
 }
 
+#[derive(Clone, Copy)]
+struct TransparencyDrawOptions {
+    alpha_cutoff: f32,
+    sort_transparent: bool,
+    blend_color_space: BlendColorSpace,
+    raster_path: RasterPath,
+}
+
 fn draw_transparency_fixture(
     target: &mut RenderTarget,
     fixture: TransparencyFixture<'_>,
     clipper: &mut TriangleClipper,
     transparent_scratch: &mut Vec<PreparedTransparentTriangle>,
-    alpha_cutoff: f32,
-    sort_transparent: bool,
-    blend_color_space: BlendColorSpace,
+    options: TransparencyDrawOptions,
 ) -> FrameDrawReport {
     target.render_gradient_checker();
     let pipeline_state = PipelineState {
@@ -3164,7 +3224,7 @@ fn draw_transparency_fixture(
             Some((fixture.cutout_texture, sampler)),
             Material {
                 alpha_mode: AlphaMode::Mask,
-                alpha_cutoff,
+                alpha_cutoff: options.alpha_cutoff,
                 ..Material::default()
             },
         ),
@@ -3189,10 +3249,11 @@ fn draw_transparency_fixture(
                 linear_material: LinearMaterial::from_srgb(material),
                 light: DirectionalLight::default(),
                 camera_world: Vec3::ZERO,
-                sort_transparent,
-                blend_color_space,
+                sort_transparent: options.sort_transparent,
+                blend_color_space: options.blend_color_space,
                 mipmap_enabled: false,
                 mip_debug_enabled: false,
+                raster_path: options.raster_path,
             },
             mesh,
             clipper,
@@ -3478,7 +3539,7 @@ fn submit_triangle(
     let mut max_mip_level = 0_u32;
     let mut invalid_lod_samples = 0_u32;
     let mut sample_counter_overflow = false;
-    setup.rasterize(|sample| {
+    let mut visit_sample = |sample: raster::CoveredSample| {
         increment_sample_counter(&mut covered_samples, &mut sample_counter_overflow);
         let barycentric = setup.covered_barycentric(sample.edge_values);
         max_barycentric_sum_error = max_barycentric_sum_error.max(barycentric.sum_error());
@@ -3742,9 +3803,25 @@ fn submit_triangle(
         } else {
             increment_sample_counter(&mut blended_samples, &mut sample_counter_overflow);
         }
-    });
+    };
+    let tiled_report = match options.raster_path {
+        RasterPath::Scalar => {
+            setup.rasterize(&mut visit_sample);
+            raster::TiledRasterizationReport::default()
+        }
+        RasterPath::Tiled16 => setup.rasterize_tiled_16(&mut visit_sample),
+    };
     report.submitted_triangles = report.submitted_triangles.saturating_add(1);
     report.rasterized_triangles = report.rasterized_triangles.saturating_add(1);
+    if options.raster_path == RasterPath::Tiled16 {
+        report.tiled_rasterized_triangles = report.tiled_rasterized_triangles.saturating_add(1);
+        report.tile_counter_overflow |= tiled_report.tile_counter_overflow;
+        add_sample_counter(
+            &mut report.tile_visits,
+            tiled_report.visited_tiles,
+            &mut report.tile_counter_overflow,
+        );
+    }
     report.sample_counter_overflow |= sample_counter_overflow;
     add_sample_counter(
         &mut report.covered_samples,
@@ -4301,6 +4378,7 @@ mod tests {
                 blend_color_space: BlendColorSpace::Linear,
                 mipmap_enabled: false,
                 mip_debug_enabled: false,
+                raster_path: RasterPath::Scalar,
             },
             &mesh,
             &mut clipper,
@@ -4337,6 +4415,7 @@ mod tests {
             blend_color_space: BlendColorSpace::Linear,
             mipmap_enabled: false,
             mip_debug_enabled: false,
+            raster_path: RasterPath::Scalar,
         }
     }
 
@@ -6227,6 +6306,13 @@ mod tests {
             ..FrameStats::default()
         };
         assert!(valid.pipeline_relations_hold());
+        let tiled_valid = FrameStats {
+            raster_path: RasterPath::Tiled16,
+            tiled_rasterized_triangles: valid.rasterized_triangles,
+            tile_visits: valid.rasterized_triangles * 2,
+            ..valid
+        };
+        assert!(tiled_valid.pipeline_relations_hold());
         for invalid in [
             FrameStats {
                 generated_triangles: 13,
@@ -6282,6 +6368,30 @@ mod tests {
                 ..valid
             },
             FrameStats {
+                tiled_rasterized_triangles: 1,
+                tile_visits: 1,
+                ..valid
+            },
+            FrameStats {
+                raster_path: RasterPath::Tiled16,
+                tiled_rasterized_triangles: 1,
+                tile_visits: 1,
+                ..valid
+            },
+            FrameStats {
+                raster_path: RasterPath::Tiled16,
+                tiled_rasterized_triangles: valid.rasterized_triangles,
+                tile_visits: valid.rasterized_triangles - 1,
+                ..valid
+            },
+            FrameStats {
+                raster_path: RasterPath::Tiled16,
+                tiled_rasterized_triangles: valid.rasterized_triangles,
+                tile_visits: valid.rasterized_triangles,
+                tile_counter_overflow: true,
+                ..valid
+            },
+            FrameStats {
                 overdrawn_pixels: 121,
                 max_overdraw: 1,
                 ..valid
@@ -6305,6 +6415,15 @@ mod tests {
         };
         assert!(!overflowed.pipeline_relations_hold());
         assert!(pipeline_stats_are_consistent_or_overflowed(overflowed));
+        let tile_overflowed = FrameStats {
+            raster_path: RasterPath::Tiled16,
+            tiled_rasterized_triangles: valid.rasterized_triangles,
+            tile_visits: u32::MAX,
+            tile_counter_overflow: true,
+            ..valid
+        };
+        assert!(!tile_overflowed.pipeline_relations_hold());
+        assert!(pipeline_stats_are_consistent_or_overflowed(tile_overflowed));
     }
 
     #[test]
@@ -6855,6 +6974,7 @@ mod tests {
                     blend_color_space: BlendColorSpace::Linear,
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
+                    raster_path: RasterPath::Scalar,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -7479,6 +7599,7 @@ mod tests {
                     blend_color_space: BlendColorSpace::Linear,
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
+                    raster_path: RasterPath::Scalar,
                 },
                 &mask_mesh,
                 &mut TriangleClipper::default(),
@@ -7513,6 +7634,7 @@ mod tests {
                     blend_color_space: BlendColorSpace::Linear,
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
+                    raster_path: RasterPath::Scalar,
                 },
                 &blend_mesh,
                 &mut TriangleClipper::default(),
@@ -7610,6 +7732,7 @@ mod tests {
                     blend_color_space: BlendColorSpace::Linear,
                     mipmap_enabled: true,
                     mip_debug_enabled: true,
+                    raster_path: RasterPath::Scalar,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -7697,6 +7820,7 @@ mod tests {
                     blend_color_space: BlendColorSpace::Linear,
                     mipmap_enabled: true,
                     mip_debug_enabled,
+                    raster_path: RasterPath::Scalar,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -7904,5 +8028,90 @@ mod tests {
                     .is_none_or(|target| target.overdraw.is_none())
             );
         }
+    }
+
+    #[test]
+    fn chapter_twenty_five_tiled_cube_is_pixel_depth_and_stats_equivalent_to_scalar() {
+        let configure = |renderer: &mut Renderer| {
+            renderer.set_debug_lines_enabled(false);
+            renderer.set_cull_mode(CullMode::None);
+            renderer.set_texture_sampling_enabled(true);
+            renderer.set_lighting_enabled(true);
+            renderer.set_mipmap_enabled(true);
+            renderer.set_quality_mode(QualityMode::Ssaa2x).unwrap();
+        };
+        let mut scalar = Renderer::new(64, 48).unwrap();
+        configure(&mut scalar);
+        scalar.set_raster_path(RasterPath::Scalar);
+        let scalar_stats = scalar.update_and_render(0.0, InputSnapshot::default());
+
+        let mut tiled = Renderer::new(64, 48).unwrap();
+        configure(&mut tiled);
+        tiled.set_raster_path(RasterPath::Tiled16);
+        let tiled_stats = tiled.update_and_render(0.0, InputSnapshot::default());
+
+        assert_eq!(scalar.color_buffer(), tiled.color_buffer());
+        assert_eq!(scalar.target.depth(), tiled.target.depth());
+        assert_eq!(scalar.raster_path(), RasterPath::Scalar);
+        assert_eq!(tiled.raster_path(), RasterPath::Tiled16);
+        assert_eq!(scalar_stats.tiled_rasterized_triangles, 0);
+        assert_eq!(scalar_stats.tile_visits, 0);
+        assert_eq!(
+            tiled_stats.tiled_rasterized_triangles,
+            tiled_stats.rasterized_triangles
+        );
+        assert!(tiled_stats.tile_visits >= tiled_stats.tiled_rasterized_triangles);
+        let mut normalized_tiled_stats = tiled_stats;
+        normalized_tiled_stats.raster_path = RasterPath::Scalar;
+        normalized_tiled_stats.tiled_rasterized_triangles = 0;
+        normalized_tiled_stats.tile_visits = 0;
+        assert_eq!(normalized_tiled_stats, scalar_stats);
+        assert!(tiled_stats.pipeline_relations_hold());
+    }
+
+    #[test]
+    fn chapter_twenty_five_tiled_transparency_preserves_mask_blend_depth_and_order() {
+        for (sort_transparent, blend_color_space) in [
+            (true, BlendColorSpace::Linear),
+            (false, BlendColorSpace::EncodedWrongWay),
+        ] {
+            let configure = |renderer: &mut Renderer, raster_path| {
+                renderer.set_debug_lines_enabled(false);
+                renderer.set_alpha_cutoff(0.4).unwrap();
+                renderer.set_transparent_sort_enabled(sort_transparent);
+                renderer.set_blend_color_space(blend_color_space);
+                renderer.set_transparency_debug_enabled(true);
+                renderer.set_raster_path(raster_path);
+            };
+            let mut scalar = Renderer::new(64, 48).unwrap();
+            configure(&mut scalar, RasterPath::Scalar);
+            let scalar_stats = scalar.update_and_render(0.0, InputSnapshot::default());
+            let mut tiled = Renderer::new(64, 48).unwrap();
+            configure(&mut tiled, RasterPath::Tiled16);
+            let tiled_stats = tiled.update_and_render(0.0, InputSnapshot::default());
+
+            assert_eq!(tiled.color_buffer(), scalar.color_buffer());
+            assert_eq!(tiled.target.depth(), scalar.target.depth());
+            assert!(tiled_stats.alpha_discarded_samples > 0);
+            assert!(tiled_stats.depth_written_samples > 0);
+            assert!(tiled_stats.blended_samples > 0);
+            assert!(tiled_stats.depth_written_samples < tiled_stats.depth_passed_samples);
+            let mut normalized_tiled_stats = tiled_stats;
+            normalized_tiled_stats.raster_path = RasterPath::Scalar;
+            normalized_tiled_stats.tiled_rasterized_triangles = 0;
+            normalized_tiled_stats.tile_visits = 0;
+            assert_eq!(normalized_tiled_stats, scalar_stats);
+        }
+
+        let mut aggregate = FrameDrawReport {
+            tile_visits: u32::MAX - 1,
+            ..FrameDrawReport::default()
+        };
+        aggregate.absorb(FrameDrawReport {
+            tile_visits: 2,
+            ..FrameDrawReport::default()
+        });
+        assert_eq!(aggregate.tile_visits, u32::MAX);
+        assert!(aggregate.tile_counter_overflow);
     }
 }

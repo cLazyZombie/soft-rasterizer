@@ -4,6 +4,7 @@ import { readObjFileBytes, validateObjFileSize } from "./mesh-upload.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
 import { FrameTimingRing, summarizeFrameTimings } from "./frame-timing.js";
+import { resolveRasterPath } from "./raster-path.js";
 
 const MAX_FRAME_DT_SECONDS = 0.1;
 
@@ -63,6 +64,9 @@ function rendererStats(renderer) {
     invalidLodSamples: renderer.stats_invalid_lod_samples(),
     overdrawnPixels: renderer.stats_overdrawn_pixels(),
     maxOverdraw: renderer.stats_max_overdraw(),
+    tiledRasterizedTriangles: renderer.stats_tiled_rasterized_triangles(),
+    tileVisits: renderer.stats_tile_visits(),
+    tileCounterOverflow: renderer.stats_tile_counter_overflow(),
   };
 }
 
@@ -126,6 +130,7 @@ async function bootstrap() {
   const transparentSortCheckbox = document.querySelector("#transparent-sort");
   const blendColorSpaceSelect = document.querySelector("#blend-color-space");
   const qualityModeSelect = document.querySelector("#quality-mode");
+  const rasterPathSelect = document.querySelector("#raster-path");
   const mipmapEnabledCheckbox = document.querySelector("#mipmap-enabled");
   const mipDebugCheckbox = document.querySelector("#mip-debug");
   const initialMipmapEnabled = mipmapEnabledCheckbox.checked;
@@ -155,6 +160,13 @@ async function bootstrap() {
   let textureDecodeGeneration = 0;
   let meshStatusText = "내장 cube · mesh 0 · 24 vertices · 12 triangles";
   let meshLoadGeneration = 0;
+  const rasterCapabilities = Object.freeze({
+    crossOriginIsolated: globalThis.crossOriginIsolated === true,
+    wasmSharedMemory: false,
+    parallelSchedulerBuilt: false,
+  });
+  const parallelCapability = resolveRasterPath(2, rasterCapabilities);
+  let rasterResolution = resolveRasterPath(Number(rasterPathSelect.value), rasterCapabilities);
 
   const updateStatus = () => {
     document.querySelector("#internal-size").textContent = `${currentSize.width} × ${currentSize.height} px`;
@@ -165,6 +177,13 @@ async function bootstrap() {
     document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
     document.querySelector("#coverage-algorithm").textContent =
       "S=256 incremental edge · pixel center · top-left (Rust)";
+    document.querySelector("#raster-status").textContent =
+      `${rasterResolution.actualLabel} · ${renderer.stats_tiled_rasterized_triangles()} tiled triangles · ` +
+      `${renderer.stats_tile_visits()} tile visits · overflow ${renderer.stats_tile_counter_overflow()}`;
+    document.querySelector("#parallel-capability").textContent =
+      rasterResolution.usedFallback
+        ? rasterResolution.reason
+        : `Shared threads 미사용 · 요청 시 ${parallelCapability.reason}`;
     document.querySelector("#interpolation-algorithm").textContent =
       attributeInterpolationModeSelect.value === "1"
         ? "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)"
@@ -279,6 +298,14 @@ async function bootstrap() {
   const setCameraMode = (mode) => {
     renderer.set_camera_mode(mode);
     cameraModeSelect.value = String(mode);
+  };
+
+  const setRasterPath = (requestedMode) => {
+    const resolution = resolveRasterPath(requestedMode, rasterCapabilities);
+    renderer.set_raster_path(resolution.actualMode);
+    rasterResolution = resolution;
+    rasterPathSelect.value = String(requestedMode);
+    return resolution;
   };
 
   const syncPipelineViewControls = (mode) => {
@@ -595,6 +622,7 @@ async function bootstrap() {
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCameraMode(Number(cameraModeSelect.value));
+  setRasterPath(Number(rasterPathSelect.value));
   setCullMode(Number(cullModeSelect.value));
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
@@ -654,6 +682,10 @@ async function bootstrap() {
 
   cameraModeSelect.addEventListener("change", () => {
     setCameraMode(Number(cameraModeSelect.value));
+    renderFrame(0);
+  });
+  rasterPathSelect.addEventListener("change", () => {
+    setRasterPath(Number(rasterPathSelect.value));
     renderFrame(0);
   });
   cullModeSelect.addEventListener("change", () => {
@@ -956,6 +988,14 @@ async function bootstrap() {
       flags: lastInputSnapshot[7],
     },
     cullMode: Number(cullModeSelect.value),
+    rasterPath: {
+      requestedMode: rasterResolution.requestedMode,
+      actualMode: renderer.raster_path(),
+      actualLabel: rasterResolution.actualLabel,
+      usedFallback: rasterResolution.usedFallback,
+      reason: rasterResolution.reason,
+      capabilities: rasterCapabilities,
+    },
     pipelineDebugMode: Number(pipelineDebugModeSelect.value),
     windingDebugMode: barycentricDebugCheckbox.checked
       ? 2
@@ -1064,6 +1104,10 @@ async function bootstrap() {
       samples.push(renderFrame(fixedDtSeconds));
     }
     const stats = rendererStats(renderer);
+    const logicalPixels = renderer.width() * renderer.height();
+    const supersamplePixels =
+      renderer.quality_mode() === 1 ? renderer.render_width() * renderer.render_height() : 0;
+    const bytesPerColorDepthPixel = 8;
     return {
       buildMode: "release Wasm · test automation web",
       browser: navigator.userAgent,
@@ -1074,9 +1118,22 @@ async function bootstrap() {
       },
       resolution: [renderer.render_width(), renderer.render_height()],
       logicalResolution: [renderer.width(), renderer.height()],
+      memory: {
+        logicalColorDepthMiB:
+          (logicalPixels * bytesPerColorDepthPixel) / (1024 * 1024),
+        supersampleColorDepthMiB:
+          (supersamplePixels * bytesPerColorDepthPixel) / (1024 * 1024),
+        estimatedRendererTargetsMiB:
+          ((logicalPixels + supersamplePixels) * bytesPerColorDepthPixel) / (1024 * 1024),
+      },
       warmupFrames,
       sampleFrames,
       fixedDtSeconds,
+      rasterPath: {
+        requestedMode: rasterResolution.requestedMode,
+        actualMode: renderer.raster_path(),
+        actualLabel: rasterResolution.actualLabel,
+      },
       triangles: stats.inputTriangles,
       coveredSamples: stats.coveredSamples,
       shadedSamples: stats.shadedSamples,
@@ -1124,6 +1181,11 @@ async function bootstrap() {
           renderer.set_debug_lines_enabled(enabled);
         },
         setCullMode,
+        setRasterPath(mode) {
+          const resolution = setRasterPath(mode);
+          renderFrame(0);
+          return { resolution, snapshot: snapshot() };
+        },
         setPipelineDebugMode,
         setWindingDebugMode,
         setClipDebugEnabled,

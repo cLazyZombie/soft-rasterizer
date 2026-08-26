@@ -2,6 +2,7 @@ import { expect, test } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import { FrameTimingRing, summarizeFrameTimings } from "../../web/frame-timing.js";
+import { resolveRasterPath } from "../../web/raster-path.js";
 
 const EXECUTION_MODE = process.env.SOFT_RASTERIZER_E2E_MODE ?? "unspecified";
 
@@ -65,6 +66,7 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#transparent-sort").checked = ${JSON.stringify(initialControls.transparentSortEnabled ?? true)};
           document.querySelector("#blend-color-space").value = ${JSON.stringify(String(initialControls.blendColorSpace ?? 0))};
           document.querySelector("#quality-mode").value = ${JSON.stringify(String(initialControls.qualityMode ?? 0))};
+          document.querySelector("#raster-path").value = ${JSON.stringify(String(initialControls.rasterPath ?? 0))};
           document.querySelector("#mipmap-enabled").checked = ${JSON.stringify(initialControls.mipmapEnabled ?? false)};
           document.querySelector("#mip-debug").checked = ${JSON.stringify(initialControls.mipDebugEnabled ?? false)};
         </script>`;
@@ -444,7 +446,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth < → perspective attributes → linear shade → sRGB write",
+    "transform → clip → fan → divide/viewport + 1/w → cull/setup → scalar 또는 disjoint 16×16 tile coverage → affine z_ndc → strict depth < → perspective attributes → linear shade → sRGB write",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -3021,5 +3023,201 @@ test("diagnostics_profiling: UV/overdraw view와 release p50/p95 report를 연�
     uvHash: uv.pixelHash,
     overdrawHash: overdraw.pixelHash,
     benchmark,
+  });
+});
+
+test("capstone_tiled: scalar와 disjoint 16x16 tile 경로의 exact image와 fallback을 검증한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "capstone_tiled" },
+    { type: "steps", description: "42" },
+  );
+  const browserLog = observeBrowserLog(page);
+  expect(
+    resolveRasterPath(0, {
+      crossOriginIsolated: false,
+      wasmSharedMemory: false,
+      parallelSchedulerBuilt: false,
+    }),
+  ).toMatchObject({ actualMode: 0, usedFallback: false });
+  expect(
+    resolveRasterPath(0, {
+      crossOriginIsolated: true,
+      wasmSharedMemory: true,
+      parallelSchedulerBuilt: true,
+    }),
+  ).toMatchObject({ actualMode: 0, usedFallback: false });
+  expect(
+    resolveRasterPath(1, {
+      crossOriginIsolated: true,
+      wasmSharedMemory: true,
+      parallelSchedulerBuilt: true,
+    }),
+  ).toMatchObject({ actualMode: 1, usedFallback: false });
+  expect(() =>
+    resolveRasterPath(3, {
+      crossOriginIsolated: false,
+      wasmSharedMemory: false,
+      parallelSchedulerBuilt: false,
+    }),
+  ).toThrow("raster path");
+  expect(() => resolveRasterPath(0, {})).toThrow("capability");
+  expect(() =>
+    resolveRasterPath(2, {
+      crossOriginIsolated: true,
+      wasmSharedMemory: true,
+      parallelSchedulerBuilt: true,
+    }),
+  ).toThrow("single-thread capstone resolver");
+  const schedulerWithoutIsolation = resolveRasterPath(2, {
+    crossOriginIsolated: false,
+    wasmSharedMemory: true,
+    parallelSchedulerBuilt: true,
+  });
+  expect(schedulerWithoutIsolation).toMatchObject({ actualMode: 1, usedFallback: true });
+  expect(schedulerWithoutIsolation.reason).toContain("crossOriginIsolated=false");
+  const schedulerWithoutSharedBuild = resolveRasterPath(2, {
+    crossOriginIsolated: true,
+    wasmSharedMemory: false,
+    parallelSchedulerBuilt: true,
+  });
+  expect(schedulerWithoutSharedBuild).toMatchObject({ actualMode: 1, usedFallback: true });
+  expect(schedulerWithoutSharedBuild.reason).toContain("shared-memory build");
+  const unavailable = resolveRasterPath(2, {
+    crossOriginIsolated: false,
+    wasmSharedMemory: false,
+    parallelSchedulerBuilt: false,
+  });
+  expect(unavailable).toMatchObject({ actualMode: 1, usedFallback: true });
+  expect(unavailable.reason).toContain("crossOriginIsolated=false");
+  const isolatedWithoutSharedBuild = resolveRasterPath(2, {
+    crossOriginIsolated: true,
+    wasmSharedMemory: false,
+    parallelSchedulerBuilt: false,
+  });
+  expect(isolatedWithoutSharedBuild.reason).not.toContain("crossOriginIsolated=false");
+  expect(isolatedWithoutSharedBuild.reason).toContain("shared-memory build");
+
+  await openReadyPage(page, { cullMode: 0, rasterPath: 0 });
+  const scalar = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(scalar.rasterPath).toMatchObject({
+    requestedMode: 0,
+    actualMode: 0,
+    usedFallback: false,
+  });
+  expect(scalar.pixelHash).toBe("10cf841e");
+  expect({
+    inputTriangles: scalar.stats.inputTriangles,
+    coveredSamples: scalar.stats.coveredSamples,
+    shadedSamples: scalar.stats.shadedSamples,
+  }).toEqual({ inputTriangles: 12, coveredSamples: 125572, shadedSamples: 75292 });
+  expect([scalar.stats.tiledRasterizedTriangles, scalar.stats.tileVisits]).toEqual([0, 0]);
+  const invariantCounts = (snapshot) => ({
+    inputTriangles: snapshot.stats.inputTriangles,
+    generatedTriangles: snapshot.stats.generatedTriangles,
+    submittedTriangles: snapshot.stats.submittedTriangles,
+    culledTriangles: snapshot.stats.culledTriangles,
+    rasterizedTriangles: snapshot.stats.rasterizedTriangles,
+    coveredSamples: snapshot.stats.coveredSamples,
+    shadedSamples: snapshot.stats.shadedSamples,
+    depthPassedSamples: snapshot.stats.depthPassedSamples,
+    depthFailedSamples: snapshot.stats.depthFailedSamples,
+  });
+
+  await page.locator("#raster-path").selectOption("1");
+  const tiled = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(tiled.rasterPath).toMatchObject({
+    requestedMode: 1,
+    actualMode: 1,
+    usedFallback: false,
+  });
+  expect(tiled.pixelHash).toBe(scalar.pixelHash);
+  expect(invariantCounts(tiled)).toEqual(invariantCounts(scalar));
+  expect(tiled.stats.tiledRasterizedTriangles).toBe(tiled.stats.rasterizedTriangles);
+  expect(tiled.stats.tileVisits).toBeGreaterThanOrEqual(tiled.stats.tiledRasterizedTriangles);
+  await expect(page.locator("#raster-status")).toContainText("16×16 tiled");
+
+  await page.locator("#raster-path").selectOption("2");
+  const fallback = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(fallback.rasterPath).toMatchObject({
+    requestedMode: 2,
+    actualMode: 1,
+    usedFallback: true,
+  });
+  expect(fallback.rasterPath.reason).toContain("crossOriginIsolated=false");
+  await expect(page.locator("#parallel-capability")).toContainText("fallback");
+  expect(fallback.pixelHash).toBe(scalar.pixelHash);
+
+  const invalidRequest = await page.evaluate(() => {
+    try {
+      window.__softRasterizer.setRasterPath(3);
+      return null;
+    } catch (error) {
+      return error instanceof Error ? error.message : String(error);
+    }
+  });
+  expect(invalidRequest).toContain("raster path");
+  expect(
+    await page.evaluate(() => window.__softRasterizer.snapshot().rasterPath.actualMode),
+  ).toBe(1);
+
+  await page.evaluate(() => window.__softRasterizer.setRasterPath(0));
+  const scalarBenchmark = await page.evaluate(() =>
+    window.__softRasterizer.runBenchmark(30, 120, 0),
+  );
+  expect(scalarBenchmark).toMatchObject({
+    warmupFrames: 30,
+    sampleFrames: 120,
+    fixedDtSeconds: 0,
+    rasterPath: { actualMode: 0 },
+    timings: { count: 120 },
+  });
+  expect(scalarBenchmark.memory.estimatedRendererTargetsMiB).toBeCloseTo(3.955078125);
+  const scalarAfterBenchmark = await page.evaluate(() => window.__softRasterizer.snapshot());
+
+  await page.evaluate(() => window.__softRasterizer.setRasterPath(1));
+  const tiledBenchmark = await page.evaluate(() =>
+    window.__softRasterizer.runBenchmark(30, 120, 0),
+  );
+  expect(tiledBenchmark).toMatchObject({
+    warmupFrames: 30,
+    sampleFrames: 120,
+    fixedDtSeconds: 0,
+    rasterPath: { actualMode: 1 },
+    timings: { count: 120 },
+  });
+  const tiledAfterBenchmark = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(tiledAfterBenchmark.pixelHash).toBe(scalarAfterBenchmark.pixelHash);
+  expect(invariantCounts(tiledAfterBenchmark)).toEqual(invariantCounts(scalarAfterBenchmark));
+  for (const benchmark of [scalarBenchmark, tiledBenchmark]) {
+    for (const stage of ["updateMs", "presentMs", "totalMs"]) {
+      expect([
+        Number.isFinite(benchmark.timings[stage].p50),
+        benchmark.timings[stage].p50 >= 0,
+        Number.isFinite(benchmark.timings[stage].p95),
+        benchmark.timings[stage].p95 >= benchmark.timings[stage].p50,
+      ]).toEqual([true, true, true, true]);
+    }
+  }
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter25-capstone-tiled.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter25-capstone-tiled", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, tiledAfterBenchmark, 0, browserLog, screenshotPath, {
+    scalarHash: scalar.pixelHash,
+    tiledHash: tiled.pixelHash,
+    fallback: fallback.rasterPath,
+    scalarBenchmark,
+    tiledBenchmark,
   });
 });

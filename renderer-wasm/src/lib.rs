@@ -6,7 +6,8 @@ use renderer_core::{
     camera_control::CameraMode,
     math::{Vec2, Vec3, Vec4},
     raster::{
-        AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
+        AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, RasterPath,
+        WindingDebugMode,
     },
     texture::{
         AddressMode, AlphaMode, FilterMode, NormalMode, SamplerState, ShaderMode,
@@ -674,6 +675,23 @@ impl Renderer {
         }
     }
 
+    pub fn set_raster_path(&mut self, path: u32) -> Result<(), String> {
+        let path = match path {
+            0 => RasterPath::Scalar,
+            1 => RasterPath::Tiled16,
+            _ => return Err(format!("알 수 없는 raster path입니다: {path}")),
+        };
+        self.core.set_raster_path(path);
+        Ok(())
+    }
+
+    pub fn raster_path(&self) -> u32 {
+        match self.core.raster_path() {
+            RasterPath::Scalar => 0,
+            RasterPath::Tiled16 => 1,
+        }
+    }
+
     pub fn render_width(&self) -> u32 {
         self.core.render_dimensions_public().0 as u32
     }
@@ -877,6 +895,18 @@ impl Renderer {
     pub fn stats_max_overdraw(&self) -> u32 {
         self.stats().max_overdraw
     }
+
+    pub fn stats_tiled_rasterized_triangles(&self) -> u32 {
+        self.stats().tiled_rasterized_triangles
+    }
+
+    pub fn stats_tile_visits(&self) -> u32 {
+        self.stats().tile_visits
+    }
+
+    pub fn stats_tile_counter_overflow(&self) -> bool {
+        self.stats().tile_counter_overflow
+    }
 }
 
 const fn invalid_interpolation_samples(stats: FrameStats) -> u32 {
@@ -1016,6 +1046,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · covered {} · shaded samples {} · counter overflow {} · S=256 pixel center/top-left\n\
+         raster path {} · tiled triangles {} · tile visits {} · overflow {} · disjoint 16x16 writes\n\
          quality stats render scale {} · resolved {} · mip samples {} · level {}..{} · invalid LOD {}\n\
          diagnostic stats overdrawn pixels {} · max overdraw {}\n\
          interpolation stats max |lambda sum - 1| {:.9} · mode {}\n\
@@ -1049,6 +1080,10 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.covered_samples,
         snapshot.frame_stats.shaded_samples,
         snapshot.frame_stats.sample_counter_overflow,
+        snapshot.raster_path.label(),
+        snapshot.frame_stats.tiled_rasterized_triangles,
+        snapshot.frame_stats.tile_visits,
+        snapshot.frame_stats.tile_counter_overflow,
         snapshot.frame_stats.render_scale,
         snapshot.frame_stats.resolved_pixels,
         snapshot.frame_stats.mip_samples,
@@ -1973,5 +2008,36 @@ mod tests {
                 .unwrap_err()
                 .contains("pipeline debug mode")
         );
+    }
+
+    #[test]
+    fn adapter_maps_chapter_twenty_five_scalar_and_tiled_paths() {
+        let mut renderer = Renderer::new(64, 48).unwrap();
+        assert_eq!(renderer.raster_path(), 0);
+        assert_eq!(renderer.stats_tiled_rasterized_triangles(), 0);
+        assert_eq!(renderer.stats_tile_visits(), 0);
+        renderer.set_raster_path(1).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.raster_path(), 1);
+        assert_eq!(
+            renderer.stats_tiled_rasterized_triangles(),
+            renderer.stats_rasterized_triangles()
+        );
+        assert!(renderer.stats_tile_visits() > 0);
+        assert!(!renderer.stats_tile_counter_overflow());
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("single-thread 16x16 tiled")
+        );
+        assert!(
+            renderer
+                .set_raster_path(2)
+                .unwrap_err()
+                .contains("raster path")
+        );
+        assert_eq!(renderer.raster_path(), 1);
+        renderer.set_raster_path(0).unwrap();
+        assert_eq!(renderer.raster_path(), 0);
     }
 }

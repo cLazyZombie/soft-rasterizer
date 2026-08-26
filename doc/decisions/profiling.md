@@ -12,6 +12,8 @@
 - 자동 회귀 fixture는 960x540 논리 해상도, 내장 12-triangle cube, 고정 `dt=0`, warm-up 3 frame, 측정 7 frame을 사용한다. 이 작은 표본은 경계와 report schema를 검증하기 위한 것이며 성능 예산은 아니다.
 - 성능 변경 비교에는 warm-up 30 frame 이상, 측정 120 frame을 사용하고 browser/user agent, hardware concurrency, device memory, DPR, 논리/실제 render 해상도, triangle 수, covered/shaded sample 수를 함께 기록한다.
 - benchmark 전후 pixel hash가 다르거나 `FrameStats` count가 다르면 그 측정은 무효다.
+- raster path 비교는 Scalar와 Tiled16을 같은 model/input/fixed `dt=0` 상태에서 각각 warm-up 30/표본 120 frame 이상 실행한다. tile 전용 count를 제외한 pipeline count와 pixel hash가 exact match해야 한다.
+- memory 표본은 logical/supersample color RGBA8와 `f32` depth target만 계산하며 Wasm heap 전체 사용량으로 표현하지 않는다.
 
 ## Debug view 계약
 

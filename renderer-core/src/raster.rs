@@ -14,6 +14,7 @@ pub const WIREFRAME_AREA_EPSILON: f32 = 1.0e-5;
 pub const SUBPIXEL_BITS: u32 = 8;
 pub const SUBPIXEL_SCALE: i64 = 1_i64 << SUBPIXEL_BITS;
 pub const PERSPECTIVE_DIVISOR_EPSILON: f32 = 1.0e-8;
+pub const TILE_SIZE: usize = 16;
 const SUBPIXEL_HALF: i64 = SUBPIXEL_SCALE / 2;
 const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
@@ -28,6 +29,22 @@ pub enum CullMode {
     None,
     Back,
     Front,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum RasterPath {
+    #[default]
+    Scalar,
+    Tiled16,
+}
+
+impl RasterPath {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Scalar => "scalar reference",
+            Self::Tiled16 => "single-thread 16x16 tiled",
+        }
+    }
 }
 
 impl CullMode {
@@ -587,6 +604,35 @@ pub struct TriangleSetup {
     edges: [EdgeEquation; 3],
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct TiledRasterizationReport {
+    pub covered_samples: u32,
+    pub visited_tiles: u32,
+    pub tile_counter_overflow: bool,
+}
+
+impl TiledRasterizationReport {
+    fn record_tile_visit(&mut self) {
+        if let Some(value) = self.visited_tiles.checked_add(1) {
+            self.visited_tiles = value;
+        } else {
+            self.visited_tiles = u32::MAX;
+            self.tile_counter_overflow = true;
+        }
+    }
+}
+
+fn tile_pixel_bounds(tile_x: usize, tile_y: usize, bounds: PixelBounds) -> PixelBounds {
+    let tile_start_x = tile_x * TILE_SIZE;
+    let tile_start_y = tile_y * TILE_SIZE;
+    PixelBounds {
+        min_x: tile_start_x.max(bounds.min_x),
+        min_y: tile_start_y.max(bounds.min_y),
+        max_x: tile_start_x.saturating_add(TILE_SIZE - 1).min(bounds.max_x),
+        max_y: tile_start_y.saturating_add(TILE_SIZE - 1).min(bounds.max_y),
+    }
+}
+
 impl TriangleSetup {
     pub fn new(
         vertices: [ViewportPosition; 3],
@@ -703,10 +749,7 @@ impl TriangleSetup {
         Some((uv_x - uv, uv_y - uv))
     }
 
-    pub fn rasterize(&self, mut visit: impl FnMut(CoveredSample)) -> u32 {
-        let Some(bounds) = self.bounds else {
-            return 0;
-        };
+    fn rasterize_bounds(&self, bounds: PixelBounds, visit: &mut impl FnMut(CoveredSample)) -> u32 {
         let mut row_values = self
             .edge_values_at(bounds.min_x, bounds.min_y)
             .expect("triangle setup preflight가 bbox 시작 edge 범위를 보장해야 한다");
@@ -735,6 +778,39 @@ impl TriangleSetup {
             }
         }
         covered_samples
+    }
+
+    pub fn rasterize(&self, mut visit: impl FnMut(CoveredSample)) -> u32 {
+        self.bounds
+            .map_or(0, |bounds| self.rasterize_bounds(bounds, &mut visit))
+    }
+
+    /// 같은 setup을 16x16의 서로 겹치지 않는 pixel 범위로 잘라 순차 방문한다.
+    ///
+    /// tile 순서는 row-major이고 각 tile 안에서도 scalar와 같은 row-major 순서다. 한
+    /// sample은 정확히 한 tile에만 속하므로 이후 worker 분할의 disjoint write 경계를
+    /// 고정하면서 현재 single-thread 경로는 scalar와 exact image를 유지한다.
+    pub fn rasterize_tiled_16(
+        &self,
+        mut visit: impl FnMut(CoveredSample),
+    ) -> TiledRasterizationReport {
+        let Some(bounds) = self.bounds else {
+            return TiledRasterizationReport::default();
+        };
+        let first_tile_x = bounds.min_x / TILE_SIZE;
+        let last_tile_x = bounds.max_x / TILE_SIZE;
+        let first_tile_y = bounds.min_y / TILE_SIZE;
+        let last_tile_y = bounds.max_y / TILE_SIZE;
+        let mut report = TiledRasterizationReport::default();
+        for tile_y in first_tile_y..=last_tile_y {
+            for tile_x in first_tile_x..=last_tile_x {
+                report.record_tile_visit();
+                report.covered_samples = report.covered_samples.saturating_add(
+                    self.rasterize_bounds(tile_pixel_bounds(tile_x, tile_y, bounds), &mut visit),
+                );
+            }
+        }
+        report
     }
 }
 
@@ -1678,9 +1754,68 @@ mod tests {
             0
         );
         assert_eq!(
+            setup.rasterize_tiled_16(|_| panic!("offscreen triangle must not visit")),
+            TiledRasterizationReport::default()
+        );
+        assert_eq!(
             setup.edge_values_at(usize::MAX, 0),
             Err(TriangleSetupError::ArithmeticOverflow)
         );
+    }
+
+    #[test]
+    fn chapter_twenty_five_tiled_ranges_are_disjoint_and_match_scalar_coverage() {
+        let setup = TriangleSetup::new(
+            [point(2.0, 2.0), point(35.0, 2.0), point(2.0, 35.0)],
+            40,
+            40,
+        )
+        .unwrap();
+        let mut scalar = Vec::new();
+        let scalar_count = setup.rasterize(|sample| scalar.push(sample));
+        let mut tiled = Vec::new();
+        let tiled_report = setup.rasterize_tiled_16(|sample| tiled.push(sample));
+        scalar.sort_unstable_by_key(|sample| (sample.y, sample.x));
+        tiled.sort_unstable_by_key(|sample| (sample.y, sample.x));
+        assert_eq!(tiled, scalar);
+        assert_eq!(tiled_report.covered_samples, scalar_count);
+        assert_eq!(tiled_report.visited_tiles, 9);
+        tiled.dedup_by_key(|sample| (sample.y, sample.x));
+        assert_eq!(tiled.len(), scalar_count as usize);
+        assert_eq!(TILE_SIZE, 16);
+        assert_eq!(RasterPath::Scalar.label(), "scalar reference");
+        assert_eq!(RasterPath::Tiled16.label(), "single-thread 16x16 tiled");
+
+        let last_tile = usize::MAX / TILE_SIZE;
+        let extreme = tile_pixel_bounds(
+            last_tile,
+            last_tile,
+            PixelBounds {
+                min_x: usize::MAX - 7,
+                min_y: usize::MAX - 5,
+                max_x: usize::MAX,
+                max_y: usize::MAX,
+            },
+        );
+        assert_eq!(
+            extreme,
+            PixelBounds {
+                min_x: usize::MAX - 7,
+                min_y: usize::MAX - 5,
+                max_x: usize::MAX,
+                max_y: usize::MAX,
+            }
+        );
+        let mut overflow = TiledRasterizationReport {
+            visited_tiles: u32::MAX - 1,
+            ..TiledRasterizationReport::default()
+        };
+        overflow.record_tile_visit();
+        assert_eq!(overflow.visited_tiles, u32::MAX);
+        assert!(!overflow.tile_counter_overflow);
+        overflow.record_tile_visit();
+        assert_eq!(overflow.visited_tiles, u32::MAX);
+        assert!(overflow.tile_counter_overflow);
     }
 
     #[test]

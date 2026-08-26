@@ -82,3 +82,17 @@ main thread JS는 입력/UI와 hosting capability 검사를 맡는다. 전용 Wo
 - tile bin에 같은 triangle을 넣는 것은 정상이다. 하지만 각 tile이 자기 픽셀 범위만 쓰지 않으면 race가 생긴다.
 - SharedArrayBuffer가 브라우저에서 보인다는 사실만으로 threads가 준비된 것이 아니다. crossOriginIsolated와 Wasm shared memory 빌드를 함께 확인한다.
 - SIMD intrinsics로 scalar보다 복잡한 코드를 먼저 만들지 않는다. profiler가 가리킨 연속 데이터 loop에서 시작한다.
+
+## 현재 구현 기준선
+
+이 저장소의 최종 capstone은 병렬화를 성능 향상으로 과장하지 않고, 다음의 최소하고 검증 가능한 경계를 선택했다.
+
+- `RasterPath::Scalar`는 기존 incremental edge reference다.
+- `RasterPath::Tiled16`은 하나의 `TriangleSetup` bbox를 겹치지 않는 16×16 범위로 나눠 single thread에서 방문한다. triangle 제출 순서는 유지한다.
+- `FrameStats`는 tiled rasterized triangle과 tile visit 수를 별도로 보고한다. Scalar에서는 둘 다 0이다.
+- browser의 shared-threads 요청은 `crossOriginIsolated`, shared-memory Wasm과 parallel scheduler 세 조건을 진단한다. 현재 build는 shared memory/scheduler를 포함하지 않으므로 Tiled16으로 fallback한다.
+- Worker/SIMD와 frame-wide triangle bin은 선택 확장으로 남긴다. 반복·교차 순서와 단계별 timing으로 재현 가능한 speedup을 아직 입증하지 않았으므로 기본 path는 Scalar다.
+
+native는 tile 경계 sample owner와 64×48 SSAA textured/lighted cube의 RGBA8/depth/stats exact equality를 확인한다. browser `capstone_tiled` scenario는 960×540 cull-none cube에서 scalar/tiled/fallback hash `10cf841e`, input 12 triangle, covered 125,572, shaded 75,292 sample을 고정한다. 같은 scenario가 각 경로를 warm-up 30/표본 120 frame으로 측정해 조건과 p50/p95를 fresh E2E report에 남긴다.
+
+측정 표본, memory estimate, 재현 명령과 의도적으로 남긴 한계는 [최종 Capstone 구현과 성능 보고서](capstone-report.md)에 기록한다.

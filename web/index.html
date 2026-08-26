@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>24장 · Debug Views, Tests와 Profiling</h1>
+        <h1>25장 · Tiled Raster와 최종 Capstone</h1>
       </div>
-      <p>같은 Rust pipeline의 단계별 debug view와 불변조건, frame timing p50/p95를 함께 관찰합니다.</p>
+      <p>Scalar 기준과 single-thread 16×16 tiled 경로의 exact image, capability fallback과 release p50/p95를 함께 검증합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="camera-mode">
           Camera
@@ -136,6 +136,14 @@
             <option value="0">끔 (양면)</option>
             <option value="1" selected>뒷면 제거</option>
             <option value="2">앞면 제거</option>
+          </select>
+        </label>
+        <label for="raster-path">
+          Raster path
+          <select id="raster-path">
+            <option value="0" selected>Scalar reference</option>
+            <option value="1">Single-thread 16×16 tiled</option>
+            <option value="2">Shared threads 요청 (fallback)</option>
           </select>
         </label>
         <label for="pipeline-debug-mode">
@@ -307,7 +315,7 @@
       </div>
       <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
       <p class="space-legend">
-        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip · UV/overdraw diagnostic post-view
+        transform → clip → fan → divide/viewport + 1/w → cull/setup → scalar 또는 disjoint 16×16 tile coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip · UV/overdraw diagnostic post-view
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -325,6 +333,10 @@
         <dd id="line-algorithm">초기화 중</dd>
         <dt>Coverage 알고리즘</dt>
         <dd id="coverage-algorithm">초기화 중</dd>
+        <dt>Raster path</dt>
+        <dd id="raster-status">초기화 중</dd>
+        <dt>Parallel capability</dt>
+        <dd id="parallel-capability">초기화 중</dd>
         <dt>보간 알고리즘</dt>
         <dd id="interpolation-algorithm">초기화 중</dd>
         <dt>깊이 알고리즘</dt>

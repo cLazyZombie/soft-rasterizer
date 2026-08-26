@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 24장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA, mipmap과 단계별 진단을 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 모두 구현합니다. Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA, mipmap, 단계별 진단과 scalar/tiled reference를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -62,6 +62,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 
 - [전체 과정 소개와 목차](doc/00-들어가며.md)
 - [좌표·카메라·깊이 결정](doc/decisions/coordinates.md)
+- [최종 Capstone 구현과 성능 보고서](doc/capstone-report.md)
 - [코딩 에이전트와 장별로 일하는 방법](doc/appendix-a-코딩-에이전트와-장별로-일하는-방법.md)
 - [최소 공개 계약과 데이터 구조](doc/appendix-b-최소-공개-계약과-데이터-구조.md)
 - [수학과 알고리즘 빠른 참조](doc/appendix-c-수학과-알고리즘-빠른-참조.md)
@@ -112,6 +113,13 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - Overdraw storage는 해당 mode에서만 target 크기로 할당해 frame마다 재사용한다. `FrameStats`는 `overdrawn_pixels`와 `max_overdraw`를 보고하고 기존 단계 관계식과 함께 검증한다.
 - 브라우저는 최근 120 frame의 update/present/total ms를 ring에 보관하고 nearest-rank p50/p95를 표시한다. test-only release benchmark는 warm-up을 제외한 표본과 build/browser/device/DPR/해상도/triangle/sample count를 E2E JSON report에 기록한다.
 - 자동 3 warm-up/7 sample은 report regression fixture다. 성능 변경 비교에는 30 warm-up/120 sample 이상과 동일 pixel hash/`FrameStats`를 요구한다. 상세 계약은 [진단과 성능 측정 기준선](doc/decisions/profiling.md)에 있다.
+
+## 25장 Tiled Raster와 Capstone 기준선
+
+- 기본 `Scalar`와 선택 가능한 single-thread `Tiled16`을 모두 safe Rust로 유지한다. Tiled16은 같은 setup을 16×16의 서로 겹치지 않는 pixel 범위로 나누며 triangle 제출 순서, top-left, strict depth와 shading 순서를 바꾸지 않는다.
+- UI의 `Shared threads 요청`은 현재 병렬 경로가 아니다. `crossOriginIsolated`, shared-memory Wasm build와 scheduler 조건을 표시하고 어느 하나라도 없으면 Tiled16으로 안전하게 fallback한다.
+- `capstone_tiled` E2E는 960×540, cull none, fixed `dt=0`에서 scalar/tiled/fallback exact pixel hash와 단계 count를 비교하고 각 경로를 warm-up 30/표본 120 frame으로 측정한다.
+- 현재 측정은 반복·교차 순서나 단계별 timing으로 재현 가능한 speedup을 입증하지 않으므로 Scalar가 기본이다. worker, SIMD와 frame-wide tile bin은 후속 범위이며 자세한 측정 계약과 한계는 [최종 Capstone 보고서](doc/capstone-report.md)에 기록했다.
 
 ## 교재
 
