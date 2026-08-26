@@ -52,6 +52,8 @@ P rows:
 - `screen_x=(0.5+0.5*x_ndc)*width`, `screen_y=(0.5-0.5*y_ndc)*height`다.
 - screen y-down에서 `orient2d(v0,v1,v2)>0`을 front face로 쓴다. 화면에서는 시계 방향이다.
 - handedness 변경만으로 screen area, edge 또는 top-left 부호를 뒤집지 않는다.
+- 9장 wireframe 제출 단계는 non-finite area나 screen projection 실패를 `invalid`, 이름 붙인 최소 float epsilon 이하의 area를 `degenerate`로 조기 거부한다. 한 프레임의 입력 삼각형은 `submitted + culled + degenerate + invalid`로 완전히 분류한다. 11장 coverage의 최종 퇴화 판정은 고정소수점 양자화 뒤 `area==0`이며 float epsilon을 top-left equality에 사용하지 않는다.
+- culling은 `none`, `back`, `front`를 지원한다. culling을 통과한 back face는 정점 순서를 바꿔 이후 단계에 positive winding으로 제출한다.
 - 포함 edge는 `dy<0 || (dy==0 && dx>0)`이며 sample 위치는 `(x+0.5,y+0.5)`다.
 
 ## 카메라 입력

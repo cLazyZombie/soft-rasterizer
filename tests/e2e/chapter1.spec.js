@@ -19,8 +19,26 @@ async function installContextAudit(page) {
   });
 }
 
-async function openReadyPage(page) {
+async function openReadyPage(page, initialControls = null) {
   await installContextAudit(page);
+  if (initialControls !== null) {
+    await page.route(
+      "**/",
+      async (route) => {
+        const response = await route.fetch();
+        const html = await response.text();
+        const initialControlScript = `<script>
+          document.querySelector("#cull-mode").value = ${JSON.stringify(String(initialControls.cullMode))};
+          document.querySelector("#winding-debug").checked = ${JSON.stringify(initialControls.windingDebugMode === 1)};
+        </script>`;
+        await route.fulfill({
+          response,
+          body: html.replace("</body>", `${initialControlScript}</body>`),
+        });
+      },
+      { times: 1 },
+    );
+  }
   await page.goto("/");
   await expect(page.locator("html")).toHaveAttribute("data-ready", "true");
 }
@@ -86,7 +104,10 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     inputVertices: 24,
     inputTriangles: 12,
     transformedVertices: 24,
-    submittedTriangles: 12,
+    submittedTriangles: 4,
+    culledTriangles: 8,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
     clippedTriangles: 0,
     rasterizedTriangles: 0,
     shadedSamples: 0,
@@ -218,13 +239,19 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표
   const browserLog = observeBrowserLog(page);
   await openReadyPage(page);
 
-  const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  const initial = await page.evaluate(() => {
+    window.__softRasterizer.setCullMode(0);
+    return window.__softRasterizer.advanceFrame(0);
+  });
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
   expect(initial.stats).toMatchObject({
     inputVertices: 24,
     inputTriangles: 12,
     transformedVertices: 24,
     submittedTriangles: 12,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
   });
   expect(initial.pixelHash).toBe("5e1a84c6");
   const projectionColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
@@ -248,6 +275,9 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표
     "LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0",
   );
   await expect(page.locator("#coordinate-debug")).toContainText("선택 정점 v6");
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "X-ray overlay · culling/depth 무관",
+  );
   await expect(page.locator("#coordinate-debug")).toContainText(
     "indexed cube mesh · vertices 24 · indices 36 · triangles 12 · material 0",
   );
@@ -279,6 +309,8 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표
     return window.__softRasterizer.advanceFrame(0);
   });
   expect(invalid.stats.invalidValues).toBe(96);
+  expect(invalid.stats.invalidTriangles).toBe(12);
+  expect(invalid.stats.submittedTriangles).toBe(0);
   await expect(page.locator("#coordinate-debug")).toContainText("NDC invalid · Screen invalid");
   await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 24");
   await expect(page.locator("#coordinate-debug")).toContainText("첫 공간: World");
@@ -304,6 +336,141 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표
   });
   expect(browserLog.errors).toEqual([]);
   recordEvidence(testInfo, recovered, 0, browserLog, screenshotPath, { projectionColorCounts });
+});
+
+test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "winding_culling" },
+    { type: "steps", description: "18" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, { cullMode: 0, windingDebugMode: 1 });
+
+  const restoredControls = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restoredControls).toMatchObject({ cullMode: 0, windingDebugMode: 1 });
+  expect(restoredControls.stats).toMatchObject({ submittedTriangles: 12, culledTriangles: 0 });
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "cull none · debug front green / back red",
+  );
+
+  await page.locator("#cull-mode").selectOption("1");
+  await page.locator("#winding-debug").uncheck();
+
+  const initial = await page.evaluate(() => {
+    const canvas = document.querySelector("#framebuffer");
+    const context = canvas.getContext("2d");
+    window.__chapterNineBaseline = context.getImageData(0, 0, canvas.width, canvas.height).data.slice();
+    return window.__softRasterizer.snapshot();
+  });
+  expect(initial.cullMode).toBe(1);
+  expect(initial.windingDebugMode).toBe(0);
+  expect(initial.stats).toMatchObject({
+    inputTriangles: 12,
+    submittedTriangles: 4,
+    culledTriangles: 8,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+  });
+  expect(initial.pixelHash).toBe("f9fb1bdc");
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "winding screen y-down orient2d > 0 front · cull back · debug vertex color",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
+  );
+  await expect(page.locator(".space-legend")).toContainText(
+    "선택 정점 흰색(X-ray · culling/depth 무관)",
+  );
+
+  await page.locator("#cull-mode").selectOption("0");
+  const doubleSided = await page.evaluate(() => {
+    const canvas = document.querySelector("#framebuffer");
+    const current = canvas
+      .getContext("2d")
+      .getImageData(0, 0, canvas.width, canvas.height).data;
+    const baseline = window.__chapterNineBaseline;
+    let differingPixels = 0;
+    let maxChannelDifference = 0;
+    for (let index = 0; index < current.length; index += 4) {
+      let differs = false;
+      for (let channel = 0; channel < 4; channel += 1) {
+        const difference = Math.abs(current[index + channel] - baseline[index + channel]);
+        maxChannelDifference = Math.max(maxChannelDifference, difference);
+        differs ||= difference !== 0;
+      }
+      differingPixels += Number(differs);
+    }
+    return {
+      snapshot: window.__softRasterizer.snapshot(),
+      differingPixels,
+      maxChannelDifference,
+    };
+  });
+  expect(doubleSided.snapshot.stats).toMatchObject({
+    submittedTriangles: 12,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+  });
+  expect(doubleSided.snapshot.pixelHash).toBe("5e1a84c6");
+  expect(doubleSided.differingPixels).toBe(1330);
+  expect(doubleSided.maxChannelDifference).toBe(215);
+
+  await page.locator("#winding-debug").check();
+  const facing = await page.evaluate(() => {
+    const canvas = document.querySelector("#framebuffer");
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    const colors = [
+      [72, 232, 112, 255],
+      [255, 82, 92, 255],
+    ];
+    const counts = [0, 0];
+    for (let index = 0; index < data.length; index += 4) {
+      colors.forEach((color, colorIndex) => {
+        if (color.every((channel, offset) => data[index + offset] === channel)) {
+          counts[colorIndex] += 1;
+        }
+      });
+    }
+    return { snapshot: window.__softRasterizer.snapshot(), facingColorCounts: counts };
+  });
+  expect(facing.snapshot.stats).toMatchObject({ submittedTriangles: 12, culledTriangles: 0 });
+  expect(facing.facingColorCounts).toEqual([520, 1327]);
+
+  await page.locator("#cull-mode").selectOption("2");
+  const frontCulled = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(frontCulled.stats).toMatchObject({ submittedTriangles: 8, culledTriangles: 4 });
+
+  await page.locator("#cull-mode").selectOption("1");
+  await page.locator("#winding-debug").uncheck();
+  const restored = await page.evaluate(() => {
+    delete window.__chapterNineBaseline;
+    return window.__softRasterizer.snapshot();
+  });
+  expect(restored.pixelHash).toBe(initial.pixelHash);
+  expect(restored.stats).toMatchObject({ submittedTriangles: 4, culledTriangles: 8 });
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter9-winding-culling.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter9-winding-culling", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    doubleSidedDiff: {
+      differingPixels: doubleSided.differingPixels,
+      maxChannelDifference: doubleSided.maxChannelDifference,
+    },
+    facingColorCounts: facing.facingColorCounts,
+  });
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({

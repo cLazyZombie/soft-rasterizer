@@ -1,10 +1,11 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 8장까지 RGBA8 프레임버퍼에 indexed mesh wireframe 큐브를 그린다.
+//! 9장까지 RGBA8 프레임버퍼에 winding/culling이 적용된 indexed mesh wireframe 큐브를 그린다.
 
 pub mod camera;
 pub mod math;
 pub mod mesh;
+pub mod raster;
 pub mod transform;
 
 use std::error::Error;
@@ -15,6 +16,7 @@ use camera::{
 };
 use math::{Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
+use raster::{CullMode, FaceOrientation, TriangleDisposition, WindingDebugMode, classify_triangle};
 #[cfg(test)]
 use transform::CoordinateSpace;
 use transform::{
@@ -263,6 +265,9 @@ pub struct FrameStats {
     pub input_triangles: u32,
     pub transformed_vertices: u32,
     pub submitted_triangles: u32,
+    pub culled_triangles: u32,
+    pub degenerate_triangles: u32,
+    pub invalid_triangles: u32,
     pub clipped_triangles: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
@@ -378,15 +383,20 @@ pub struct CoordinateDebugSnapshot {
     pub mesh_indices: u32,
     pub mesh_triangles: u32,
     pub material_id: u32,
+    pub cull_mode: CullMode,
+    pub winding_debug_mode: WindingDebugMode,
+    pub frame_stats: FrameStats,
 }
 
-/// 렌더 타깃과 3-8장 indexed mesh debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-9장 indexed mesh debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
     stats: FrameStats,
     framebuffer_generation: u32,
     debug_lines_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -411,6 +421,8 @@ impl Renderer {
             stats: FrameStats::default(),
             framebuffer_generation: 0,
             debug_lines_enabled: true,
+            cull_mode: CullMode::Back,
+            winding_debug_mode: WindingDebugMode::VertexColor,
             mesh,
             draw_item,
             mesh_scene,
@@ -418,6 +430,8 @@ impl Renderer {
         draw_frame(
             &mut renderer.target,
             renderer.debug_lines_enabled,
+            renderer.cull_mode,
+            renderer.winding_debug_mode,
             &renderer.mesh,
             &renderer.mesh_scene.viewport_positions,
             &renderer.mesh_scene.clip_vertices,
@@ -434,6 +448,8 @@ impl Renderer {
         draw_frame(
             &mut replacement,
             self.debug_lines_enabled,
+            self.cull_mode,
+            self.winding_debug_mode,
             &self.mesh,
             &replacement_scene.viewport_positions,
             &replacement_scene.clip_vertices,
@@ -459,9 +475,11 @@ impl Renderer {
             self.target.width(),
             self.target.height(),
         );
-        let debug_pixels = draw_frame(
+        let draw_report = draw_frame(
             &mut self.target,
             self.debug_lines_enabled,
+            self.cull_mode,
+            self.winding_debug_mode,
             &self.mesh,
             &self.mesh_scene.viewport_positions,
             &self.mesh_scene.clip_vertices,
@@ -473,8 +491,11 @@ impl Renderer {
             input_vertices: self.mesh.vertices().len() as u32,
             input_triangles: self.mesh.triangle_count() as u32,
             transformed_vertices: self.mesh_scene.traces.len() as u32,
-            submitted_triangles: self.mesh.triangle_count() as u32,
-            debug_pixels,
+            submitted_triangles: draw_report.submitted_triangles,
+            culled_triangles: draw_report.culled_triangles,
+            degenerate_triangles: draw_report.degenerate_triangles,
+            invalid_triangles: draw_report.invalid_triangles,
+            debug_pixels: draw_report.debug_pixels,
             invalid_values: self
                 .mesh_scene
                 .diagnostics
@@ -492,6 +513,14 @@ impl Renderer {
 
     pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
         self.debug_lines_enabled = enabled;
+    }
+
+    pub fn set_cull_mode(&mut self, mode: CullMode) {
+        self.cull_mode = mode;
+    }
+
+    pub fn set_winding_debug_mode(&mut self, mode: WindingDebugMode) {
+        self.winding_debug_mode = mode;
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -548,41 +577,83 @@ impl Renderer {
             mesh_indices: self.mesh.indices().len() as u32,
             mesh_triangles: self.mesh.triangle_count() as u32,
             material_id: self.draw_item.material_id.0,
+            cull_mode: self.cull_mode,
+            winding_debug_mode: self.winding_debug_mode,
+            frame_stats: self.stats,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct FrameDrawReport {
+    submitted_triangles: u32,
+    culled_triangles: u32,
+    degenerate_triangles: u32,
+    invalid_triangles: u32,
+    debug_pixels: u32,
 }
 
 fn draw_frame(
     target: &mut RenderTarget,
     debug_lines_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
     mesh: &Mesh,
     viewport_positions: &[Option<ViewportPosition>],
     clip_vertices: &[ClipVertex],
-) -> u32 {
+) -> FrameDrawReport {
     target.render_gradient_checker();
-    if debug_lines_enabled {
-        draw_debug_scene(target, mesh, viewport_positions, clip_vertices)
-    } else {
-        0
-    }
+    draw_debug_scene(
+        target,
+        debug_lines_enabled,
+        cull_mode,
+        winding_debug_mode,
+        mesh,
+        viewport_positions,
+        clip_vertices,
+    )
 }
 
 fn draw_debug_scene(
     target: &mut RenderTarget,
+    debug_lines_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
     mesh: &Mesh,
     viewport_positions: &[Option<ViewportPosition>],
     clip_vertices: &[ClipVertex],
-) -> u32 {
+) -> FrameDrawReport {
     let width = target.width() as i32;
     let height = target.height() as i32;
     let shortest_side = width.min(height);
     let white = Color::rgb(238, 244, 255);
+    if !debug_lines_enabled {
+        return draw_mesh_wireframe(
+            target,
+            false,
+            cull_mode,
+            winding_debug_mode,
+            mesh,
+            viewport_positions,
+            clip_vertices,
+        );
+    }
     if width < 16 || height < 16 {
-        return target.draw_line_bresenham(
+        let mut report = draw_mesh_wireframe(
+            target,
+            false,
+            cull_mode,
+            winding_debug_mode,
+            mesh,
+            viewport_positions,
+            clip_vertices,
+        );
+        report.debug_pixels = target.draw_line_bresenham(
             ScreenPoint::new(0, 0),
             ScreenPoint::new(width - 1, height - 1),
             white,
         );
+        return report;
     }
 
     let mut written = 0_u32;
@@ -603,12 +674,16 @@ fn draw_debug_scene(
         ));
     }
 
-    written = written.saturating_add(draw_mesh_wireframe(
+    let mut report = draw_mesh_wireframe(
         target,
+        true,
+        cull_mode,
+        winding_debug_mode,
         mesh,
         viewport_positions,
         clip_vertices,
-    ));
+    );
+    written = written.saturating_add(report.debug_pixels);
     if let Some(selected) = viewport_positions
         .get(SELECTED_VERTEX_INDEX)
         .copied()
@@ -624,36 +699,76 @@ fn draw_debug_scene(
         ScreenPoint::new(width - 1 - inset, height - 1 - inset),
         white,
     ));
-    written
+    report.debug_pixels = written;
+    report
 }
 
 fn draw_mesh_wireframe(
     target: &mut RenderTarget,
+    draw_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
     mesh: &Mesh,
     viewport_positions: &[Option<ViewportPosition>],
     clip_vertices: &[ClipVertex],
-) -> u32 {
-    let mut written = 0_u32;
+) -> FrameDrawReport {
+    let mut report = FrameDrawReport::default();
     for triangle in mesh.triangles() {
-        let positions = triangle.map(|index| {
-            viewport_positions
-                .get(index)
-                .copied()
-                .flatten()
-                .map(viewport_screen_point)
-        });
+        let positions = triangle.map(|index| viewport_positions.get(index).copied().flatten());
         let [Some(first), Some(second), Some(third)] = positions else {
+            report.invalid_triangles = report.invalid_triangles.saturating_add(1);
             continue;
         };
-        let edge_colors = triangle.map(|index| {
-            clip_vertices
-                .get(index)
-                .map_or(Color::rgb(255, 210, 72), |vertex| debug_color(vertex.color))
-        });
-        written = written
-            .saturating_add(target.draw_wireframe_triangle([first, second, third], edge_colors));
+        let (source_orientation, order) = match classify_triangle([first, second, third], cull_mode)
+        {
+            TriangleDisposition::Submit {
+                source_orientation,
+                order,
+            } => (source_orientation, order),
+            TriangleDisposition::Culled(_) => {
+                report.culled_triangles = report.culled_triangles.saturating_add(1);
+                continue;
+            }
+            TriangleDisposition::Degenerate => {
+                report.degenerate_triangles = report.degenerate_triangles.saturating_add(1);
+                continue;
+            }
+            TriangleDisposition::Invalid => {
+                report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+                continue;
+            }
+        };
+        report.submitted_triangles = report.submitted_triangles.saturating_add(1);
+        if !draw_enabled {
+            continue;
+        }
+        let screen_positions = [first, second, third].map(viewport_screen_point);
+        let ordered_positions = order.map(|index| screen_positions[index]);
+        let (wireframe_positions, edge_colors) = match winding_debug_mode {
+            WindingDebugMode::VertexColor => {
+                // 제출 geometry는 positive winding이지만, 8장 debug golden의 Bresenham
+                // 방향과 edge 덮어쓰기 순서를 보존하기 위해 이 wireframe만 원본 index
+                // 순서로 그린다.
+                let colors = triangle.map(|vertex_index| {
+                    clip_vertices
+                        .get(vertex_index)
+                        .map_or(Color::rgb(255, 210, 72), |vertex| debug_color(vertex.color))
+                });
+                (screen_positions, colors)
+            }
+            WindingDebugMode::Facing => {
+                let color = match source_orientation {
+                    FaceOrientation::Front => Color::rgb(72, 232, 112),
+                    FaceOrientation::Back => Color::rgb(255, 82, 92),
+                };
+                (ordered_positions, [color; 3])
+            }
+        };
+        report.debug_pixels = report
+            .debug_pixels
+            .saturating_add(target.draw_wireframe_triangle(wireframe_positions, edge_colors));
     }
-    written
+    report
 }
 
 fn debug_color(color: Vec4) -> Color {
@@ -968,7 +1083,10 @@ mod tests {
         assert_eq!(first.input_vertices, 24);
         assert_eq!(first.input_triangles, 12);
         assert_eq!(first.transformed_vertices, 24);
-        assert_eq!(first.submitted_triangles, 12);
+        assert_eq!(first.submitted_triangles, 4);
+        assert_eq!(first.culled_triangles, 8);
+        assert_eq!(first.degenerate_triangles, 0);
+        assert_eq!(first.invalid_triangles, 0);
         assert_eq!(first.clipped_triangles, 0);
         assert_eq!(first.rasterized_triangles, 0);
         assert_eq!(first.shaded_samples, 0);
@@ -990,6 +1108,8 @@ mod tests {
         renderer.set_debug_lines_enabled(false);
         let negative = renderer.update_and_render(-1.0, InputSnapshot::default());
         assert_eq!(negative.dt_seconds, 0.0);
+        assert_eq!(negative.submitted_triangles, 4);
+        assert_eq!(negative.culled_triangles, 8);
         assert_eq!(negative.debug_pixels, 0);
         assert_eq!(negative.invalid_values, 0);
         assert_eq!(renderer.color_buffer()[..4], [0, 0, 220, 255]);
@@ -1015,7 +1135,77 @@ mod tests {
 
     #[test]
     fn chapter_eight_indexed_mesh_wireframe_matches_64_by_64_golden_hash() {
+        let mut renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
+        renderer.set_cull_mode(CullMode::None);
+        renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf1ef_5933);
+    }
+
+    #[test]
+    fn chapter_nine_backface_culled_wireframe_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x647c_0b11);
+    }
+
+    #[test]
+    fn cull_modes_report_fixed_cube_counts_and_normalize_double_sided_faces() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        for (rotation_y, submitted, culled) in [(0.0, 4, 8), (0.75, 6, 6), (-0.75, 4, 8)] {
+            renderer.set_model_rotation_y(rotation_y);
+            let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+            assert_eq!(stats.submitted_triangles, submitted);
+            assert_eq!(stats.culled_triangles, culled);
+            assert_eq!(stats.degenerate_triangles, 0);
+            assert_eq!(stats.invalid_triangles, 0);
+            assert_eq!(stats.submitted_triangles + stats.culled_triangles, 12);
+        }
+
+        renderer.set_model_rotation_y(0.0);
+        renderer.set_cull_mode(CullMode::None);
+        let double_sided = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(double_sided.submitted_triangles, 12);
+        assert_eq!(double_sided.culled_triangles, 0);
+
+        renderer.set_cull_mode(CullMode::Front);
+        let front_culled = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(front_culled.submitted_triangles, 8);
+        assert_eq!(front_culled.culled_triangles, 4);
+    }
+
+    #[test]
+    fn facing_debug_colors_both_orientations_without_changing_geometry_counts() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_cull_mode(CullMode::None);
+        renderer.set_winding_debug_mode(WindingDebugMode::Facing);
+        let facing = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(
+            (facing.submitted_triangles, facing.culled_triangles),
+            (12, 0)
+        );
+        for expected in [[72, 232, 112, 255], [255, 82, 92, 255]] {
+            assert!(
+                renderer
+                    .color_buffer()
+                    .chunks_exact(4)
+                    .any(|pixel| pixel == expected),
+                "missing winding debug color {expected:?}"
+            );
+        }
+
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert_eq!(snapshot.cull_mode, CullMode::None);
+        assert_eq!(snapshot.winding_debug_mode, WindingDebugMode::Facing);
+        assert_eq!(snapshot.frame_stats, facing);
+
+        renderer.set_winding_debug_mode(WindingDebugMode::VertexColor);
+        let vertex_colors = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(
+            (
+                vertex_colors.submitted_triangles,
+                vertex_colors.culled_triangles
+            ),
+            (facing.submitted_triangles, facing.culled_triangles)
+        );
         assert_eq!(fnv1a(renderer.color_buffer()), 0xf1ef_5933);
     }
 
@@ -1041,11 +1231,14 @@ mod tests {
         assert_eq!(
             draw_mesh_wireframe(
                 &mut target,
+                true,
+                CullMode::Back,
+                WindingDebugMode::VertexColor,
                 &empty,
                 &empty_scene.viewport_positions,
                 &empty_scene.clip_vertices,
             ),
-            0
+            FrameDrawReport::default()
         );
 
         let vertex = mesh::Vertex::new(
@@ -1056,14 +1249,45 @@ mod tests {
         );
         let degenerate = Mesh::new(vec![vertex], vec![0, 0, 0]).unwrap();
         let degenerate_scene = MeshScene::new(&degenerate, Transform::IDENTITY, 64, 64);
+        let color_before_degenerate = target.color().to_vec();
+        let depth_before_degenerate = target.depth().to_vec();
         assert_eq!(
             draw_mesh_wireframe(
                 &mut target,
+                true,
+                CullMode::Back,
+                WindingDebugMode::VertexColor,
                 &degenerate,
                 &degenerate_scene.viewport_positions,
                 &degenerate_scene.clip_vertices,
             ),
-            3
+            FrameDrawReport {
+                degenerate_triangles: 1,
+                ..FrameDrawReport::default()
+            }
+        );
+        assert_eq!(target.color(), color_before_degenerate);
+        assert_eq!(target.depth(), depth_before_degenerate);
+
+        let invalid_positions = [Some(ViewportPosition {
+            x: f32::NAN,
+            y: 0.0,
+            z_ndc: 0.5,
+        })];
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                true,
+                CullMode::None,
+                WindingDebugMode::VertexColor,
+                &degenerate,
+                &invalid_positions,
+                degenerate_scene.clip_vertices.as_slice(),
+            ),
+            FrameDrawReport {
+                invalid_triangles: 1,
+                ..FrameDrawReport::default()
+            }
         );
     }
 
@@ -1103,7 +1327,10 @@ mod tests {
         assert_eq!(stats.input_vertices, 24);
         assert_eq!(stats.input_triangles, 12);
         assert_eq!(stats.transformed_vertices, 24);
-        assert_eq!(stats.submitted_triangles, 12);
+        assert_eq!(stats.submitted_triangles, 4);
+        assert_eq!(stats.culled_triangles, 8);
+        assert_eq!(stats.degenerate_triangles, 0);
+        assert_eq!(stats.invalid_triangles, 0);
         assert_eq!(stats.invalid_values, 0);
         assert_eq!(
             rotated.selected_vertex.object_pos,
@@ -1136,6 +1363,8 @@ mod tests {
         let invalid = renderer.update_and_render(0.0, InputSnapshot::default());
         let invalid_snapshot = renderer.coordinate_debug_snapshot();
         assert_eq!(invalid.invalid_values, 96);
+        assert_eq!(invalid.invalid_triangles, 12);
+        assert_eq!(invalid.submitted_triangles, 0);
         assert_eq!(invalid_snapshot.projection_failures, 24);
         assert_eq!(invalid_snapshot.selected_ndc, None);
         assert_eq!(invalid_snapshot.selected_viewport, None);

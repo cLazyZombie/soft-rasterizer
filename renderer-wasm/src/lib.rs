@@ -1,7 +1,9 @@
 //! `renderer-core`를 브라우저가 프레임 단위로 호출할 수 있게 하는 얇은 어댑터.
 
 use renderer_core::{
-    CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer, math::Vec4,
+    CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
+    math::Vec4,
+    raster::{CullMode, WindingDebugMode},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -45,6 +47,27 @@ impl Renderer {
 
     pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
         self.core.set_debug_lines_enabled(enabled);
+    }
+
+    pub fn set_cull_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => CullMode::None,
+            1 => CullMode::Back,
+            2 => CullMode::Front,
+            _ => return Err(format!("알 수 없는 cull mode입니다: {mode}")),
+        };
+        self.core.set_cull_mode(mode);
+        Ok(())
+    }
+
+    pub fn set_winding_debug_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => WindingDebugMode::VertexColor,
+            1 => WindingDebugMode::Facing,
+            _ => return Err(format!("알 수 없는 winding debug mode입니다: {mode}")),
+        };
+        self.core.set_winding_debug_mode(mode);
+        Ok(())
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -105,6 +128,18 @@ impl Renderer {
 
     pub fn stats_submitted_triangles(&self) -> u32 {
         self.stats().submitted_triangles
+    }
+
+    pub fn stats_culled_triangles(&self) -> u32 {
+        self.stats().culled_triangles
+    }
+
+    pub fn stats_degenerate_triangles(&self) -> u32 {
+        self.stats().degenerate_triangles
+    }
+
+    pub fn stats_invalid_triangles(&self) -> u32 {
+        self.stats().invalid_triangles
     }
 
     pub fn stats_clipped_triangles(&self) -> u32 {
@@ -171,7 +206,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
     format!(
         "LH/+Z 카메라 · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}\n\
          indexed cube mesh · vertices {} · indices {} · triangles {} · material {}\n\
-         선택 정점 v{} · model Y {:.3} rad\n\
+         winding screen y-down orient2d > 0 front · cull {} · debug {}\n\
+         triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
+         선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
          w_clip {:.3} · NDC {} · Screen {}\n\
@@ -188,6 +225,13 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.mesh_indices,
         snapshot.mesh_triangles,
         snapshot.material_id,
+        snapshot.cull_mode.label(),
+        snapshot.winding_debug_mode.label(),
+        snapshot.frame_stats.input_triangles,
+        snapshot.frame_stats.submitted_triangles,
+        snapshot.frame_stats.culled_triangles,
+        snapshot.frame_stats.degenerate_triangles,
+        snapshot.frame_stats.invalid_triangles,
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
         attributes.normal_world.x,
@@ -247,7 +291,10 @@ mod tests {
         assert_eq!(renderer.stats_input_vertices(), 24);
         assert_eq!(renderer.stats_input_triangles(), 12);
         assert_eq!(renderer.stats_transformed_vertices(), 24);
-        assert_eq!(renderer.stats_submitted_triangles(), 12);
+        assert_eq!(renderer.stats_submitted_triangles(), 4);
+        assert_eq!(renderer.stats_culled_triangles(), 8);
+        assert_eq!(renderer.stats_degenerate_triangles(), 0);
+        assert_eq!(renderer.stats_invalid_triangles(), 0);
         assert_eq!(renderer.stats_clipped_triangles(), 0);
         assert_eq!(renderer.stats_rasterized_triangles(), 0);
         assert_eq!(renderer.stats_shaded_samples(), 0);
@@ -286,12 +333,53 @@ mod tests {
     }
 
     #[test]
+    fn adapter_maps_culling_and_winding_debug_modes_and_rejects_unknown_values() {
+        let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
+        renderer.set_cull_mode(1).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_submitted_triangles(), 4);
+        assert_eq!(renderer.stats_culled_triangles(), 8);
+
+        renderer.set_cull_mode(0).unwrap();
+        renderer.set_winding_debug_mode(1).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_submitted_triangles(), 12);
+        assert_eq!(renderer.stats_culled_triangles(), 0);
+        let text = renderer.coordinate_debug_text();
+        assert!(text.contains("cull none · debug front green / back red"));
+
+        renderer.set_cull_mode(2).unwrap();
+        renderer.set_winding_debug_mode(0).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_submitted_triangles(), 8);
+        assert_eq!(renderer.stats_culled_triangles(), 4);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("cull front · debug vertex color")
+        );
+
+        assert!(renderer.set_cull_mode(3).unwrap_err().contains("cull mode"));
+        assert!(
+            renderer
+                .set_winding_debug_mode(2)
+                .unwrap_err()
+                .contains("winding debug mode")
+        );
+    }
+
+    #[test]
     fn adapter_formats_coordinate_overlay_and_reports_invalid_rotation() {
         let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
         renderer.update_and_render(0.0, 0);
         let text = renderer.coordinate_debug_text();
         assert!(text.contains("선택 정점 v6"));
+        assert!(text.contains("X-ray overlay · culling/depth 무관"));
         assert!(text.contains("indexed cube mesh · vertices 24 · indices 36 · triangles 12"));
+        assert!(text.contains("winding screen y-down orient2d > 0 front · cull back"));
+        assert!(text.contains(
+            "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0"
+        ));
         assert!(text.contains("normal ("));
         assert!(text.contains("UV ("));
         assert!(text.contains("LH/+Z 카메라 · fov 60.0° · near 0.100 · far 100.0"));

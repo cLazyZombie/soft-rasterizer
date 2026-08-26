@@ -29,14 +29,19 @@ screen y-down 기준: area2 > 0 -> front, area2 < 0 -> back
 ## 알고리즘과 구현 순서
 
 1. clip과 perspective divide를 통과한 세 screen 위치로 area2를 계산한다.
-1. area2가 0에 가깝거나 유한하지 않으면 퇴화 삼각형 통계를 올리고 버린다.
+1. area2가 유한하지 않으면 invalid 삼각형 통계를 올리고 버린다.
+1. area2가 0에 가까우면 퇴화 삼각형 통계를 올리고 버린다.
 1. material이 double_sided가 아니고 area2&lt;0이면 culled 통계를 올리고 버린다.
 1. raster 단계에는 area2&gt;0인 삼각형만 넘긴다. 필요하면 v1과 v2를 교환해 positive winding으로 정규화한다.
 1. debug 모드에서 front는 초록, back은 빨강 wireframe으로 그려 규약을 확인한다.
 
 ```text
 area2 = orient2d(s0, s1, s2)
-if not finite(area2) or abs(area2) <= AREA_EPS:
+if not finite(area2):
+  stats.invalid += 1
+  reject
+
+if abs(area2) <= AREA_EPS:
   stats.degenerate += 1
   reject
 
@@ -50,7 +55,7 @@ if area2 < 0:
 
 ## JS-Wasm 경계
 
-culling toggle과 double-sided 옵션은 JS UI가 상태를 바꿀 수 있지만 판정은 Rust에서 한다. JS는 triangle 목록을 줄이거나 winding을 고치지 않는다. 통계만 받아 overlay에 submitted/cull/degenerate 수를 표시한다.
+culling toggle과 double-sided 옵션은 JS UI가 상태를 바꿀 수 있지만 판정은 Rust에서 한다. JS는 triangle 목록을 줄이거나 winding을 고치지 않는다. 통계만 받아 overlay에 submitted/cull/degenerate/invalid 수를 표시한다. 한 프레임의 입력 삼각형은 `input = submitted + culled + degenerate + invalid`로 완전히 분류되어야 한다.
 
 ## 코딩 에이전트 작업 명세
 
@@ -63,6 +68,8 @@ culling toggle과 double-sided 옵션은 JS UI가 상태를 바꿀 수 있지만
 
 - 정점 순서를 뒤집으면 area 부호가 정확히 반대로 바뀌어야 한다.
 - 같은 직선 위 세 점은 퇴화로 거부되고 깊이/색 버퍼를 바꾸지 않아야 한다.
+- non-finite area 또는 screen projection 실패는 invalid로 거부되고 다른 분류와 중복 집계되지 않아야 한다.
+- 모든 입력 삼각형은 submitted, culled, degenerate, invalid 중 정확히 하나로 집계되어야 한다.
 - 닫힌 큐브를 일반 시점에서 볼 때 culling on이 off보다 raster submitted 수를 줄여야 한다.
 - 기본 LH 카메라 앞의 outward-normal triangle은 `area2&gt;0`, 정점 순서를 뒤집은 triangle은 `area2&lt;0`이어야 한다.
 - double-sided 재질에서는 뒤집힌 삼각형도 positive winding으로 정규화되어 같은 coverage 규칙을 사용해야 한다.

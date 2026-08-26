@@ -21,6 +21,9 @@ function rendererStats(renderer) {
     inputTriangles: renderer.stats_input_triangles(),
     transformedVertices: renderer.stats_transformed_vertices(),
     submittedTriangles: renderer.stats_submitted_triangles(),
+    culledTriangles: renderer.stats_culled_triangles(),
+    degenerateTriangles: renderer.stats_degenerate_triangles(),
+    invalidTriangles: renderer.stats_invalid_triangles(),
     clippedTriangles: renderer.stats_clipped_triangles(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),
@@ -55,6 +58,8 @@ function canvasPixelHash(context, width, height) {
 async function bootstrap() {
   const canvas = document.querySelector("#framebuffer");
   const errorOutput = document.querySelector("#error");
+  const cullModeSelect = document.querySelector("#cull-mode");
+  const windingDebugCheckbox = document.querySelector("#winding-debug");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -130,6 +135,29 @@ async function bootstrap() {
     updateStatus();
   };
 
+  const setCullMode = (mode) => {
+    renderer.set_cull_mode(mode);
+    cullModeSelect.value = String(mode);
+  };
+
+  const setWindingDebugMode = (mode) => {
+    renderer.set_winding_debug_mode(mode);
+    windingDebugCheckbox.checked = mode === 1;
+  };
+
+  // Reload/history restoration can preserve form values independently of the newly created Wasm state.
+  setCullMode(Number(cullModeSelect.value));
+  setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
+
+  cullModeSelect.addEventListener("change", () => {
+    setCullMode(Number(cullModeSelect.value));
+    renderFrame(0);
+  });
+  windingDebugCheckbox.addEventListener("change", () => {
+    setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
+    renderFrame(0);
+  });
+
   const applyDisplayResize = () => {
     resizeScheduled = false;
     const size = logicalRenderSize(canvas);
@@ -173,6 +201,8 @@ async function bootstrap() {
     lastFrameMetrics,
     resizeEvents,
     contextKind: "2d",
+    cullMode: Number(cullModeSelect.value),
+    windingDebugMode: windingDebugCheckbox.checked ? 1 : 0,
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -196,6 +226,8 @@ async function bootstrap() {
         setDebugLinesEnabled(enabled) {
           renderer.set_debug_lines_enabled(enabled);
         },
+        setCullMode,
+        setWindingDebugMode,
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },
