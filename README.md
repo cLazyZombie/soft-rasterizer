@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 9장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, 원근 투영, 검증된 indexed mesh와 screen-space winding/culling을 구현했습니다. 24정점/36인덱스 큐브는 `orient2d > 0` 앞면 규약으로 분류되며 culling on/off와 앞면 초록·뒷면 빨강 wireframe debug를 실제 Rust-Wasm-Canvas 2D 경로에서 전환할 수 있습니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 10장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling과 여섯 평면 homogeneous clipping을 구현했습니다. perspective divide 전에 `ClipVertex` 전체 속성을 같은 `t`로 보간하고 결과 polygon을 triangle fan으로 분해하며, near/화면 모서리 교차 fixture를 실제 Rust-Wasm-Canvas 2D 경로에서 확인할 수 있습니다.
 
 ## 실행 방법
 

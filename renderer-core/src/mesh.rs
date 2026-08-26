@@ -192,7 +192,7 @@ impl DrawItem {
     }
 }
 
-/// 클리핑이 추가될 때 정점 전체를 같은 `t`로 보간하기 위한 vertex-stage 출력이다.
+/// clipping에서 정점 전체를 같은 `t`로 보간하는 vertex-stage 출력이다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipVertex {
     pub clip_pos: crate::transform::ClipPosition,
@@ -200,6 +200,21 @@ pub struct ClipVertex {
     pub normal_world: Vec3,
     pub uv: Vec2,
     pub color: Vec4,
+}
+
+impl ClipVertex {
+    /// 동차 clipping 교점에서 모든 정점 속성을 같은 `t`로 보간한다.
+    pub fn lerp(self, rhs: Self, t: f32) -> Self {
+        Self {
+            clip_pos: crate::transform::ClipPosition(
+                self.clip_pos.0 + (rhs.clip_pos.0 - self.clip_pos.0) * t,
+            ),
+            world_pos: self.world_pos + (rhs.world_pos - self.world_pos) * t,
+            normal_world: self.normal_world + (rhs.normal_world - self.normal_world) * t,
+            uv: self.uv + (rhs.uv - self.uv) * t,
+            color: self.color + (rhs.color - self.color) * t,
+        }
+    }
 }
 
 pub fn unit_cube_mesh() -> Mesh {

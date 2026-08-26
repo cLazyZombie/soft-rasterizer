@@ -1,8 +1,9 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 9장까지 RGBA8 프레임버퍼에 winding/culling이 적용된 indexed mesh wireframe 큐브를 그린다.
+//! 10장까지 RGBA8 프레임버퍼에 homogeneous clipping이 적용된 indexed mesh wireframe을 그린다.
 
 pub mod camera;
+pub mod clip;
 pub mod math;
 pub mod mesh;
 pub mod raster;
@@ -14,7 +15,8 @@ use std::fmt::{Display, Formatter};
 use camera::{
     NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
 };
-use math::{Vec3, Vec4};
+use clip::{ClipPlane, ClipStatus, TriangleClipper};
+use math::{Mat4, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{CullMode, FaceOrientation, TriangleDisposition, WindingDebugMode, classify_triangle};
 #[cfg(test)]
@@ -28,7 +30,8 @@ use transform::{
 pub const MAX_PIXEL_COUNT: usize = 16_777_216;
 const MAX_FRAME_DT_SECONDS: f32 = 0.1;
 const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
-const SELECTED_VERTEX_INDEX: usize = 6;
+const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
+const CLIP_DEBUG_SELECTED_VERTEX_INDEX: usize = 2;
 const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
 const CAMERA_TARGET: Vec3 = Vec3::ZERO;
 const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
@@ -268,7 +271,10 @@ pub struct FrameStats {
     pub culled_triangles: u32,
     pub degenerate_triangles: u32,
     pub invalid_triangles: u32,
-    pub clipped_triangles: u32,
+    pub fully_clipped_triangles: u32,
+    pub clip_invalid_triangles: u32,
+    pub generated_triangles: u32,
+    pub max_clip_polygon_vertices: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
     pub debug_pixels: u32,
@@ -297,40 +303,71 @@ impl InputSnapshot {
 struct MeshScene {
     traces: Vec<VertexTrace>,
     clip_vertices: Vec<ClipVertex>,
-    ndc_positions: Vec<Option<NdcPosition>>,
-    viewport_positions: Vec<Option<ViewportPosition>>,
+    diagnostic_ndc_positions: Vec<Option<NdcPosition>>,
+    diagnostic_viewport_positions: Vec<Option<ViewportPosition>>,
     diagnostics: CoordinateDiagnostics,
     projection_failures: u32,
     aspect: f32,
 }
 
 impl MeshScene {
-    fn new(mesh: &Mesh, model: Transform, width: usize, height: usize) -> Self {
+    fn with_capacity(mesh: &Mesh) -> Self {
         let vertex_count = mesh.vertices().len();
-        let mut scene = Self {
+        Self {
             traces: Vec::with_capacity(vertex_count),
             clip_vertices: Vec::with_capacity(vertex_count),
-            ndc_positions: Vec::with_capacity(vertex_count),
-            viewport_positions: Vec::with_capacity(vertex_count),
+            diagnostic_ndc_positions: Vec::with_capacity(vertex_count),
+            diagnostic_viewport_positions: Vec::with_capacity(vertex_count),
             diagnostics: CoordinateDiagnostics::from_traces(&[]),
             projection_failures: 0,
             aspect: 1.0,
-        };
-        scene.rebuild(mesh, model, width, height);
+        }
+    }
+
+    fn new(mesh: &Mesh, model: Transform, width: usize, height: usize) -> Self {
+        let mut scene = Self::with_capacity(mesh);
+        scene.rebuild_cube(mesh, model, width, height);
         scene
     }
 
-    fn rebuild(&mut self, mesh: &Mesh, model: Transform, width: usize, height: usize) {
+    fn new_clip_debug(mesh: &Mesh, width: usize, height: usize) -> Self {
+        let mut scene = Self::with_capacity(mesh);
+        scene.rebuild_clip_debug(mesh, width, height);
+        scene
+    }
+
+    fn rebuild_cube(&mut self, mesh: &Mesh, model: Transform, width: usize, height: usize) {
         let aspect = width as f32 / height as f32;
         let view = look_at_lh(CAMERA_EYE, CAMERA_TARGET, CAMERA_WORLD_UP)
             .expect("고정 카메라 view 계약은 항상 유효해야 한다");
         let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
             .expect("유효한 렌더 타깃의 고정 projection 계약은 항상 유효해야 한다");
         let pipeline = TransformPipeline::new(model.model_matrix(), view, projection);
+        self.rebuild_with_pipeline(mesh, pipeline, width, height);
+    }
+
+    fn rebuild_clip_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
+        let identity = Mat4::identity();
+        self.rebuild_with_pipeline(
+            mesh,
+            TransformPipeline::new(identity, identity, identity),
+            width,
+            height,
+        );
+    }
+
+    fn rebuild_with_pipeline(
+        &mut self,
+        mesh: &Mesh,
+        pipeline: TransformPipeline,
+        width: usize,
+        height: usize,
+    ) {
+        let aspect = width as f32 / height as f32;
         self.traces.clear();
         self.clip_vertices.clear();
-        self.ndc_positions.clear();
-        self.viewport_positions.clear();
+        self.diagnostic_ndc_positions.clear();
+        self.diagnostic_viewport_positions.clear();
         for vertex in mesh.vertices() {
             let trace = pipeline.trace(ObjectPosition(vertex.position_object));
             let normal = pipeline.transform_model_direction(vertex.normal_object);
@@ -346,18 +383,35 @@ impl MeshScene {
                 uv: vertex.uv,
                 color: vertex.color,
             });
-            let ndc = perspective_divide(trace.clip_pos).ok();
-            self.viewport_positions.push(
-                ndc.and_then(|position| viewport(position, width as f32, height as f32).ok()),
-            );
-            self.ndc_positions.push(ndc);
+            // 이 값은 overlay 전용 source 진단이다. 실제 geometry는 이 캐시를 쓰지
+            // 않고 여섯 평면 clipping을 마친 fan만 divide/viewport로 보낸다.
+            let clip_position_is_finite = clip_position_is_finite(trace.clip_pos);
+            let inside_clip_volume = clip_position_is_finite
+                && ClipPlane::ALL
+                    .into_iter()
+                    .all(|plane| plane.distance(trace.clip_pos) >= 0.0);
+            let ndc = inside_clip_volume
+                .then(|| perspective_divide(trace.clip_pos).ok())
+                .flatten();
+            let projected =
+                ndc.and_then(|position| viewport(position, width as f32, height as f32).ok());
+            self.diagnostic_viewport_positions.push(projected);
+            self.diagnostic_ndc_positions.push(ndc);
             self.traces.push(trace);
         }
         self.diagnostics = CoordinateDiagnostics::from_traces(&self.traces);
         self.projection_failures = self
-            .ndc_positions
+            .traces
             .iter()
-            .filter(|position| position.is_none())
+            .zip(&self.diagnostic_ndc_positions)
+            .filter(|(trace, ndc)| {
+                let finite = clip_position_is_finite(trace.clip_pos);
+                let inside = finite
+                    && ClipPlane::ALL
+                        .into_iter()
+                        .all(|plane| plane.distance(trace.clip_pos) >= 0.0);
+                !finite || (inside && ndc.is_none())
+            })
             .count() as u32;
         self.aspect = aspect;
     }
@@ -385,10 +439,11 @@ pub struct CoordinateDebugSnapshot {
     pub material_id: u32,
     pub cull_mode: CullMode,
     pub winding_debug_mode: WindingDebugMode,
+    pub clip_debug_enabled: bool,
     pub frame_stats: FrameStats,
 }
 
-/// 렌더 타깃과 3-9장 indexed mesh debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-10장 indexed mesh/clipping debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -397,9 +452,13 @@ pub struct Renderer {
     debug_lines_enabled: bool,
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
+    clip_debug_enabled: bool,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
+    clip_debug_mesh: Mesh,
+    clip_debug_scene: MeshScene,
+    clipper: TriangleClipper,
 }
 
 impl Renderer {
@@ -416,6 +475,8 @@ impl Renderer {
             },
         );
         let mesh_scene = MeshScene::new(&mesh, draw_item.model, width, height);
+        let clip_debug_mesh = clipping_debug_fixture();
+        let clip_debug_scene = MeshScene::new_clip_debug(&clip_debug_mesh, width, height);
         let mut renderer = Self {
             target,
             stats: FrameStats::default(),
@@ -423,18 +484,22 @@ impl Renderer {
             debug_lines_enabled: true,
             cull_mode: CullMode::Back,
             winding_debug_mode: WindingDebugMode::VertexColor,
+            clip_debug_enabled: false,
             mesh,
             draw_item,
             mesh_scene,
+            clip_debug_mesh,
+            clip_debug_scene,
+            clipper: TriangleClipper::default(),
         };
+        let draw_options = FrameDrawOptions::from_renderer(&renderer);
         draw_frame(
             &mut renderer.target,
-            renderer.debug_lines_enabled,
-            renderer.cull_mode,
-            renderer.winding_debug_mode,
+            draw_options,
             &renderer.mesh,
-            &renderer.mesh_scene.viewport_positions,
+            &mut renderer.clipper,
             &renderer.mesh_scene.clip_vertices,
+            CUBE_SELECTED_VERTEX_INDEX,
         );
         Ok(renderer)
     }
@@ -445,17 +510,33 @@ impl Renderer {
         }
         let mut replacement = RenderTarget::new(width, height)?;
         let replacement_scene = MeshScene::new(&self.mesh, self.draw_item.model, width, height);
+        let replacement_clip_debug_scene =
+            MeshScene::new_clip_debug(&self.clip_debug_mesh, width, height);
+        let (mesh, clip_vertices, selected_vertex_index) = if self.clip_debug_enabled {
+            (
+                &self.clip_debug_mesh,
+                replacement_clip_debug_scene.clip_vertices.as_slice(),
+                CLIP_DEBUG_SELECTED_VERTEX_INDEX,
+            )
+        } else {
+            (
+                &self.mesh,
+                replacement_scene.clip_vertices.as_slice(),
+                CUBE_SELECTED_VERTEX_INDEX,
+            )
+        };
+        let draw_options = FrameDrawOptions::from_renderer(self);
         draw_frame(
             &mut replacement,
-            self.debug_lines_enabled,
-            self.cull_mode,
-            self.winding_debug_mode,
-            &self.mesh,
-            &replacement_scene.viewport_positions,
-            &replacement_scene.clip_vertices,
+            draw_options,
+            mesh,
+            &mut self.clipper,
+            clip_vertices,
+            selected_vertex_index,
         );
         self.target = replacement;
         self.mesh_scene = replacement_scene;
+        self.clip_debug_scene = replacement_clip_debug_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
@@ -469,38 +550,63 @@ impl Renderer {
         } else {
             rotation_y
         };
-        self.mesh_scene.rebuild(
-            &self.mesh,
-            self.draw_item.model,
-            self.target.width(),
-            self.target.height(),
-        );
+        if self.clip_debug_enabled {
+            self.clip_debug_scene.rebuild_clip_debug(
+                &self.clip_debug_mesh,
+                self.target.width(),
+                self.target.height(),
+            );
+        } else {
+            self.mesh_scene.rebuild_cube(
+                &self.mesh,
+                self.draw_item.model,
+                self.target.width(),
+                self.target.height(),
+            );
+        }
+        let (mesh, scene, selected_vertex_index) = if self.clip_debug_enabled {
+            (
+                &self.clip_debug_mesh,
+                &self.clip_debug_scene,
+                CLIP_DEBUG_SELECTED_VERTEX_INDEX,
+            )
+        } else {
+            (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX)
+        };
         let draw_report = draw_frame(
             &mut self.target,
-            self.debug_lines_enabled,
-            self.cull_mode,
-            self.winding_debug_mode,
-            &self.mesh,
-            &self.mesh_scene.viewport_positions,
-            &self.mesh_scene.clip_vertices,
+            FrameDrawOptions {
+                debug_lines_enabled: self.debug_lines_enabled,
+                cull_mode: self.cull_mode,
+                winding_debug_mode: self.winding_debug_mode,
+            },
+            mesh,
+            &mut self.clipper,
+            &scene.clip_vertices,
+            selected_vertex_index,
         );
+        let active_vertex_count = mesh.vertices().len() as u32;
+        let transformed_vertex_count = scene.traces.len() as u32;
+        let active_triangle_count = mesh.triangle_count() as u32;
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
             input_bits: input.packed_bits(),
-            input_vertices: self.mesh.vertices().len() as u32,
-            input_triangles: self.mesh.triangle_count() as u32,
-            transformed_vertices: self.mesh_scene.traces.len() as u32,
+            input_vertices: active_vertex_count,
+            input_triangles: active_triangle_count,
+            transformed_vertices: transformed_vertex_count,
             submitted_triangles: draw_report.submitted_triangles,
             culled_triangles: draw_report.culled_triangles,
             degenerate_triangles: draw_report.degenerate_triangles,
             invalid_triangles: draw_report.invalid_triangles,
+            fully_clipped_triangles: draw_report.fully_clipped_triangles,
+            clip_invalid_triangles: draw_report.clip_invalid_triangles,
+            generated_triangles: draw_report.generated_triangles,
+            max_clip_polygon_vertices: draw_report.max_clip_polygon_vertices,
             debug_pixels: draw_report.debug_pixels,
-            invalid_values: self
-                .mesh_scene
+            invalid_values: scene
                 .diagnostics
                 .invalid_values
-                .saturating_add(self.mesh_scene.projection_failures)
                 .saturating_add(u32::from(invalid_dt)),
             ..FrameStats::default()
         };
@@ -523,9 +629,13 @@ impl Renderer {
         self.winding_debug_mode = mode;
     }
 
+    pub fn set_clip_debug_enabled(&mut self, enabled: bool) {
+        self.clip_debug_enabled = enabled;
+    }
+
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.draw_item.model.rotation_radians.y = rotation_y_radians;
-        self.mesh_scene.rebuild(
+        self.mesh_scene.rebuild_cube(
             &self.mesh,
             self.draw_item.model,
             self.target.width(),
@@ -558,30 +668,76 @@ impl Renderer {
     }
 
     pub fn coordinate_debug_snapshot(&self) -> CoordinateDebugSnapshot {
-        let selected_vertex = self.mesh_scene.traces[SELECTED_VERTEX_INDEX];
+        let (mesh, scene, selected_vertex_index, rotation_y_radians, material_id) =
+            if self.clip_debug_enabled {
+                (
+                    &self.clip_debug_mesh,
+                    &self.clip_debug_scene,
+                    CLIP_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                )
+            } else {
+                (
+                    &self.mesh,
+                    &self.mesh_scene,
+                    CUBE_SELECTED_VERTEX_INDEX,
+                    self.draw_item.model.rotation_radians.y,
+                    self.draw_item.material_id.0,
+                )
+            };
+        let selected_vertex = scene.traces[selected_vertex_index];
         CoordinateDebugSnapshot {
-            rotation_y_radians: self.draw_item.model.rotation_radians.y,
-            selected_vertex_index: SELECTED_VERTEX_INDEX,
+            rotation_y_radians,
+            selected_vertex_index,
             selected_vertex,
-            selected_attributes: self.mesh_scene.clip_vertices[SELECTED_VERTEX_INDEX],
-            selected_ndc: self.mesh_scene.ndc_positions[SELECTED_VERTEX_INDEX],
-            selected_viewport: self.mesh_scene.viewport_positions[SELECTED_VERTEX_INDEX],
+            selected_attributes: scene.clip_vertices[selected_vertex_index],
+            selected_ndc: scene.diagnostic_ndc_positions[selected_vertex_index],
+            selected_viewport: scene.diagnostic_viewport_positions[selected_vertex_index],
             clip_plane_distances: ClipPlaneDistances::from_position(selected_vertex.clip_pos),
-            diagnostics: self.mesh_scene.diagnostics,
-            projection_failures: self.mesh_scene.projection_failures,
+            diagnostics: scene.diagnostics,
+            projection_failures: scene.projection_failures,
             fov_y_radians: CAMERA_FOV_Y_RADIANS,
             near: CAMERA_NEAR,
             far: CAMERA_FAR,
-            aspect: self.mesh_scene.aspect,
-            mesh_vertices: self.mesh.vertices().len() as u32,
-            mesh_indices: self.mesh.indices().len() as u32,
-            mesh_triangles: self.mesh.triangle_count() as u32,
-            material_id: self.draw_item.material_id.0,
+            aspect: scene.aspect,
+            mesh_vertices: mesh.vertices().len() as u32,
+            mesh_indices: mesh.indices().len() as u32,
+            mesh_triangles: mesh.triangle_count() as u32,
+            material_id,
             cull_mode: self.cull_mode,
             winding_debug_mode: self.winding_debug_mode,
+            clip_debug_enabled: self.clip_debug_enabled,
             frame_stats: self.stats,
         }
     }
+}
+
+fn clipping_debug_fixture() -> Mesh {
+    let positions = [
+        Vec3::new(-2.0, 2.0, -0.5),
+        Vec3::new(0.75, -0.5, 0.5),
+        Vec3::new(-0.25, -0.25, 0.5),
+    ];
+    let colors = [
+        Vec4::new(1.0, 0.25, 0.2, 1.0),
+        Vec4::new(0.2, 1.0, 0.35, 1.0),
+        Vec4::new(0.25, 0.55, 1.0, 1.0),
+    ];
+    let vertices = positions
+        .into_iter()
+        .zip(colors)
+        .enumerate()
+        .map(|(index, (position, color))| {
+            mesh::Vertex::new(
+                position,
+                Vec3::Z,
+                math::Vec2::new(index as f32 * 0.5, index as f32 * 0.25),
+                color,
+            )
+        })
+        .collect();
+    Mesh::new(vertices, vec![0, 1, 2]).expect("고정 clipping debug mesh 계약은 항상 유효해야 한다")
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -590,51 +746,69 @@ struct FrameDrawReport {
     culled_triangles: u32,
     degenerate_triangles: u32,
     invalid_triangles: u32,
+    fully_clipped_triangles: u32,
+    clip_invalid_triangles: u32,
+    generated_triangles: u32,
+    max_clip_polygon_vertices: u32,
     debug_pixels: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FrameDrawOptions {
+    debug_lines_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
+}
+
+impl FrameDrawOptions {
+    const fn from_renderer(renderer: &Renderer) -> Self {
+        Self {
+            debug_lines_enabled: renderer.debug_lines_enabled,
+            cull_mode: renderer.cull_mode,
+            winding_debug_mode: renderer.winding_debug_mode,
+        }
+    }
 }
 
 fn draw_frame(
     target: &mut RenderTarget,
-    debug_lines_enabled: bool,
-    cull_mode: CullMode,
-    winding_debug_mode: WindingDebugMode,
+    options: FrameDrawOptions,
     mesh: &Mesh,
-    viewport_positions: &[Option<ViewportPosition>],
+    clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
+    selected_vertex_index: usize,
 ) -> FrameDrawReport {
     target.render_gradient_checker();
     draw_debug_scene(
         target,
-        debug_lines_enabled,
-        cull_mode,
-        winding_debug_mode,
+        options,
         mesh,
-        viewport_positions,
+        clipper,
         clip_vertices,
+        selected_vertex_index,
     )
 }
 
 fn draw_debug_scene(
     target: &mut RenderTarget,
-    debug_lines_enabled: bool,
-    cull_mode: CullMode,
-    winding_debug_mode: WindingDebugMode,
+    options: FrameDrawOptions,
     mesh: &Mesh,
-    viewport_positions: &[Option<ViewportPosition>],
+    clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
+    selected_vertex_index: usize,
 ) -> FrameDrawReport {
     let width = target.width() as i32;
     let height = target.height() as i32;
     let shortest_side = width.min(height);
     let white = Color::rgb(238, 244, 255);
-    if !debug_lines_enabled {
+    if !options.debug_lines_enabled {
         return draw_mesh_wireframe(
             target,
             false,
-            cull_mode,
-            winding_debug_mode,
+            options.cull_mode,
+            options.winding_debug_mode,
             mesh,
-            viewport_positions,
+            clipper,
             clip_vertices,
         );
     }
@@ -642,10 +816,10 @@ fn draw_debug_scene(
         let mut report = draw_mesh_wireframe(
             target,
             false,
-            cull_mode,
-            winding_debug_mode,
+            options.cull_mode,
+            options.winding_debug_mode,
             mesh,
-            viewport_positions,
+            clipper,
             clip_vertices,
         );
         report.debug_pixels = target.draw_line_bresenham(
@@ -677,18 +851,18 @@ fn draw_debug_scene(
     let mut report = draw_mesh_wireframe(
         target,
         true,
-        cull_mode,
-        winding_debug_mode,
+        options.cull_mode,
+        options.winding_debug_mode,
         mesh,
-        viewport_positions,
+        clipper,
         clip_vertices,
     );
     written = written.saturating_add(report.debug_pixels);
-    if let Some(selected) = viewport_positions
-        .get(SELECTED_VERTEX_INDEX)
+    if let Some(selected) = clip_vertices
+        .get(selected_vertex_index)
         .copied()
-        .flatten()
-        .map(viewport_screen_point)
+        .and_then(|vertex| project_inside_clip(vertex.clip_pos, target.width(), target.height()))
+        .map(|(_, position)| viewport_screen_point(position))
     {
         written = written.saturating_add(target.draw_point(selected, white));
     }
@@ -703,72 +877,142 @@ fn draw_debug_scene(
     report
 }
 
+fn clip_position_is_finite(position: transform::ClipPosition) -> bool {
+    let position = position.0;
+    [position.x, position.y, position.z, position.w]
+        .into_iter()
+        .all(f32::is_finite)
+}
+
+fn project_inside_clip(
+    position: transform::ClipPosition,
+    width: usize,
+    height: usize,
+) -> Option<(NdcPosition, ViewportPosition)> {
+    if !clip_position_is_finite(position)
+        || !ClipPlane::ALL
+            .into_iter()
+            .all(|plane| plane.distance(position) >= 0.0)
+    {
+        return None;
+    }
+    let ndc = perspective_divide(position).ok()?;
+    let viewport = viewport(ndc, width as f32, height as f32).ok()?;
+    Some((ndc, viewport))
+}
+
 fn draw_mesh_wireframe(
     target: &mut RenderTarget,
     draw_enabled: bool,
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
     mesh: &Mesh,
-    viewport_positions: &[Option<ViewportPosition>],
+    clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
 ) -> FrameDrawReport {
     let mut report = FrameDrawReport::default();
     for triangle in mesh.triangles() {
-        let positions = triangle.map(|index| viewport_positions.get(index).copied().flatten());
-        let [Some(first), Some(second), Some(third)] = positions else {
-            report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+        let vertices = triangle.map(|index| clip_vertices.get(index).copied());
+        let [Some(first), Some(second), Some(third)] = vertices else {
+            report.clip_invalid_triangles = report.clip_invalid_triangles.saturating_add(1);
             continue;
         };
-        let (source_orientation, order) = match classify_triangle([first, second, third], cull_mode)
-        {
-            TriangleDisposition::Submit {
-                source_orientation,
-                order,
-            } => (source_orientation, order),
-            TriangleDisposition::Culled(_) => {
-                report.culled_triangles = report.culled_triangles.saturating_add(1);
+        let clipped = clipper.clip_triangle([first, second, third]);
+        report.max_clip_polygon_vertices = report
+            .max_clip_polygon_vertices
+            .max(clipped.max_polygon_vertices as u32);
+        match clipped.status {
+            ClipStatus::FullyClipped => {
+                report.fully_clipped_triangles = report.fully_clipped_triangles.saturating_add(1);
                 continue;
             }
-            TriangleDisposition::Degenerate => {
-                report.degenerate_triangles = report.degenerate_triangles.saturating_add(1);
+            ClipStatus::Invalid => {
+                report.clip_invalid_triangles = report.clip_invalid_triangles.saturating_add(1);
                 continue;
             }
-            TriangleDisposition::Invalid => {
+            ClipStatus::Visible => {}
+        }
+        report.generated_triangles = report
+            .generated_triangles
+            .saturating_add(clipped.triangles.len() as u32);
+
+        for generated in clipped.triangles {
+            let positions = generated.map(|vertex| {
+                perspective_divide(vertex.clip_pos)
+                    .and_then(|position| {
+                        viewport(position, target.width() as f32, target.height() as f32)
+                    })
+                    .ok()
+            });
+            let [Some(first), Some(second), Some(third)] = positions else {
                 report.invalid_triangles = report.invalid_triangles.saturating_add(1);
                 continue;
-            }
-        };
-        report.submitted_triangles = report.submitted_triangles.saturating_add(1);
-        if !draw_enabled {
-            continue;
+            };
+            submit_wireframe_triangle(
+                target,
+                draw_enabled,
+                cull_mode,
+                winding_debug_mode,
+                *generated,
+                [first, second, third],
+                &mut report,
+            );
         }
-        let screen_positions = [first, second, third].map(viewport_screen_point);
-        let ordered_positions = order.map(|index| screen_positions[index]);
-        let (wireframe_positions, edge_colors) = match winding_debug_mode {
-            WindingDebugMode::VertexColor => {
-                // 제출 geometry는 positive winding이지만, 8장 debug golden의 Bresenham
-                // 방향과 edge 덮어쓰기 순서를 보존하기 위해 이 wireframe만 원본 index
-                // 순서로 그린다.
-                let colors = triangle.map(|vertex_index| {
-                    clip_vertices
-                        .get(vertex_index)
-                        .map_or(Color::rgb(255, 210, 72), |vertex| debug_color(vertex.color))
-                });
-                (screen_positions, colors)
-            }
-            WindingDebugMode::Facing => {
-                let color = match source_orientation {
-                    FaceOrientation::Front => Color::rgb(72, 232, 112),
-                    FaceOrientation::Back => Color::rgb(255, 82, 92),
-                };
-                (ordered_positions, [color; 3])
-            }
-        };
-        report.debug_pixels = report
-            .debug_pixels
-            .saturating_add(target.draw_wireframe_triangle(wireframe_positions, edge_colors));
     }
     report
+}
+
+fn submit_wireframe_triangle(
+    target: &mut RenderTarget,
+    draw_enabled: bool,
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
+    generated: [ClipVertex; 3],
+    positions: [ViewportPosition; 3],
+    report: &mut FrameDrawReport,
+) {
+    let (source_orientation, order) = match classify_triangle(positions, cull_mode) {
+        TriangleDisposition::Submit {
+            source_orientation,
+            order,
+        } => (source_orientation, order),
+        TriangleDisposition::Culled(_) => {
+            report.culled_triangles = report.culled_triangles.saturating_add(1);
+            return;
+        }
+        TriangleDisposition::Degenerate => {
+            report.degenerate_triangles = report.degenerate_triangles.saturating_add(1);
+            return;
+        }
+        TriangleDisposition::Invalid => {
+            report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+            return;
+        }
+    };
+    report.submitted_triangles = report.submitted_triangles.saturating_add(1);
+    if !draw_enabled {
+        return;
+    }
+    let screen_positions = positions.map(viewport_screen_point);
+    let ordered_positions = order.map(|index| screen_positions[index]);
+    let (wireframe_positions, edge_colors) = match winding_debug_mode {
+        WindingDebugMode::VertexColor => {
+            // 제출 geometry는 positive winding이지만, 기존 Bresenham 방향과 edge
+            // 덮어쓰기 순서를 보존하기 위해 vertex-color wireframe은 원본 순서로 그린다.
+            let colors = generated.map(|vertex| debug_color(vertex.color));
+            (screen_positions, colors)
+        }
+        WindingDebugMode::Facing => {
+            let color = match source_orientation {
+                FaceOrientation::Front => Color::rgb(72, 232, 112),
+                FaceOrientation::Back => Color::rgb(255, 82, 92),
+            };
+            (ordered_positions, [color; 3])
+        }
+    };
+    report.debug_pixels = report
+        .debug_pixels
+        .saturating_add(target.draw_wireframe_triangle(wireframe_positions, edge_colors));
 }
 
 fn debug_color(color: Vec4) -> Color {
@@ -1074,7 +1318,7 @@ mod tests {
         let depth_pointer = renderer.depth_buffer().as_ptr();
         let trace_cache_pointer = renderer.mesh_scene.traces.as_ptr();
         let clip_cache_pointer = renderer.mesh_scene.clip_vertices.as_ptr();
-        let viewport_cache_pointer = renderer.mesh_scene.viewport_positions.as_ptr();
+        let viewport_cache_pointer = renderer.mesh_scene.diagnostic_viewport_positions.as_ptr();
 
         let first = renderer.update_and_render(0.25, InputSnapshot::from_packed(0xa5));
         assert_eq!(first.frame_index, 1);
@@ -1087,7 +1331,10 @@ mod tests {
         assert_eq!(first.culled_triangles, 8);
         assert_eq!(first.degenerate_triangles, 0);
         assert_eq!(first.invalid_triangles, 0);
-        assert_eq!(first.clipped_triangles, 0);
+        assert_eq!(first.fully_clipped_triangles, 0);
+        assert_eq!(first.clip_invalid_triangles, 0);
+        assert_eq!(first.generated_triangles, 12);
+        assert_eq!(first.max_clip_polygon_vertices, 3);
         assert_eq!(first.rasterized_triangles, 0);
         assert_eq!(first.shaded_samples, 0);
         assert!(first.debug_pixels > 0);
@@ -1101,7 +1348,7 @@ mod tests {
             clip_cache_pointer
         );
         assert_eq!(
-            renderer.mesh_scene.viewport_positions.as_ptr(),
+            renderer.mesh_scene.diagnostic_viewport_positions.as_ptr(),
             viewport_cache_pointer
         );
 
@@ -1145,6 +1392,196 @@ mod tests {
     fn chapter_nine_backface_culled_wireframe_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
         assert_eq!(fnv1a(renderer.color_buffer()), 0x647c_0b11);
+    }
+
+    #[test]
+    fn chapter_ten_near_corner_fixture_clips_before_divide_and_fans_the_polygon() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_cull_mode(CullMode::None);
+        renderer.set_clip_debug_enabled(true);
+        let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(stats.input_vertices, 3);
+        assert_eq!(stats.input_triangles, 1);
+        assert_eq!(stats.transformed_vertices, 3);
+        assert_eq!(stats.fully_clipped_triangles, 0);
+        assert_eq!(stats.clip_invalid_triangles, 0);
+        assert_eq!(stats.generated_triangles, 3);
+        assert_eq!(stats.max_clip_polygon_vertices, 5);
+        assert_eq!(
+            stats.generated_triangles,
+            stats.submitted_triangles
+                + stats.culled_triangles
+                + stats.degenerate_triangles
+                + stats.invalid_triangles
+        );
+        assert_eq!(stats.submitted_triangles, stats.generated_triangles);
+        assert!(stats.debug_pixels > 0);
+        assert_eq!(stats.invalid_values, 0);
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert_eq!(snapshot.selected_vertex_index, 2);
+        assert_eq!(
+            snapshot.selected_vertex.object_pos.0,
+            Vec3::new(-0.25, -0.25, 0.5)
+        );
+        assert_eq!(
+            snapshot.selected_vertex.world_pos.0,
+            Vec4::new(-0.25, -0.25, 0.5, 1.0)
+        );
+        assert_eq!(
+            snapshot.selected_vertex.view_pos.0,
+            snapshot.selected_vertex.world_pos.0
+        );
+        assert_eq!(
+            snapshot.selected_vertex.clip_pos.0,
+            snapshot.selected_vertex.world_pos.0
+        );
+        assert_eq!(
+            snapshot.selected_ndc.unwrap().0,
+            Vec3::new(-0.25, -0.25, 0.5)
+        );
+        assert_eq!(
+            snapshot.selected_viewport.unwrap(),
+            ViewportPosition {
+                x: 24.0,
+                y: 40.0,
+                z_ndc: 0.5,
+            }
+        );
+        assert_eq!(snapshot.projection_failures, 0);
+        assert_eq!(snapshot.mesh_vertices, 3);
+        assert_eq!(snapshot.mesh_indices, 3);
+        assert_eq!(snapshot.mesh_triangles, 1);
+        assert_eq!(snapshot.rotation_y_radians, 0.0);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x0d76_cd40);
+
+        renderer
+            .resize(128, 64)
+            .expect("wide resize should succeed");
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.generated_triangles, stats.generated_triangles);
+        assert_eq!(
+            resized.max_clip_polygon_vertices,
+            stats.max_clip_polygon_vertices
+        );
+    }
+
+    #[test]
+    fn clip_debug_transforms_and_reports_only_its_active_scene() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_model_rotation_y(f32::NAN);
+        let hidden_cube_clip_bits: Vec<_> = renderer
+            .mesh_scene
+            .traces
+            .iter()
+            .map(|trace| {
+                let clip = trace.clip_pos.0;
+                [
+                    clip.x.to_bits(),
+                    clip.y.to_bits(),
+                    clip.z.to_bits(),
+                    clip.w.to_bits(),
+                ]
+            })
+            .collect();
+        let clip_trace_pointer = renderer.clip_debug_scene.traces.as_ptr();
+        renderer.set_clip_debug_enabled(true);
+
+        let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(stats.input_vertices, 3);
+        assert_eq!(stats.transformed_vertices, 3);
+        assert_eq!(stats.invalid_values, 0);
+        assert_eq!(stats.clip_invalid_triangles, 0);
+        assert_eq!(
+            renderer
+                .mesh_scene
+                .traces
+                .iter()
+                .map(|trace| {
+                    let clip = trace.clip_pos.0;
+                    [
+                        clip.x.to_bits(),
+                        clip.y.to_bits(),
+                        clip.z.to_bits(),
+                        clip.w.to_bits(),
+                    ]
+                })
+                .collect::<Vec<_>>(),
+            hidden_cube_clip_bits
+        );
+        assert_eq!(
+            renderer.clip_debug_scene.traces.as_ptr(),
+            clip_trace_pointer
+        );
+        assert_eq!(
+            renderer.coordinate_debug_snapshot().selected_vertex_index,
+            2
+        );
+
+        renderer.set_clip_debug_enabled(false);
+        let cube = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(cube.transformed_vertices, 24);
+        assert_eq!(cube.invalid_values, 72);
+        assert_eq!(cube.clip_invalid_triangles, 12);
+    }
+
+    #[test]
+    fn clipped_fan_preserves_winding_for_front_and_back_culling() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_clip_debug_enabled(true);
+
+        renderer.set_cull_mode(CullMode::Back);
+        let back = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!((back.submitted_triangles, back.culled_triangles), (3, 0));
+        assert_eq!(back.degenerate_triangles, 0);
+
+        renderer.set_cull_mode(CullMode::Front);
+        let front = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!((front.submitted_triangles, front.culled_triangles), (0, 3));
+        assert_eq!(front.degenerate_triangles, 0);
+
+        let source = clipping_debug_fixture();
+        let reversed = Mesh::new(source.vertices().to_vec(), vec![0, 2, 1])
+            .expect("reversed clipping fixture should remain a valid mesh");
+        let reversed_scene = MeshScene::new_clip_debug(&reversed, 64, 64);
+        let mut target = RenderTarget::new(64, 64).expect("target should be valid");
+        let mut clipper = TriangleClipper::default();
+        let reversed_back = draw_mesh_wireframe(
+            &mut target,
+            false,
+            CullMode::Back,
+            WindingDebugMode::VertexColor,
+            &reversed,
+            &mut clipper,
+            &reversed_scene.clip_vertices,
+        );
+        assert_eq!(reversed_back.generated_triangles, 3);
+        assert_eq!(
+            (
+                reversed_back.submitted_triangles,
+                reversed_back.culled_triangles,
+            ),
+            (0, 3)
+        );
+        assert_eq!(reversed_back.degenerate_triangles, 0);
+
+        let reversed_front = draw_mesh_wireframe(
+            &mut target,
+            false,
+            CullMode::Front,
+            WindingDebugMode::VertexColor,
+            &reversed,
+            &mut clipper,
+            &reversed_scene.clip_vertices,
+        );
+        assert_eq!(reversed_front.generated_triangles, 3);
+        assert_eq!(
+            (
+                reversed_front.submitted_triangles,
+                reversed_front.culled_triangles,
+            ),
+            (3, 0)
+        );
+        assert_eq!(reversed_front.degenerate_triangles, 0);
     }
 
     #[test]
@@ -1228,6 +1665,7 @@ mod tests {
         let empty = Mesh::new(vec![], vec![]).unwrap();
         let empty_scene = MeshScene::new(&empty, Transform::IDENTITY, 64, 64);
         let mut target = RenderTarget::new(64, 64).unwrap();
+        let mut clipper = TriangleClipper::default();
         assert_eq!(
             draw_mesh_wireframe(
                 &mut target,
@@ -1235,7 +1673,7 @@ mod tests {
                 CullMode::Back,
                 WindingDebugMode::VertexColor,
                 &empty,
-                &empty_scene.viewport_positions,
+                &mut clipper,
                 &empty_scene.clip_vertices,
             ),
             FrameDrawReport::default()
@@ -1258,22 +1696,21 @@ mod tests {
                 CullMode::Back,
                 WindingDebugMode::VertexColor,
                 &degenerate,
-                &degenerate_scene.viewport_positions,
+                &mut clipper,
                 &degenerate_scene.clip_vertices,
             ),
             FrameDrawReport {
                 degenerate_triangles: 1,
+                generated_triangles: 1,
+                max_clip_polygon_vertices: 3,
                 ..FrameDrawReport::default()
             }
         );
         assert_eq!(target.color(), color_before_degenerate);
         assert_eq!(target.depth(), depth_before_degenerate);
 
-        let invalid_positions = [Some(ViewportPosition {
-            x: f32::NAN,
-            y: 0.0,
-            z_ndc: 0.5,
-        })];
+        let mut invalid_vertices = degenerate_scene.clip_vertices.clone();
+        invalid_vertices[0].uv.x = f32::NAN;
         assert_eq!(
             draw_mesh_wireframe(
                 &mut target,
@@ -1281,11 +1718,109 @@ mod tests {
                 CullMode::None,
                 WindingDebugMode::VertexColor,
                 &degenerate,
-                &invalid_positions,
-                degenerate_scene.clip_vertices.as_slice(),
+                &mut clipper,
+                invalid_vertices.as_slice(),
+            ),
+            FrameDrawReport {
+                clip_invalid_triangles: 1,
+                ..FrameDrawReport::default()
+            }
+        );
+
+        let fixture_mesh = clipping_debug_fixture();
+        let fixture_scene = MeshScene::new_clip_debug(&fixture_mesh, 64, 64);
+        let mut fixture_vertices = fixture_scene.clip_vertices;
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                true,
+                CullMode::None,
+                WindingDebugMode::VertexColor,
+                &fixture_mesh,
+                &mut clipper,
+                &fixture_vertices[..2],
+            ),
+            FrameDrawReport {
+                clip_invalid_triangles: 1,
+                ..FrameDrawReport::default()
+            }
+        );
+
+        let mut invalid_submission = FrameDrawReport::default();
+        submit_wireframe_triangle(
+            &mut target,
+            true,
+            CullMode::None,
+            WindingDebugMode::VertexColor,
+            [
+                fixture_vertices[0],
+                fixture_vertices[1],
+                fixture_vertices[2],
+            ],
+            [
+                ViewportPosition {
+                    x: f32::NAN,
+                    y: 0.0,
+                    z_ndc: 0.5,
+                },
+                ViewportPosition {
+                    x: 1.0,
+                    y: 0.0,
+                    z_ndc: 0.5,
+                },
+                ViewportPosition {
+                    x: 0.0,
+                    y: 1.0,
+                    z_ndc: 0.5,
+                },
+            ],
+            &mut invalid_submission,
+        );
+        assert_eq!(
+            invalid_submission,
+            FrameDrawReport {
+                invalid_triangles: 1,
+                ..FrameDrawReport::default()
+            }
+        );
+
+        for vertex in &mut fixture_vertices {
+            vertex.clip_pos.0 = Vec4::new(0.0, 0.0, -0.5, 1.0);
+        }
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                true,
+                CullMode::None,
+                WindingDebugMode::VertexColor,
+                &fixture_mesh,
+                &mut clipper,
+                &fixture_vertices,
+            ),
+            FrameDrawReport {
+                fully_clipped_triangles: 1,
+                max_clip_polygon_vertices: 3,
+                ..FrameDrawReport::default()
+            }
+        );
+
+        for vertex in &mut fixture_vertices {
+            vertex.clip_pos.0 = Vec4::ZERO;
+        }
+        assert_eq!(
+            draw_mesh_wireframe(
+                &mut target,
+                true,
+                CullMode::None,
+                WindingDebugMode::VertexColor,
+                &fixture_mesh,
+                &mut clipper,
+                &fixture_vertices,
             ),
             FrameDrawReport {
                 invalid_triangles: 1,
+                generated_triangles: 1,
+                max_clip_polygon_vertices: 3,
                 ..FrameDrawReport::default()
             }
         );
@@ -1362,8 +1897,9 @@ mod tests {
         renderer.set_model_rotation_y(f32::NAN);
         let invalid = renderer.update_and_render(0.0, InputSnapshot::default());
         let invalid_snapshot = renderer.coordinate_debug_snapshot();
-        assert_eq!(invalid.invalid_values, 96);
-        assert_eq!(invalid.invalid_triangles, 12);
+        assert_eq!(invalid.invalid_values, 72);
+        assert_eq!(invalid.invalid_triangles, 0);
+        assert_eq!(invalid.clip_invalid_triangles, 12);
         assert_eq!(invalid.submitted_triangles, 0);
         assert_eq!(invalid_snapshot.projection_failures, 24);
         assert_eq!(invalid_snapshot.selected_ndc, None);

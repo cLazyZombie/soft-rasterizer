@@ -24,7 +24,10 @@ function rendererStats(renderer) {
     culledTriangles: renderer.stats_culled_triangles(),
     degenerateTriangles: renderer.stats_degenerate_triangles(),
     invalidTriangles: renderer.stats_invalid_triangles(),
-    clippedTriangles: renderer.stats_clipped_triangles(),
+    fullyClippedTriangles: renderer.stats_fully_clipped_triangles(),
+    clipInvalidTriangles: renderer.stats_clip_invalid_triangles(),
+    generatedTriangles: renderer.stats_generated_triangles(),
+    maxClipPolygonVertices: renderer.stats_max_clip_polygon_vertices(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),
     debugPixels: renderer.stats_debug_pixels(),
@@ -60,6 +63,7 @@ async function bootstrap() {
   const errorOutput = document.querySelector("#error");
   const cullModeSelect = document.querySelector("#cull-mode");
   const windingDebugCheckbox = document.querySelector("#winding-debug");
+  const clipDebugCheckbox = document.querySelector("#clip-debug");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -145,9 +149,15 @@ async function bootstrap() {
     windingDebugCheckbox.checked = mode === 1;
   };
 
+  const setClipDebugEnabled = (enabled) => {
+    renderer.set_clip_debug_enabled(enabled);
+    clipDebugCheckbox.checked = enabled;
+  };
+
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCullMode(Number(cullModeSelect.value));
   setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
+  setClipDebugEnabled(clipDebugCheckbox.checked);
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -155,6 +165,10 @@ async function bootstrap() {
   });
   windingDebugCheckbox.addEventListener("change", () => {
     setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
+    renderFrame(0);
+  });
+  clipDebugCheckbox.addEventListener("change", () => {
+    setClipDebugEnabled(clipDebugCheckbox.checked);
     renderFrame(0);
   });
 
@@ -203,6 +217,7 @@ async function bootstrap() {
     contextKind: "2d",
     cullMode: Number(cullModeSelect.value),
     windingDebugMode: windingDebugCheckbox.checked ? 1 : 0,
+    clipDebugEnabled: clipDebugCheckbox.checked,
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -228,6 +243,7 @@ async function bootstrap() {
         },
         setCullMode,
         setWindingDebugMode,
+        setClipDebugEnabled,
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },

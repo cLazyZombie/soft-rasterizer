@@ -30,6 +30,7 @@ async function openReadyPage(page, initialControls = null) {
         const initialControlScript = `<script>
           document.querySelector("#cull-mode").value = ${JSON.stringify(String(initialControls.cullMode))};
           document.querySelector("#winding-debug").checked = ${JSON.stringify(initialControls.windingDebugMode === 1)};
+          document.querySelector("#clip-debug").checked = ${JSON.stringify(initialControls.clipDebugEnabled ?? false)};
         </script>`;
         await route.fulfill({
           response,
@@ -108,7 +109,10 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     culledTriangles: 8,
     degenerateTriangles: 0,
     invalidTriangles: 0,
-    clippedTriangles: 0,
+    fullyClippedTriangles: 0,
+    clipInvalidTriangles: 0,
+    generatedTriangles: 12,
+    maxClipPolygonVertices: 3,
     rasterizedTriangles: 0,
     shadedSamples: 0,
     invalidValues: 0,
@@ -308,8 +312,9 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 캐시해 wireframe으로 표
     window.__softRasterizer.setModelRotationY(Number.NaN);
     return window.__softRasterizer.advanceFrame(0);
   });
-  expect(invalid.stats.invalidValues).toBe(96);
-  expect(invalid.stats.invalidTriangles).toBe(12);
+  expect(invalid.stats.invalidValues).toBe(72);
+  expect(invalid.stats.invalidTriangles).toBe(0);
+  expect(invalid.stats.clipInvalidTriangles).toBe(12);
   expect(invalid.stats.submittedTriangles).toBe(0);
   await expect(page.locator("#coordinate-debug")).toContainText("NDC invalid · Screen invalid");
   await expect(page.locator("#coordinate-debug")).toContainText("projection failures: 24");
@@ -381,7 +386,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "선택 정점 흰색(X-ray · culling/depth 무관)",
+    "clip → fan → divide/viewport → orient2d · 선택 정점 흰색(X-ray)",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -470,6 +475,103 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
       maxChannelDifference: doubleSided.maxChannelDifference,
     },
     facingColorCounts: facing.facingColorCounts,
+  });
+});
+
+test("triangle_pipeline: homogeneous clipping을 divide 전에 적용한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "triangle_pipeline" },
+    { type: "steps", description: "14" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 0,
+    windingDebugMode: 0,
+    clipDebugEnabled: true,
+  });
+
+  const clipped = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(clipped).toMatchObject({
+    cullMode: 0,
+    windingDebugMode: 0,
+    clipDebugEnabled: true,
+  });
+  expect(clipped.stats).toMatchObject({
+    inputVertices: 3,
+    inputTriangles: 1,
+    transformedVertices: 3,
+    submittedTriangles: 3,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+    fullyClippedTriangles: 0,
+    clipInvalidTriangles: 0,
+    generatedTriangles: 3,
+    maxClipPolygonVertices: 5,
+    rasterizedTriangles: 0,
+    shadedSamples: 0,
+    invalidValues: 0,
+  });
+  expect(clipped.stats.debugPixels).toBeGreaterThan(0);
+  expect(clipped.pixelHash).toBe("8892f8b6");
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "동차 clip fixture · identity M/V/P vertex stage · viewport aspect 1.778",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "clip debug mesh · vertices 3 · indices 3 · triangles 1 · material 0 · near/left/top 교차",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText("선택 정점 v2");
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "Object (-0.250, -0.250, 0.500, 1.000)",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "Clip   (-0.250, -0.250, 0.500, 1.000)",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "Screen (360.0, 337.5, z=0.500)",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "clip stats fully clipped 0 · clip invalid 0 · generated 3 · max polygon vertices 5",
+  );
+
+  await page.locator("#clip-debug").uncheck();
+  const cube = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(cube.clipDebugEnabled).toBe(false);
+  expect(cube.stats).toMatchObject({
+    inputVertices: 24,
+    inputTriangles: 12,
+    generatedTriangles: 12,
+    maxClipPolygonVertices: 3,
+  });
+  expect(cube.pixelHash).toBe("5e1a84c6");
+  expect(cube.pixelHash).not.toBe(clipped.pixelHash);
+
+  await page.locator("#clip-debug").check();
+  const restored = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restored.clipDebugEnabled).toBe(true);
+  expect(restored.pixelHash).toBe(clipped.pixelHash);
+  expect(restored.stats).toEqual({
+    ...clipped.stats,
+    frameIndex: clipped.stats.frameIndex + 2,
+  });
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter10-homogeneous-clipping.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter10-homogeneous-clipping", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    clippedPolygonVertices: restored.stats.maxClipPolygonVertices,
+    generatedTriangles: restored.stats.generatedTriangles,
   });
 });
 

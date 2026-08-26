@@ -130,14 +130,14 @@ pub struct ClipPlaneDistances(pub [f32; 6]);
 
 impl ClipPlaneDistances {
     pub const fn from_position(clip_pos: ClipPosition) -> Self {
-        let position = clip_pos.0;
+        use crate::clip::ClipPlane;
         Self([
-            position.x + position.w,
-            position.w - position.x,
-            position.y + position.w,
-            position.w - position.y,
-            position.z,
-            position.w - position.z,
+            ClipPlane::Left.distance(clip_pos),
+            ClipPlane::Right.distance(clip_pos),
+            ClipPlane::Bottom.distance(clip_pos),
+            ClipPlane::Top.distance(clip_pos),
+            ClipPlane::Near.distance(clip_pos),
+            ClipPlane::Far.distance(clip_pos),
         ])
     }
 }

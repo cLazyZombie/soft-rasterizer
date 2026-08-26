@@ -32,7 +32,7 @@ intersection = lerp(prev, curr, t)
 1. 입력 triangle을 작은 Vec&lt;ClipVertex&gt; polygon으로 시작한다.
 1. 각 clip plane마다 기존 polygon의 모든 prev-&gt;curr edge를 순환한다.
 1. prev와 curr가 모두 내부면 curr를 출력한다. 내부-&gt;외부면 교점만, 외부-&gt;내부면 교점과 curr를 출력한다. 둘 다 외부면 아무것도 출력하지 않는다.
-1. 한 평면 뒤 결과가 비면 즉시 fully clipped로 종료한다. d_prev-d_curr가 매우 작으면 평행 edge 정책을 적용한다.
+1. 한 평면 뒤 결과가 비면 즉시 fully clipped로 종료한다. 내부 판정이 서로 다를 때만 교점을 만들며, 이때 유한한 `d_prev-d_curr`는 0일 수 없다. 경계(`distance == 0`) endpoint는 교점으로 중복 출력하지 않는다.
 1. 여섯 평면을 통과한 polygon을 fan으로 삼각형화하고, 그때 처음 perspective divide와 viewport를 수행한다.
 
 ```text
@@ -47,9 +47,11 @@ clip_polygon_against_plane(input, distance):
     if prev_in and curr_in:
       output.push(curr)
     else if prev_in and not curr_in:
-      output.push(lerp_vertex(prev, curr, d_prev/(d_prev-d_curr)))
+      if d_prev != 0:
+        output.push(lerp_vertex(prev, curr, d_prev/(d_prev-d_curr)))
     else if not prev_in and curr_in:
-      output.push(lerp_vertex(prev, curr, d_prev/(d_prev-d_curr)))
+      if d_curr != 0:
+        output.push(lerp_vertex(prev, curr, d_prev/(d_prev-d_curr)))
       output.push(curr)
     prev, d_prev = curr, d_curr
   return output
@@ -58,6 +60,10 @@ clip_polygon_against_plane(input, distance):
 ## JS-Wasm 경계
 
 클리핑은 전적으로 Rust core에 있다. JS resize는 aspect와 projection을 바꿀 뿐 clip 규칙은 바꾸지 않는다. clipping 통계로 input triangles, fully clipped, generated triangles, max polygon vertex 수를 JS overlay에 전달한다.
+
+구현에서는 내부 판정을 `distance >= 0`으로 유지한다. 실제 crossing edge는 두 거리의 부호가 다르므로 유한한 분모는 0이 아니고 `t`는 `0..1`이다. 경계 endpoint는 이미 정확한 교점이므로 그대로 한 번만 출력하고, 그 밖의 crossing에서 분모가 0이거나 non-finite이면 invalid로 분류한다. 임의 epsilon으로 inside/outside를 바꾸지 않고, 좌표 규모에 비례하는 ULP tolerance는 생성 정점의 debug postcondition에만 사용한다.
+
+통계 단계는 source와 fan 출력을 섞지 않는다. `input_triangles`는 source triangle, `fully_clipped_triangles`와 `clip_invalid_triangles`는 source 단계, `generated_triangles`와 submitted/culled/degenerate/invalid는 fan 출력 단계다. 따라서 정상 fan 출력은 `generated = submitted + culled + degenerate + invalid`를 만족한다.
 
 ## 코딩 에이전트 작업 명세
 
@@ -79,4 +85,4 @@ clip_polygon_against_plane(input, distance):
 
 - NDC로 나눈 뒤 2D에서 자르면 w와 원근 속성의 관계를 잃는다. 반드시 homogeneous clip space에서 자른다.
 - position만 자르고 UV/normal을 원래 정점에서 가져오면 clip 경계에서 텍스처와 조명이 찢어진다.
-- distance가 매우 작은 값을 무조건 0으로 만들면 plane을 따라 움직일 때 깜빡일 수 있다. 일관된 epsilon 정책과 테스트를 둔다.
+- distance가 매우 작은 값을 무조건 0으로 만들면 plane을 따라 움직일 때 깜빡일 수 있다. 경계 소유는 exact `distance >= 0`으로 유지하고, 좌표 규모에 비례하는 tolerance는 생성 정점의 debug postcondition에만 사용한다.

@@ -47,12 +47,21 @@ P rows:
 - clip 범위는 `-w<=x<=w`, `-w<=y<=w`, `0<=z<=w`다. plane distance는 `x+w`, `w-x`, `y+w`, `w-y`, `z`, `w-z`를 유지한다.
 - depth clear는 `+infinity`, 통과는 유한한 `0..1` 후보에 대한 strict `<`다. 작은 NDC 깊이가 가깝다.
 
+## Homogeneous clipping
+
+- perspective divide 전에 left, right, bottom, top, near, far 순서로 여섯 평면을 처리한다.
+- 내부 판정은 정확히 `distance >= 0`이며 임의 epsilon으로 평면 소유를 바꾸지 않는다.
+- crossing edge 교점은 `t=dA/(dA-dB)`로 만들고 `ClipVertex`의 clip position, world position, normal, UV, color를 모두 같은 `t`로 보간한다.
+- 경계(`distance == 0`) endpoint는 교점으로 중복 생성하지 않고 한 번만 출력한다. 그 밖의 crossing에서 두 거리의 차가 0이거나 non-finite이면 잘못된 입력으로 관찰하고 버린다. 좌표 규모에 비례하는 ULP tolerance는 생성 정점의 debug postcondition에만 사용한다.
+- 삼각형에서 시작한 convex polygon은 평면마다 정점이 최대 하나 늘 수 있으므로 scratch capacity 상한은 9다. 두 polygon buffer와 fan output buffer는 프레임 사이 재사용한다.
+- source 통계와 fan output 통계를 분리하며 정상 fan 출력은 `generated = submitted + culled + degenerate + invalid`를 만족한다.
+
 ## Viewport, winding과 coverage
 
 - `screen_x=(0.5+0.5*x_ndc)*width`, `screen_y=(0.5-0.5*y_ndc)*height`다.
 - screen y-down에서 `orient2d(v0,v1,v2)>0`을 front face로 쓴다. 화면에서는 시계 방향이다.
 - handedness 변경만으로 screen area, edge 또는 top-left 부호를 뒤집지 않는다.
-- 9장 wireframe 제출 단계는 non-finite area나 screen projection 실패를 `invalid`, 이름 붙인 최소 float epsilon 이하의 area를 `degenerate`로 조기 거부한다. 한 프레임의 입력 삼각형은 `submitted + culled + degenerate + invalid`로 완전히 분류한다. 11장 coverage의 최종 퇴화 판정은 고정소수점 양자화 뒤 `area==0`이며 float epsilon을 top-left equality에 사용하지 않는다.
+- 9장 wireframe 제출 단계는 non-finite area나 screen projection 실패를 `invalid`, 이름 붙인 최소 float epsilon 이하의 area를 `degenerate`로 조기 거부한다. 10장부터는 source triangle이 fan triangle 여러 개를 만들 수 있으므로 `generated = submitted + culled + degenerate + invalid`로 fan 출력을 완전히 분류한다. 11장 coverage의 최종 퇴화 판정은 고정소수점 양자화 뒤 `area==0`이며 float epsilon을 top-left equality에 사용하지 않는다.
 - culling은 `none`, `back`, `front`를 지원한다. culling을 통과한 back face는 정점 순서를 바꿔 이후 단계에 positive winding으로 제출한다.
 - 포함 edge는 `dy<0 || (dy==0 && dx>0)`이며 sample 위치는 `(x+0.5,y+0.5)`다.
 

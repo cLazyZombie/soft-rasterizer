@@ -70,6 +70,10 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn set_clip_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_clip_debug_enabled(enabled);
+    }
+
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.core.set_model_rotation_y(rotation_y_radians);
     }
@@ -142,8 +146,20 @@ impl Renderer {
         self.stats().invalid_triangles
     }
 
-    pub fn stats_clipped_triangles(&self) -> u32 {
-        self.stats().clipped_triangles
+    pub fn stats_fully_clipped_triangles(&self) -> u32 {
+        self.stats().fully_clipped_triangles
+    }
+
+    pub fn stats_clip_invalid_triangles(&self) -> u32 {
+        self.stats().clip_invalid_triangles
+    }
+
+    pub fn stats_generated_triangles(&self) -> u32 {
+        self.stats().generated_triangles
+    }
+
+    pub fn stats_max_clip_polygon_vertices(&self) -> u32 {
+        self.stats().max_clip_polygon_vertices
     }
 
     pub fn stats_rasterized_triangles(&self) -> u32 {
@@ -203,11 +219,45 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         },
     );
     let attributes = snapshot.selected_attributes;
+    let pipeline = if snapshot.clip_debug_enabled {
+        format!(
+            "동차 clip fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
+            snapshot.aspect
+        )
+    } else {
+        format!(
+            "LH/+Z 카메라 · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}",
+            snapshot.fov_y_radians.to_degrees(),
+            snapshot.near,
+            snapshot.far,
+            snapshot.aspect
+        )
+    };
+    let scene_name = if snapshot.clip_debug_enabled {
+        "clip debug mesh"
+    } else {
+        "indexed cube mesh"
+    };
+    let scene_suffix = if snapshot.clip_debug_enabled {
+        " · near/left/top 교차"
+    } else {
+        ""
+    };
+    let scene = format!(
+        "{} · vertices {} · indices {} · triangles {} · material {}{}",
+        scene_name,
+        snapshot.mesh_vertices,
+        snapshot.mesh_indices,
+        snapshot.mesh_triangles,
+        snapshot.material_id,
+        scene_suffix
+    );
     format!(
-        "LH/+Z 카메라 · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}\n\
-         indexed cube mesh · vertices {} · indices {} · triangles {} · material {}\n\
+        "{}\n\
+         {}\n\
          winding screen y-down orient2d > 0 front · cull {} · debug {}\n\
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
+         clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
@@ -217,14 +267,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          Object 범위 {} .. {}\nWorld  범위 {} .. {}\n\
          View   범위 {} .. {}\nClip   범위 {} .. {}\n\
          invalid values: {} · projection failures: {} · 첫 공간: {}",
-        snapshot.fov_y_radians.to_degrees(),
-        snapshot.near,
-        snapshot.far,
-        snapshot.aspect,
-        snapshot.mesh_vertices,
-        snapshot.mesh_indices,
-        snapshot.mesh_triangles,
-        snapshot.material_id,
+        pipeline,
+        scene,
         snapshot.cull_mode.label(),
         snapshot.winding_debug_mode.label(),
         snapshot.frame_stats.input_triangles,
@@ -232,6 +276,10 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.culled_triangles,
         snapshot.frame_stats.degenerate_triangles,
         snapshot.frame_stats.invalid_triangles,
+        snapshot.frame_stats.fully_clipped_triangles,
+        snapshot.frame_stats.clip_invalid_triangles,
+        snapshot.frame_stats.generated_triangles,
+        snapshot.frame_stats.max_clip_polygon_vertices,
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
         attributes.normal_world.x,
@@ -295,7 +343,10 @@ mod tests {
         assert_eq!(renderer.stats_culled_triangles(), 8);
         assert_eq!(renderer.stats_degenerate_triangles(), 0);
         assert_eq!(renderer.stats_invalid_triangles(), 0);
-        assert_eq!(renderer.stats_clipped_triangles(), 0);
+        assert_eq!(renderer.stats_fully_clipped_triangles(), 0);
+        assert_eq!(renderer.stats_clip_invalid_triangles(), 0);
+        assert_eq!(renderer.stats_generated_triangles(), 12);
+        assert_eq!(renderer.stats_max_clip_polygon_vertices(), 3);
         assert_eq!(renderer.stats_rasterized_triangles(), 0);
         assert_eq!(renderer.stats_shaded_samples(), 0);
         assert!(renderer.stats_debug_pixels() > 0);
@@ -330,6 +381,46 @@ mod tests {
         renderer.set_debug_lines_enabled(true);
         renderer.update_and_render(0.0, 0);
         assert!(renderer.stats_debug_pixels() > 0);
+    }
+
+    #[test]
+    fn adapter_exposes_near_corner_clipping_fixture_and_stats() {
+        let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
+        renderer.set_cull_mode(0).unwrap();
+        renderer.set_clip_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_input_vertices(), 3);
+        assert_eq!(renderer.stats_input_triangles(), 1);
+        assert_eq!(renderer.stats_generated_triangles(), 3);
+        assert_eq!(renderer.stats_submitted_triangles(), 3);
+        assert_eq!(renderer.stats_max_clip_polygon_vertices(), 5);
+        assert!(
+            renderer.coordinate_debug_text().contains(
+                "동차 clip fixture · identity M/V/P vertex stage · viewport aspect 1.000"
+            )
+        );
+        assert!(renderer.coordinate_debug_text().contains(
+            "clip debug mesh · vertices 3 · indices 3 · triangles 1 · material 0 · near/left/top 교차"
+        ));
+        assert!(renderer.coordinate_debug_text().contains("선택 정점 v2"));
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("Object (-0.250, -0.250, 0.500, 1.000)")
+        );
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("Clip   (-0.250, -0.250, 0.500, 1.000)")
+        );
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("Screen (24.0, 40.0, z=0.500)")
+        );
+        assert!(renderer.coordinate_debug_text().contains(
+            "clip stats fully clipped 0 · clip invalid 0 · generated 3 · max polygon vertices 5"
+        ));
     }
 
     #[test]
@@ -392,7 +483,7 @@ mod tests {
 
         renderer.set_model_rotation_y(f32::NAN);
         renderer.update_and_render(0.0, 0);
-        assert_eq!(renderer.stats_invalid_values(), 96);
+        assert_eq!(renderer.stats_invalid_values(), 72);
         assert!(
             renderer
                 .coordinate_debug_text()
