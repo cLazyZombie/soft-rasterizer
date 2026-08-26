@@ -30,6 +30,7 @@ function rendererStats(renderer) {
     maxClipPolygonVertices: renderer.stats_max_clip_polygon_vertices(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),
+    maxBarycentricSumError: renderer.stats_max_barycentric_sum_error(),
     debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
   };
@@ -63,8 +64,10 @@ async function bootstrap() {
   const errorOutput = document.querySelector("#error");
   const cullModeSelect = document.querySelector("#cull-mode");
   const windingDebugCheckbox = document.querySelector("#winding-debug");
+  const barycentricDebugCheckbox = document.querySelector("#barycentric-debug");
   const clipDebugCheckbox = document.querySelector("#clip-debug");
   const coverageDebugCheckbox = document.querySelector("#coverage-debug");
+  const interpolationDebugCheckbox = document.querySelector("#interpolation-debug");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -93,6 +96,8 @@ async function bootstrap() {
     document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
     document.querySelector("#coverage-algorithm").textContent =
       "S=256 incremental edge · pixel center · top-left (Rust)";
+    document.querySelector("#interpolation-algorithm").textContent =
+      "edge / area barycentric · affine color (Rust)";
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
@@ -150,6 +155,7 @@ async function bootstrap() {
   const setWindingDebugMode = (mode) => {
     renderer.set_winding_debug_mode(mode);
     windingDebugCheckbox.checked = mode === 1;
+    barycentricDebugCheckbox.checked = mode === 2;
   };
 
   const setClipDebugEnabled = (enabled) => {
@@ -157,6 +163,7 @@ async function bootstrap() {
     clipDebugCheckbox.checked = enabled;
     if (enabled) {
       coverageDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
     }
   };
 
@@ -165,14 +172,27 @@ async function bootstrap() {
     coverageDebugCheckbox.checked = enabled;
     if (enabled) {
       clipDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
+    }
+  };
+
+  const setInterpolationDebugEnabled = (enabled) => {
+    renderer.set_interpolation_debug_enabled(enabled);
+    interpolationDebugCheckbox.checked = enabled;
+    if (enabled) {
+      clipDebugCheckbox.checked = false;
+      coverageDebugCheckbox.checked = false;
     }
   };
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCullMode(Number(cullModeSelect.value));
-  setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
+  setWindingDebugMode(
+    barycentricDebugCheckbox.checked ? 2 : windingDebugCheckbox.checked ? 1 : 0,
+  );
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
+  setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -182,12 +202,20 @@ async function bootstrap() {
     setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
     renderFrame(0);
   });
+  barycentricDebugCheckbox.addEventListener("change", () => {
+    setWindingDebugMode(barycentricDebugCheckbox.checked ? 2 : 0);
+    renderFrame(0);
+  });
   clipDebugCheckbox.addEventListener("change", () => {
     setClipDebugEnabled(clipDebugCheckbox.checked);
     renderFrame(0);
   });
   coverageDebugCheckbox.addEventListener("change", () => {
     setCoverageDebugEnabled(coverageDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  interpolationDebugCheckbox.addEventListener("change", () => {
+    setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
     renderFrame(0);
   });
 
@@ -235,9 +263,14 @@ async function bootstrap() {
     resizeEvents,
     contextKind: "2d",
     cullMode: Number(cullModeSelect.value),
-    windingDebugMode: windingDebugCheckbox.checked ? 1 : 0,
+    windingDebugMode: barycentricDebugCheckbox.checked
+      ? 2
+      : windingDebugCheckbox.checked
+        ? 1
+        : 0,
     clipDebugEnabled: clipDebugCheckbox.checked,
     coverageDebugEnabled: coverageDebugCheckbox.checked,
+    interpolationDebugEnabled: interpolationDebugCheckbox.checked,
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -265,6 +298,7 @@ async function bootstrap() {
         setWindingDebugMode,
         setClipDebugEnabled,
         setCoverageDebugEnabled,
+        setInterpolationDebugEnabled,
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },

@@ -50,6 +50,10 @@ if covered:
 
 보간과 색 변환은 Rust에서 수행한다. JS UI는 barycentric RGB, triangle ID, solid color 같은 debug shader mode를 enum 값으로 선택할 수 있다. 픽셀 속성 배열을 JS로 내보내지 않는다.
 
+현재 구현은 `TriangleSetup`에서 positive fixed-point area의 역수를 한 번 만들고, coverage callback이 받은 세 edge 값을 그대로 `BarycentricCoordinates`로 바꾼다. 공개 생성자는 세 edge가 각각 `0..=area`이고 합이 정확히 area인 경우만 허용해 가중치 invariant를 타입에 고정한다. `FragmentInput`은 이 장의 범위인 barycentric과 affine color만 담으며 UV, world position과 normal은 14장 전까지 넣지 않는다. vertex-color mode는 세 `ClipVertex.color`를 screen 공간에서 affine 보간하고, barycentric debug mode는 `(lambda0,lambda1,lambda2)`를 RGB로 기록한다.
+
+색 채널은 유한한 값만 0..1로 clamp해 마지막에 RGBA8로 반올림한다. 범용 변환 함수에 직접 들어온 NaN/Inf 채널은 0으로 고정하지만, 렌더 경로의 `FragmentInput`은 non-finite 정점/보간 결과를 거부해 framebuffer를 쓰지 않고 `invalid_values`에 기록한다. `FrameStats.max_barycentric_sum_error`는 프레임의 모든 covered sample에서 최대 `|lambda0+lambda1+lambda2-1|`를 기록한다. R/G/B 단일 triangle fixture는 source affine color와 barycentric debug가 같은 이미지를 만드는 불변조건을 Rust-Wasm-Canvas 2D 경로에서 확인한다. 네 정점 색을 하나의 screen-space affine 함수로 정한 quad는 어느 대각선으로 나누어도 모든 내부 sample의 owner가 1이고 RGBA8 이미지가 exact match하는지 네이티브 invariant로 고정한다.
+
 ## 코딩 에이전트 작업 명세
 
 - FragmentInput 또는 Interpolants 구조를 만들고 현재는 affine color와 barycentric만 채운다.

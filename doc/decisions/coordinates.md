@@ -65,7 +65,9 @@ P rows:
 - culling은 `none`, `back`, `front`를 지원한다. culling을 통과한 back face는 정점 순서를 바꿔 이후 단계에 positive winding으로 제출한다.
 - coverage 화면 좌표는 `S=256`으로 `round(screen*S)`한 i64 고정소수점이며, 양자화 뒤 `area==0`이면 버린다. 포함 edge는 `dy<0 || (dy==0 && dx>0)`이고 sample 위치는 `(x+0.5,y+0.5)`다.
 - 정상 clip/viewport 출력과 최대 `16,777,216` 픽셀 계약에서는 각 edge 교차항이 최대 `width*height*S^2 = 1,099,511,627,776`이므로 i64 범위에 안전하다. 독립 setup API의 더 넓은 좌표는 i128로 area, edge step과 clamp된 bbox 네 모서리를 preflight하고 i64 범위를 벗어나면 명시적 오류로 거부한다.
-- bbox는 양자화 정점의 보수적인 정수 범위를 화면에 clamp한다. 첫 픽셀 중심에서 edge 세 개를 한 번 계산하고 x에는 `-dy*S`, y에는 `dx*S`를 더한다. 단색 sample 쓰기 수는 `shaded_samples`, setup을 통과한 삼각형 수는 `rasterized_triangles`로 관찰한다.
+- bbox는 양자화 정점의 보수적인 정수 범위를 화면에 clamp한다. 첫 픽셀 중심에서 edge 세 개를 한 번 계산하고 x에는 `-dy*S`, y에는 `dx*S`를 더한다. coverage를 통과해 색을 기록한 sample 수는 `shaded_samples`, setup을 통과한 삼각형 수는 `rasterized_triangles`로 관찰한다.
+- coverage가 만든 `e0,e1,e2`는 각각 v0,v1,v2 반대 edge이며, `lambda_i=e_i/area`로 재사용한다. triangle setup은 `inv_area`를 한 번만 만들고 각 sample에서는 곱셈으로 barycentric 좌표를 복원한다. 공개 barycentric 생성자는 `0<=e_i<=area`와 `e0+e1+e2==area`를 검증한다.
+- 12장의 정점 색은 screen-space affine 보간이며 `FragmentInput`은 barycentric과 affine color만 소유한다. UV/world position/normal의 perspective-correct 보간은 14장까지 만들지 않는다. `max_barycentric_sum_error`로 프레임의 최대 `|lambda0+lambda1+lambda2-1|`를 관찰하고, non-finite fragment 입력/결과는 색을 쓰지 않은 채 `invalid_values`에 기록한다.
 
 ## 카메라 입력
 

@@ -30,8 +30,10 @@ async function openReadyPage(page, initialControls = null) {
         const initialControlScript = `<script>
           document.querySelector("#cull-mode").value = ${JSON.stringify(String(initialControls.cullMode))};
           document.querySelector("#winding-debug").checked = ${JSON.stringify(initialControls.windingDebugMode === 1)};
+          document.querySelector("#barycentric-debug").checked = ${JSON.stringify(initialControls.windingDebugMode === 2)};
           document.querySelector("#clip-debug").checked = ${JSON.stringify(initialControls.clipDebugEnabled ?? false)};
           document.querySelector("#coverage-debug").checked = ${JSON.stringify(initialControls.coverageDebugEnabled ?? false)};
+          document.querySelector("#interpolation-debug").checked = ${JSON.stringify(initialControls.interpolationDebugEnabled ?? false)};
         </script>`;
         await route.fulfill({
           response,
@@ -118,6 +120,7 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     shadedSamples: 22958,
     invalidValues: 0,
   });
+  expect(initial.stats.maxBarycentricSumError).toBeLessThanOrEqual(2 * Math.fround(2 ** -23));
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
 
   const afterAdvance = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
@@ -392,7 +395,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "clip → fan → divide/viewport → S=256 edge/top-left coverage · 선택 정점 흰색(X-ray)",
+    "clip → fan → divide/viewport → edge/top-left → barycentric/affine color · 선택 정점 흰색(X-ray)",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -528,7 +531,7 @@ test("triangle_pipeline: homogeneous clipping을 divide 전에 적용한다", as
     invalidValues: 0,
   });
   expect(clipped.stats.debugPixels).toBeGreaterThan(0);
-  expect(clipped.pixelHash).toBe("7229f3dd");
+  expect(clipped.pixelHash).toBe("67de920e");
   await expect(page.locator("#coordinate-debug")).toContainText(
     "동차 clip fixture · identity M/V/P vertex stage · viewport aspect 1.778",
   );
@@ -702,6 +705,108 @@ test("triangle_pipeline: fixed-point top-left quad가 각 sample을 한 번만 �
     coveragePixels,
     expectedSamples,
   });
+});
+
+test("triangle_pipeline: barycentric 좌표로 R/G/B 정점 색을 affine 보간한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "triangle_pipeline" },
+    { type: "steps", description: "17" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    windingDebugMode: 0,
+    clipDebugEnabled: false,
+    coverageDebugEnabled: false,
+    interpolationDebugEnabled: true,
+  });
+  const affine = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(false);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(affine).toMatchObject({
+    windingDebugMode: 0,
+    clipDebugEnabled: false,
+    coverageDebugEnabled: false,
+    interpolationDebugEnabled: true,
+  });
+  expect(affine.stats).toMatchObject({
+    inputVertices: 3,
+    inputTriangles: 1,
+    transformedVertices: 3,
+    submittedTriangles: 1,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+    fullyClippedTriangles: 0,
+    clipInvalidTriangles: 0,
+    generatedTriangles: 1,
+    maxClipPolygonVertices: 3,
+    rasterizedTriangles: 1,
+    debugPixels: 0,
+    invalidValues: 0,
+  });
+  expect(affine.stats.shadedSamples).toBe(109824);
+  expect(affine.stats.maxBarycentricSumError).toBeLessThanOrEqual(2 * Math.fround(2 ** -23));
+
+  const sampleColors = await page.locator("#framebuffer").evaluate((canvas) => {
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    const pixel = (x, y) => Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
+    return {
+      nearRed: pixel(180, 105),
+      nearGreen: pixel(780, 105),
+      nearBlue: pixel(480, 430),
+      centroid: pixel(480, 212),
+    };
+  });
+  expect({ sampleColors, pixelHash: affine.pixelHash }).toEqual({
+    sampleColors: {
+      nearRed: [246, 1, 8, 255],
+      nearGreen: [1, 246, 8, 255],
+      nearBlue: [5, 6, 244, 255],
+      centroid: [84, 85, 86, 255],
+    },
+    pixelHash: "aabc25f9",
+  });
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "affine RGB fixture · identity M/V/P vertex stage · viewport aspect 1.778",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "barycentric RGB triangle mesh · vertices 3 · indices 3 · triangles 1 · material 0 · vertex colors R/G/B",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "interpolation stats max |lambda sum - 1|",
+  );
+  await expect(page.locator("#interpolation-algorithm")).toHaveText(
+    "edge / area barycentric · affine color (Rust)",
+  );
+
+  await page.locator("#barycentric-debug").check();
+  const barycentric = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(barycentric.windingDebugMode).toBe(2);
+  expect(barycentric.stats).toMatchObject({
+    submittedTriangles: affine.stats.submittedTriangles,
+    rasterizedTriangles: affine.stats.rasterizedTriangles,
+    shadedSamples: affine.stats.shadedSamples,
+  });
+  expect(barycentric.pixelHash).toBe(affine.pixelHash);
+  await expect(page.locator("#coordinate-debug")).toContainText("debug barycentric RGB");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter12-barycentric-affine.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter12-barycentric-affine", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, barycentric, 0, browserLog, screenshotPath, { sampleColors });
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({

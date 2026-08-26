@@ -1,6 +1,6 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 11장까지 homogeneous clipping 뒤 fixed-point top-left coverage로 단색 mesh를 그린다.
+//! 12장까지 homogeneous clipping 뒤 fixed-point coverage와 affine color 보간으로 mesh를 그린다.
 
 pub mod camera;
 pub mod clip;
@@ -19,8 +19,8 @@ use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use math::{Mat4, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
-    CullMode, FaceOrientation, TriangleDisposition, TriangleSetup, TriangleSetupError,
-    WindingDebugMode, classify_triangle,
+    CullMode, FaceOrientation, FragmentInput, TriangleDisposition, TriangleSetup,
+    TriangleSetupError, WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
 #[cfg(test)]
 use transform::CoordinateSpace;
@@ -36,6 +36,7 @@ const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
 const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
 const CLIP_DEBUG_SELECTED_VERTEX_INDEX: usize = 2;
 const COVERAGE_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
+const INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
 const CAMERA_TARGET: Vec3 = Vec3::ZERO;
 const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
@@ -281,6 +282,7 @@ pub struct FrameStats {
     pub max_clip_polygon_vertices: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
+    pub max_barycentric_sum_error: f32,
     pub debug_pixels: u32,
     pub invalid_values: u32,
 }
@@ -445,6 +447,7 @@ pub struct CoordinateDebugSnapshot {
     pub winding_debug_mode: WindingDebugMode,
     pub clip_debug_enabled: bool,
     pub coverage_debug_enabled: bool,
+    pub interpolation_debug_enabled: bool,
     pub frame_stats: FrameStats,
 }
 
@@ -453,9 +456,10 @@ enum ActiveScene {
     Cube,
     Clipping,
     Coverage,
+    Interpolation,
 }
 
-/// 렌더 타깃과 3-11장 indexed mesh/clipping/coverage debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-12장 indexed mesh/clipping/coverage/interpolation debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -466,6 +470,7 @@ pub struct Renderer {
     winding_debug_mode: WindingDebugMode,
     clip_debug_enabled: bool,
     coverage_debug_enabled: bool,
+    interpolation_debug_enabled: bool,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -473,12 +478,16 @@ pub struct Renderer {
     clip_debug_scene: MeshScene,
     coverage_debug_mesh: Mesh,
     coverage_debug_scene: MeshScene,
+    interpolation_debug_mesh: Mesh,
+    interpolation_debug_scene: MeshScene,
     clipper: TriangleClipper,
 }
 
 impl Renderer {
     const fn active_scene(&self) -> ActiveScene {
-        if self.coverage_debug_enabled {
+        if self.interpolation_debug_enabled {
+            ActiveScene::Interpolation
+        } else if self.coverage_debug_enabled {
             ActiveScene::Coverage
         } else if self.clip_debug_enabled {
             ActiveScene::Clipping
@@ -505,6 +514,9 @@ impl Renderer {
         let coverage_debug_mesh = coverage_debug_fixture();
         let coverage_debug_scene =
             MeshScene::new_identity_debug(&coverage_debug_mesh, width, height);
+        let interpolation_debug_mesh = interpolation_debug_fixture();
+        let interpolation_debug_scene =
+            MeshScene::new_identity_debug(&interpolation_debug_mesh, width, height);
         let mut renderer = Self {
             target,
             stats: FrameStats::default(),
@@ -514,6 +526,7 @@ impl Renderer {
             winding_debug_mode: WindingDebugMode::VertexColor,
             clip_debug_enabled: false,
             coverage_debug_enabled: false,
+            interpolation_debug_enabled: false,
             mesh,
             draw_item,
             mesh_scene,
@@ -521,6 +534,8 @@ impl Renderer {
             clip_debug_scene,
             coverage_debug_mesh,
             coverage_debug_scene,
+            interpolation_debug_mesh,
+            interpolation_debug_scene,
             clipper: TriangleClipper::default(),
         };
         let draw_options = FrameDrawOptions::from_renderer(&renderer);
@@ -545,6 +560,8 @@ impl Renderer {
             MeshScene::new_identity_debug(&self.clip_debug_mesh, width, height);
         let replacement_coverage_debug_scene =
             MeshScene::new_identity_debug(&self.coverage_debug_mesh, width, height);
+        let replacement_interpolation_debug_scene =
+            MeshScene::new_identity_debug(&self.interpolation_debug_mesh, width, height);
         let (mesh, clip_vertices, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (
                 &self.mesh,
@@ -561,6 +578,13 @@ impl Renderer {
                 replacement_coverage_debug_scene.clip_vertices.as_slice(),
                 COVERAGE_DEBUG_SELECTED_VERTEX_INDEX,
             ),
+            ActiveScene::Interpolation => (
+                &self.interpolation_debug_mesh,
+                replacement_interpolation_debug_scene
+                    .clip_vertices
+                    .as_slice(),
+                INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
         };
         let draw_options = FrameDrawOptions::from_renderer(self);
         draw_frame(
@@ -575,6 +599,7 @@ impl Renderer {
         self.mesh_scene = replacement_scene;
         self.clip_debug_scene = replacement_clip_debug_scene;
         self.coverage_debug_scene = replacement_coverage_debug_scene;
+        self.interpolation_debug_scene = replacement_interpolation_debug_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
@@ -605,6 +630,11 @@ impl Renderer {
                 self.target.width(),
                 self.target.height(),
             ),
+            ActiveScene::Interpolation => self.interpolation_debug_scene.rebuild_identity_debug(
+                &self.interpolation_debug_mesh,
+                self.target.width(),
+                self.target.height(),
+            ),
         }
         let (mesh, scene, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX),
@@ -617,6 +647,11 @@ impl Renderer {
                 &self.coverage_debug_mesh,
                 &self.coverage_debug_scene,
                 COVERAGE_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
+            ActiveScene::Interpolation => (
+                &self.interpolation_debug_mesh,
+                &self.interpolation_debug_scene,
+                INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
             ),
         };
         let draw_report = draw_frame(
@@ -651,10 +686,12 @@ impl Renderer {
             max_clip_polygon_vertices: draw_report.max_clip_polygon_vertices,
             rasterized_triangles: draw_report.rasterized_triangles,
             shaded_samples: draw_report.shaded_samples,
+            max_barycentric_sum_error: draw_report.max_barycentric_sum_error,
             debug_pixels: draw_report.debug_pixels,
             invalid_values: scene
                 .diagnostics
                 .invalid_values
+                .saturating_add(draw_report.invalid_values)
                 .saturating_add(u32::from(invalid_dt)),
         };
         self.stats
@@ -680,6 +717,7 @@ impl Renderer {
         self.clip_debug_enabled = enabled;
         if enabled {
             self.coverage_debug_enabled = false;
+            self.interpolation_debug_enabled = false;
         }
     }
 
@@ -687,6 +725,15 @@ impl Renderer {
         self.coverage_debug_enabled = enabled;
         if enabled {
             self.clip_debug_enabled = false;
+            self.interpolation_debug_enabled = false;
+        }
+    }
+
+    pub fn set_interpolation_debug_enabled(&mut self, enabled: bool) {
+        self.interpolation_debug_enabled = enabled;
+        if enabled {
+            self.clip_debug_enabled = false;
+            self.coverage_debug_enabled = false;
         }
     }
 
@@ -748,6 +795,13 @@ impl Renderer {
                     0.0,
                     0,
                 ),
+                ActiveScene::Interpolation => (
+                    &self.interpolation_debug_mesh,
+                    &self.interpolation_debug_scene,
+                    INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                ),
             };
         let selected_vertex = scene.traces[selected_vertex_index];
         CoordinateDebugSnapshot {
@@ -772,6 +826,7 @@ impl Renderer {
             winding_debug_mode: self.winding_debug_mode,
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
+            interpolation_debug_enabled: self.interpolation_debug_enabled,
             frame_stats: self.stats,
         }
     }
@@ -830,7 +885,32 @@ fn coverage_debug_fixture() -> Mesh {
         .expect("고정 top-left coverage quad 계약은 항상 유효해야 한다")
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+fn interpolation_debug_fixture() -> Mesh {
+    let vertices = [
+        (
+            Vec3::new(-0.65, 0.65, 0.5),
+            math::Vec2::new(0.0, 0.0),
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+        ),
+        (
+            Vec3::new(0.65, 0.65, 0.5),
+            math::Vec2::new(1.0, 0.0),
+            Vec4::new(0.0, 1.0, 0.0, 1.0),
+        ),
+        (
+            Vec3::new(0.0, -0.65, 0.5),
+            math::Vec2::new(0.5, 1.0),
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+        ),
+    ]
+    .into_iter()
+    .map(|(position, uv, color)| mesh::Vertex::new(position, Vec3::Z, uv, color))
+    .collect();
+    Mesh::new(vertices, vec![0, 1, 2])
+        .expect("고정 barycentric RGB triangle 계약은 항상 유효해야 한다")
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct FrameDrawReport {
     submitted_triangles: u32,
     culled_triangles: u32,
@@ -842,7 +922,9 @@ struct FrameDrawReport {
     max_clip_polygon_vertices: u32,
     rasterized_triangles: u32,
     shaded_samples: u32,
+    max_barycentric_sum_error: f32,
     debug_pixels: u32,
+    invalid_values: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1099,23 +1181,40 @@ fn submit_triangle(
             return;
         }
     };
-    let fill_color = match winding_debug_mode {
-        WindingDebugMode::VertexColor => debug_color(generated[order[0]].color),
-        WindingDebugMode::Facing => match source_orientation {
-            FaceOrientation::Front => Color::rgb(72, 232, 112),
-            FaceOrientation::Back => Color::rgb(255, 82, 92),
-        },
+    let ordered_colors = order.map(|index| generated[index].color);
+    let facing_color = match source_orientation {
+        FaceOrientation::Front => Color::rgb(72, 232, 112),
+        FaceOrientation::Back => Color::rgb(255, 82, 92),
     };
-    let shaded_samples = setup.rasterize(|sample| {
+    let mut max_barycentric_sum_error = 0.0_f32;
+    let mut shaded_samples = 0_u32;
+    let mut invalid_values = 0_u32;
+    setup.rasterize(|sample| {
+        let barycentric = setup.covered_barycentric(sample.edge_values);
+        max_barycentric_sum_error = max_barycentric_sum_error.max(barycentric.sum_error());
+        let Some(fragment) = FragmentInput::from_affine_color(barycentric, ordered_colors) else {
+            invalid_values = invalid_values.saturating_add(1);
+            return;
+        };
+        let fill_color = match winding_debug_mode {
+            WindingDebugMode::VertexColor => debug_color(fragment.affine_color()),
+            WindingDebugMode::Facing => facing_color,
+            WindingDebugMode::Barycentric => debug_color(fragment.barycentric().debug_color()),
+        };
         let written = target.put_pixel(
             ScreenPoint::new(sample.x as i32, sample.y as i32),
             fill_color,
         );
         debug_assert!(written, "clamp된 coverage sample은 렌더 타깃 내부여야 한다");
+        shaded_samples = shaded_samples.saturating_add(u32::from(written));
     });
     report.submitted_triangles = report.submitted_triangles.saturating_add(1);
     report.rasterized_triangles = report.rasterized_triangles.saturating_add(1);
     report.shaded_samples = report.shaded_samples.saturating_add(shaded_samples);
+    report.max_barycentric_sum_error = report
+        .max_barycentric_sum_error
+        .max(max_barycentric_sum_error);
+    report.invalid_values = report.invalid_values.saturating_add(invalid_values);
     if !draw_enabled {
         return;
     }
@@ -1128,13 +1227,15 @@ fn submit_triangle(
             let colors = generated.map(|vertex| debug_color(vertex.color));
             (screen_positions, colors)
         }
-        WindingDebugMode::Facing => {
-            let color = match source_orientation {
-                FaceOrientation::Front => Color::rgb(72, 232, 112),
-                FaceOrientation::Back => Color::rgb(255, 82, 92),
-            };
-            (ordered_positions, [color; 3])
-        }
+        WindingDebugMode::Facing => (ordered_positions, [facing_color; 3]),
+        WindingDebugMode::Barycentric => (
+            ordered_positions,
+            [
+                Color::rgb(255, 0, 0),
+                Color::rgb(0, 255, 0),
+                Color::rgb(0, 0, 255),
+            ],
+        ),
     };
     report.debug_pixels = report
         .debug_pixels
@@ -1142,8 +1243,11 @@ fn submit_triangle(
 }
 
 fn debug_color(color: Vec4) -> Color {
-    let channel = |value: f32| (value.clamp(0.0, 1.0) * 255.0).round() as u8;
-    Color::rgb(channel(color.x), channel(color.y), channel(color.z))
+    Color::rgb(
+        normalized_channel_to_u8(color.x),
+        normalized_channel_to_u8(color.y),
+        normalized_channel_to_u8(color.z),
+    )
 }
 
 fn viewport_screen_point(position: ViewportPosition) -> ScreenPoint {
@@ -1467,6 +1571,7 @@ mod tests {
         assert_eq!(first.max_clip_polygon_vertices, 3);
         assert_eq!(first.rasterized_triangles, 4);
         assert_eq!(first.shaded_samples, 329);
+        assert!(first.max_barycentric_sum_error <= 2.0 * f32::EPSILON);
         assert!(first.debug_pixels > 0);
         assert_eq!(first.invalid_values, 0);
         assert_eq!(renderer.stats(), first);
@@ -1584,7 +1689,7 @@ mod tests {
         assert_eq!(snapshot.mesh_indices, 3);
         assert_eq!(snapshot.mesh_triangles, 1);
         assert_eq!(snapshot.rotation_y_radians, 0.0);
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x3de5_f88f);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xb7bd_5d28);
 
         renderer
             .resize(128, 64)
@@ -1613,6 +1718,7 @@ mod tests {
         assert_eq!(stats.invalid_triangles, 0);
         assert_eq!(stats.rasterized_triangles, 2);
         assert_eq!(stats.shaded_samples, 32 * 32);
+        assert!(stats.max_barycentric_sum_error <= 2.0 * f32::EPSILON);
         assert_eq!(stats.debug_pixels, 0);
         assert!(
             renderer
@@ -1673,6 +1779,124 @@ mod tests {
         let clipping = renderer.coordinate_debug_snapshot();
         assert!(clipping.clip_debug_enabled);
         assert!(!clipping.coverage_debug_enabled);
+    }
+
+    #[test]
+    fn chapter_twelve_rgb_triangle_interpolates_affine_color_and_barycentric_debug() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_interpolation_debug_enabled(true);
+        let affine = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(affine.input_vertices, 3);
+        assert_eq!(affine.input_triangles, 1);
+        assert_eq!(affine.transformed_vertices, 3);
+        assert_eq!(affine.generated_triangles, 1);
+        assert_eq!(affine.submitted_triangles, 1);
+        assert_eq!(affine.rasterized_triangles, 1);
+        assert_eq!(affine.shaded_samples, 882);
+        assert_eq!(affine.max_barycentric_sum_error, f32::EPSILON);
+        assert_eq!(affine.debug_pixels, 0);
+        assert!(
+            renderer
+                .depth_buffer()
+                .iter()
+                .all(|depth| depth.is_infinite())
+        );
+
+        let near_red = pixel(&renderer.target, 13, 13);
+        let near_green = pixel(&renderer.target, 50, 13);
+        let near_blue = pixel(&renderer.target, 32, 49);
+        let centroid = pixel(&renderer.target, 32, 25);
+        assert!(near_red[0] > near_red[1] && near_red[0] > near_red[2]);
+        assert!(near_green[1] > near_green[0] && near_green[1] > near_green[2]);
+        assert!(near_blue[2] > near_blue[0] && near_blue[2] > near_blue[1]);
+        let centroid_min = centroid[..3].iter().copied().min().unwrap();
+        let centroid_max = centroid[..3].iter().copied().max().unwrap();
+        assert!(centroid_max - centroid_min <= 8);
+        assert_eq!(
+            [near_red, near_green, near_blue, centroid],
+            [
+                [234, 7, 14, 255],
+                [7, 234, 14, 255],
+                [7, 13, 235, 255],
+                [81, 87, 88, 255],
+            ]
+        );
+        let affine_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(affine_hash, 0xdb7e_9eb4);
+
+        renderer.set_winding_debug_mode(WindingDebugMode::Barycentric);
+        let barycentric = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(barycentric.submitted_triangles, affine.submitted_triangles);
+        assert_eq!(
+            barycentric.rasterized_triangles,
+            affine.rasterized_triangles
+        );
+        assert_eq!(barycentric.shaded_samples, affine.shaded_samples);
+        assert_eq!(fnv1a(renderer.color_buffer()), affine_hash);
+
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert!(snapshot.interpolation_debug_enabled);
+        assert!(!snapshot.clip_debug_enabled);
+        assert!(!snapshot.coverage_debug_enabled);
+        assert_eq!(snapshot.winding_debug_mode, WindingDebugMode::Barycentric);
+        assert_eq!(snapshot.selected_vertex_index, 0);
+        let selected = snapshot.selected_viewport.unwrap();
+        assert_close(selected.x, 11.2);
+        assert_close(selected.y, 11.2);
+        assert_close(selected.z_ndc, 0.5);
+
+        renderer
+            .resize(128, 64)
+            .expect("active interpolation fixture resize should succeed");
+        assert_eq!(renderer.framebuffer_generation(), 1);
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.input_vertices, 3);
+        assert_eq!(resized.rasterized_triangles, 1);
+        assert!(resized.shaded_samples > affine.shaded_samples);
+        assert!(resized.max_barycentric_sum_error <= 2.0 * f32::EPSILON);
+        let resized_snapshot = renderer.coordinate_debug_snapshot();
+        assert!(resized_snapshot.interpolation_debug_enabled);
+        let resized_selected = resized_snapshot.selected_viewport.unwrap();
+        assert_close(resized_selected.x, 22.4);
+        assert_close(resized_selected.y, 11.2);
+
+        renderer.set_coverage_debug_enabled(true);
+        let coverage = renderer.coordinate_debug_snapshot();
+        assert!(coverage.coverage_debug_enabled);
+        assert!(!coverage.interpolation_debug_enabled);
+    }
+
+    #[test]
+    fn chapter_twelve_invalid_fragment_color_is_counted_without_writing_a_sample() {
+        let mesh = interpolation_debug_fixture();
+        let scene = MeshScene::new_identity_debug(&mesh, 64, 64);
+        let mut generated: [ClipVertex; 3] = scene.clip_vertices.clone().try_into().unwrap();
+        generated[1].color.x = f32::NAN;
+        let positions = [
+            scene.diagnostic_viewport_positions[0].unwrap(),
+            scene.diagnostic_viewport_positions[1].unwrap(),
+            scene.diagnostic_viewport_positions[2].unwrap(),
+        ];
+        let mut target = RenderTarget::new(64, 64).unwrap();
+        target.render_gradient_checker();
+        let color_before = target.color().to_vec();
+        let mut report = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            CullMode::None,
+            WindingDebugMode::VertexColor,
+            generated,
+            positions,
+            &mut report,
+        );
+
+        assert_eq!(report.submitted_triangles, 1);
+        assert_eq!(report.rasterized_triangles, 1);
+        assert_eq!(report.shaded_samples, 0);
+        assert!(report.invalid_values > 0);
+        assert_eq!(target.color(), color_before);
     }
 
     #[test]

@@ -1,6 +1,7 @@
-//! 9장의 screen-space winding/culling과 11장의 fixed-point coverage 계약.
+//! 9장의 screen-space winding/culling, 11장의 fixed-point coverage와
+//! 12장의 barycentric/affine color 보간 계약.
 
-use crate::camera::ViewportPosition;
+use crate::{camera::ViewportPosition, math::Vec4};
 
 /// Wireframe 단계의 조기 분류에만 쓰는 float 면적 기준이다.
 ///
@@ -38,6 +39,7 @@ impl CullMode {
 pub enum WindingDebugMode {
     VertexColor,
     Facing,
+    Barycentric,
 }
 
 impl WindingDebugMode {
@@ -45,6 +47,7 @@ impl WindingDebugMode {
         match self {
             Self::VertexColor => "vertex color",
             Self::Facing => "front green / back red",
+            Self::Barycentric => "barycentric RGB",
         }
     }
 }
@@ -179,16 +182,122 @@ pub struct CoveredSample {
     pub edge_values: [i64; 3],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarycentricCoordinates {
+    lambda0: f32,
+    lambda1: f32,
+    lambda2: f32,
+}
+
+impl BarycentricCoordinates {
+    pub fn from_edge_values(edge_values: [i64; 3], area: i64) -> Option<Self> {
+        if !barycentric_edge_values_are_valid(edge_values, area) {
+            return None;
+        }
+        Some(Self::from_inv_area(edge_values, 1.0 / area as f32))
+    }
+
+    fn from_inv_area(edge_values: [i64; 3], inv_area: f32) -> Self {
+        Self {
+            lambda0: edge_values[0] as f32 * inv_area,
+            lambda1: edge_values[1] as f32 * inv_area,
+            lambda2: edge_values[2] as f32 * inv_area,
+        }
+    }
+
+    pub fn sum(self) -> f32 {
+        self.lambda0 + self.lambda1 + self.lambda2
+    }
+
+    pub fn sum_error(self) -> f32 {
+        (self.sum() - 1.0).abs()
+    }
+
+    pub const fn components(self) -> [f32; 3] {
+        [self.lambda0, self.lambda1, self.lambda2]
+    }
+
+    pub fn interpolate_vec4(self, values: [Vec4; 3]) -> Vec4 {
+        values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
+    }
+
+    pub const fn debug_color(self) -> Vec4 {
+        Vec4::new(self.lambda0, self.lambda1, self.lambda2, 1.0)
+    }
+}
+
+/// 12장 fragment 단계가 소유하는 affine 값이다.
+///
+/// UV, world position과 normal은 14장의 perspective-correct 경로 전까지 의도적으로
+/// 포함하지 않는다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FragmentInput {
+    barycentric: BarycentricCoordinates,
+    affine_color: Vec4,
+}
+
+impl FragmentInput {
+    pub fn from_affine_color(
+        barycentric: BarycentricCoordinates,
+        vertex_colors: [Vec4; 3],
+    ) -> Option<Self> {
+        if !vertex_colors.into_iter().all(vec4_is_finite) {
+            return None;
+        }
+        let affine_color = barycentric.interpolate_vec4(vertex_colors);
+        if !vec4_is_finite(affine_color) {
+            return None;
+        }
+        Some(Self {
+            barycentric,
+            affine_color,
+        })
+    }
+
+    pub const fn barycentric(self) -> BarycentricCoordinates {
+        self.barycentric
+    }
+
+    pub const fn affine_color(self) -> Vec4 {
+        self.affine_color
+    }
+}
+
+const fn vec4_is_finite(value: Vec4) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite() && value.w.is_finite()
+}
+
+fn barycentric_edge_values_are_valid(edge_values: [i64; 3], area: i64) -> bool {
+    area > 0
+        && edge_values
+            .into_iter()
+            .all(|edge| (0..=area).contains(&edge))
+        && edge_values.into_iter().map(i128::from).sum::<i128>() == i128::from(area)
+}
+
+/// 정규화 색 채널을 결정적으로 RGBA8 채널로 바꾼다.
+///
+/// NaN/Inf는 유효한 정점/보간 경로에서 나올 수 없으므로 검은 채널 0으로 관찰 가능하게
+/// 고정하고, 유한한 범위 이탈은 0..1로 clamp한 뒤 마지막에만 반올림한다.
+pub fn normalized_channel_to_u8(value: f32) -> u8 {
+    if value.is_finite() {
+        (value.clamp(0.0, 1.0) * 255.0).round() as u8
+    } else {
+        0
+    }
+}
+
 /// 양자화, bbox clamp, edge 계수와 top-left flag를 프레임 hot loop 전에 고정한다.
 ///
 /// 정상 파이프라인의 screen 정점은 `0..=width`, `0..=height`에 있고 RenderTarget은
 /// `width * height <= 16_777_216`이다. 따라서 각 교차항은 최대
 /// `width * height * 256^2 = 1_099_511_627_776`으로 i64에 안전하다. 공개 setup은
 /// 더 넓은 입력도 받을 수 있으므로 i128로 네 bbox 모서리를 preflight한 뒤 i64만 저장한다.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TriangleSetup {
     bounds: Option<PixelBounds>,
     area: i64,
+    inv_area: f32,
     edges: [EdgeEquation; 3],
 }
 
@@ -234,6 +343,7 @@ impl TriangleSetup {
         Ok(Self {
             bounds,
             area,
+            inv_area: 1.0 / area as f32,
             edges,
         })
     }
@@ -244,6 +354,21 @@ impl TriangleSetup {
 
     pub const fn bounds(&self) -> Option<PixelBounds> {
         self.bounds
+    }
+
+    pub fn barycentric(&self, edge_values: [i64; 3]) -> Option<BarycentricCoordinates> {
+        if !barycentric_edge_values_are_valid(edge_values, self.area) {
+            return None;
+        }
+        Some(BarycentricCoordinates::from_inv_area(
+            edge_values,
+            self.inv_area,
+        ))
+    }
+
+    pub(crate) fn covered_barycentric(&self, edge_values: [i64; 3]) -> BarycentricCoordinates {
+        debug_assert!(barycentric_edge_values_are_valid(edge_values, self.area));
+        BarycentricCoordinates::from_inv_area(edge_values, self.inv_area)
     }
 
     pub const fn top_left_flags(&self) -> [bool; 3] {
@@ -531,6 +656,160 @@ mod tests {
         assert_eq!(CullMode::Front.label(), "front");
         assert_eq!(WindingDebugMode::VertexColor.label(), "vertex color");
         assert_eq!(WindingDebugMode::Facing.label(), "front green / back red");
+        assert_eq!(WindingDebugMode::Barycentric.label(), "barycentric RGB");
+    }
+
+    #[test]
+    fn barycentric_coordinates_recover_vertices_midpoints_centroid_and_affine_color() {
+        let colors = [
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+            Vec4::new(0.0, 1.0, 0.0, 1.0),
+            Vec4::new(0.0, 0.0, 1.0, 1.0),
+        ];
+        for (edge_values, expected) in [
+            ([12, 0, 0], [1.0, 0.0, 0.0]),
+            ([0, 12, 0], [0.0, 1.0, 0.0]),
+            ([0, 0, 12], [0.0, 0.0, 1.0]),
+            ([6, 6, 0], [0.5, 0.5, 0.0]),
+            ([4, 4, 4], [1.0 / 3.0; 3]),
+        ] {
+            let barycentric = BarycentricCoordinates::from_edge_values(edge_values, 12).unwrap();
+            let actual = barycentric.components();
+            for (actual, expected) in actual.into_iter().zip(expected) {
+                assert!((actual - expected).abs() <= f32::EPSILON);
+            }
+            assert!(barycentric.sum_error() <= f32::EPSILON);
+            let fragment = FragmentInput::from_affine_color(barycentric, colors).unwrap();
+            assert_eq!(fragment.affine_color(), barycentric.debug_color());
+        }
+        assert_eq!(BarycentricCoordinates::from_edge_values([1, 0, 0], 0), None);
+        assert_eq!(
+            BarycentricCoordinates::from_edge_values([1, 0, 0], -1),
+            None
+        );
+        assert_eq!(
+            BarycentricCoordinates::from_edge_values([-1, 2, 11], 12),
+            None
+        );
+        assert_eq!(
+            BarycentricCoordinates::from_edge_values([5, 5, 5], 12),
+            None
+        );
+    }
+
+    #[test]
+    fn covered_samples_have_normalized_non_negative_barycentric_weights() {
+        let setup =
+            TriangleSetup::new([point(1.25, 0.5), point(7.75, 3.5), point(1.5, 7.25)], 9, 9)
+                .unwrap();
+        let mut visited = 0;
+        setup.rasterize(|sample| {
+            let barycentric = setup.barycentric(sample.edge_values).unwrap();
+            assert!(barycentric.sum_error() <= 2.0 * f32::EPSILON);
+            assert!(
+                barycentric
+                    .components()
+                    .into_iter()
+                    .all(|weight| (0.0..=1.0).contains(&weight))
+            );
+            visited += 1;
+        });
+        assert!(visited > 0);
+        assert_eq!(setup.barycentric([1, 1, 1]), None);
+    }
+
+    #[test]
+    fn fragment_input_rejects_non_finite_vertex_colors() {
+        let barycentric = BarycentricCoordinates::from_edge_values([1, 1, 1], 3).unwrap();
+        let valid = Vec4::new(0.25, 0.5, 0.75, 1.0);
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                FragmentInput::from_affine_color(
+                    barycentric,
+                    [valid, Vec4::new(non_finite, 0.0, 0.0, 1.0), valid],
+                ),
+                None
+            );
+        }
+
+        let rounding_overflow = BarycentricCoordinates::from_edge_values([0, 1, 6], 7).unwrap();
+        let largest_finite = Vec4::new(f32::MAX, f32::MAX, f32::MAX, f32::MAX);
+        assert_eq!(
+            FragmentInput::from_affine_color(
+                rounding_overflow,
+                [largest_finite, largest_finite, largest_finite],
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn affine_plane_is_identical_across_quad_diagonals_without_shared_edge_seams() {
+        const WIDTH: usize = 8;
+        const HEIGHT: usize = 8;
+        let vertices = [
+            point(1.0, 1.0),
+            point(7.0, 1.0),
+            point(7.0, 7.0),
+            point(1.0, 7.0),
+        ];
+        let vertex_colors = vertices.map(|position| {
+            Vec4::new(
+                position.x / WIDTH as f32,
+                position.y / HEIGHT as f32,
+                (position.x + position.y) / (WIDTH + HEIGHT) as f32,
+                1.0,
+            )
+        });
+        let render = |triangles: [[usize; 3]; 2]| {
+            let mut pixels = vec![None; WIDTH * HEIGHT];
+            let mut owners = vec![0_u8; WIDTH * HEIGHT];
+            for triangle in triangles {
+                let setup =
+                    TriangleSetup::new(triangle.map(|index| vertices[index]), WIDTH, HEIGHT)
+                        .unwrap();
+                let colors = triangle.map(|index| vertex_colors[index]);
+                setup.rasterize(|sample| {
+                    let index = sample.y * WIDTH + sample.x;
+                    let barycentric = setup.barycentric(sample.edge_values).unwrap();
+                    let color = FragmentInput::from_affine_color(barycentric, colors)
+                        .unwrap()
+                        .affine_color();
+                    let rgba = [
+                        normalized_channel_to_u8(color.x),
+                        normalized_channel_to_u8(color.y),
+                        normalized_channel_to_u8(color.z),
+                        normalized_channel_to_u8(color.w),
+                    ];
+                    assert!(pixels[index].replace(rgba).is_none());
+                    owners[index] += 1;
+                });
+            }
+            (pixels, owners)
+        };
+
+        let (first_pixels, first_owners) = render([[0, 1, 2], [0, 2, 3]]);
+        let (second_pixels, second_owners) = render([[0, 1, 3], [1, 2, 3]]);
+        assert_eq!(first_pixels, second_pixels);
+        assert_eq!(first_owners, second_owners);
+        for y in 0..HEIGHT {
+            for x in 0..WIDTH {
+                let expected_owner = u8::from((1..7).contains(&x) && (1..7).contains(&y));
+                assert_eq!(first_owners[y * WIDTH + x], expected_owner, "({x}, {y})");
+            }
+        }
+    }
+
+    #[test]
+    fn normalized_color_channel_clamps_finite_values_and_maps_non_finite_to_zero() {
+        assert_eq!(normalized_channel_to_u8(-1.0), 0);
+        assert_eq!(normalized_channel_to_u8(0.0), 0);
+        assert_eq!(normalized_channel_to_u8(0.5), 128);
+        assert_eq!(normalized_channel_to_u8(1.0), 255);
+        assert_eq!(normalized_channel_to_u8(2.0), 255);
+        for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(normalized_channel_to_u8(non_finite), 0);
+        }
     }
 
     #[test]

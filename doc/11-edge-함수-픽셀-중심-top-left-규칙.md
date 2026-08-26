@@ -67,7 +67,7 @@ _그림 4. 셀 전체가 아니라 중앙 샘플을 검사한다. MSAA에서는 
 
 coverage loop와 고정소수점 변환은 Rust 내부 hot path다. JS는 debug scene의 정점 위치나 top-left 표시 옵션만 바꾼다. Canvas 2D가 삼각형을 채우게 해 결과를 대신 만들면 안 된다.
 
-구현은 9장의 float `orient2d`를 culling과 조기 invalid/degenerate 분류에만 사용하고, 제출 순서를 positive winding으로 정규화한 뒤 S=256 고정소수점 area를 다시 계산한다. 양자화 뒤 `area==0`은 degenerate, 음수나 산술 범위 오류는 pipeline invalid로 분류한다. 이 setup을 통과한 삼각형은 `rasterized_triangles`, 단색을 기록한 sample은 `shaded_samples`에 집계한다. 색 보간은 12장 범위이므로 현재 단색은 제출된 첫 정점의 debug color다.
+구현은 9장의 float `orient2d`를 culling과 조기 invalid/degenerate 분류에만 사용하고, 제출 순서를 positive winding으로 정규화한 뒤 S=256 고정소수점 area를 다시 계산한다. 양자화 뒤 `area==0`은 degenerate, 음수나 산술 범위 오류는 pipeline invalid로 분류한다. 이 setup을 통과한 삼각형은 `rasterized_triangles`, 색을 기록한 sample은 `shaded_samples`에 집계한다. 11장 완료 시점에는 제출된 첫 정점의 단색을 썼고, 12장부터 같은 coverage callback에서 barycentric affine 색 보간을 적용한다. 이 장의 두 삼각형 quad fixture는 각 삼각형의 세 정점 색을 동일하게 유지해 top-left 소유 golden을 보존한다.
 
 정상 clip/viewport 출력은 화면 `0..=width`, `0..=height` 안에 있고 RenderTarget은 `width*height <= 16,777,216`이다. 따라서 S=256일 때 각 edge 교차항은 최대 `width*height*S^2 = 1,099,511,627,776`으로 i64 범위에 안전하다. 순수 setup API가 받는 더 넓은 입력은 i128로 area, edge step과 clamp된 bbox 네 모서리를 preflight한 뒤 i64로 좁히며, 범위를 벗어나면 framebuffer를 건드리지 않고 명시적 오류로 거부한다.
 
