@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 23장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA와 mipmap을 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 24장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA, mipmap과 단계별 진단을 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -105,6 +105,13 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - texture upload는 base부터 ceil-half인 `max(1, (width+1)/2) × max(1, (height+1)/2)`를 반복해 1x1까지 mip chain을 Rust가 소유한다. 홀수 extent의 마지막 행/열을 보존하고 base-color RGB는 linear에서 평균한다. base와 모든 mip level의 합이 texture당 최대 texel 수를 넘기 전에 거부한다.
 - LOD는 현재 fragment와 screen x/y 한 픽셀 이웃에서 같은 perspective rational UV 식을 평가해 구한다. `rho`의 log2를 유효 mip 범위에 clamp하고 필수 범위인 nearest mip만 선택한다.
 - mip debug는 선택 level을 색으로 표시한다. `FrameStats`는 render scale/resolved pixel, mip sample, 최소·최대 level과 invalid LOD를 별도로 보고한다. MSAA와 trilinear는 후속 확장 범위다.
+
+## 24장 진단과 프로파일링 기준선
+
+- perspective-correct UV와 covered-sample Overdraw를 pipeline debug view에 추가했다. Overdraw는 depth test 전에 count하고 geometry 제출이 끝난 뒤 post-view로 표시하므로 geometry/depth count를 바꾸지 않는다.
+- Overdraw storage는 해당 mode에서만 target 크기로 할당해 frame마다 재사용한다. `FrameStats`는 `overdrawn_pixels`와 `max_overdraw`를 보고하고 기존 단계 관계식과 함께 검증한다.
+- 브라우저는 최근 120 frame의 update/present/total ms를 ring에 보관하고 nearest-rank p50/p95를 표시한다. test-only release benchmark는 warm-up을 제외한 표본과 build/browser/device/DPR/해상도/triangle/sample count를 E2E JSON report에 기록한다.
+- 자동 3 warm-up/7 sample은 report regression fixture다. 성능 변경 비교에는 30 warm-up/120 sample 이상과 동일 pixel hash/`FrameStats`를 요구한다. 상세 계약은 [진단과 성능 측정 기준선](doc/decisions/profiling.md)에 있다.
 
 ## 교재
 

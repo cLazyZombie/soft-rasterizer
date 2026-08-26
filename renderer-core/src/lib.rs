@@ -206,6 +206,7 @@ pub struct RenderTarget {
     height: usize,
     color: Vec<u8>,
     depth: Vec<f32>,
+    overdraw: Option<Vec<u32>>,
 }
 
 impl RenderTarget {
@@ -216,6 +217,7 @@ impl RenderTarget {
             height,
             color: vec![0; color_byte_count],
             depth: vec![f32::INFINITY; pixel_count],
+            overdraw: None,
         })
     }
 
@@ -240,6 +242,51 @@ impl RenderTarget {
             pixel.copy_from_slice(&color.rgba());
         }
         self.depth.fill(f32::INFINITY);
+        self.clear_overdraw();
+    }
+
+    fn set_overdraw_tracking(&mut self, enabled: bool) {
+        if enabled {
+            if self.overdraw.is_none() {
+                self.overdraw = Some(vec![0; self.depth.len()]);
+            }
+        } else {
+            self.overdraw = None;
+        }
+    }
+
+    fn clear_overdraw(&mut self) {
+        if let Some(overdraw) = self.overdraw.as_mut() {
+            overdraw.fill(0);
+        }
+    }
+
+    fn record_overdraw(&mut self, point: ScreenPoint) {
+        let Some(pixel_index) = self.pixel_index(point) else {
+            return;
+        };
+        if let Some(overdraw) = self.overdraw.as_mut() {
+            overdraw[pixel_index] = overdraw[pixel_index].saturating_add(1);
+        }
+    }
+
+    fn apply_overdraw_debug(&mut self) -> (u32, u32) {
+        let Some(overdraw) = self.overdraw.as_ref() else {
+            return (0, 0);
+        };
+        let mut overdrawn_pixels = 0_u32;
+        let mut max_overdraw = 0_u32;
+        for (pixel_index, &count) in overdraw.iter().enumerate() {
+            if count == 0 {
+                continue;
+            }
+            overdrawn_pixels = overdrawn_pixels.saturating_add(1);
+            max_overdraw = max_overdraw.max(count);
+            let byte_index = 4 * pixel_index;
+            self.color[byte_index..byte_index + 4]
+                .copy_from_slice(&overdraw_debug_color(count).rgba());
+        }
+        (overdrawn_pixels, max_overdraw)
     }
 
     pub fn resolve_ssaa_2x_from(&mut self, source: &Self) -> bool {
@@ -396,6 +443,7 @@ impl RenderTarget {
             }
         }
         self.depth.fill(f32::INFINITY);
+        self.clear_overdraw();
     }
 
     /// Texture row 0을 화면 row 0에 두고 nearest로 전체 target에 확대한다.
@@ -413,6 +461,7 @@ impl RenderTarget {
             }
         }
         self.depth.fill(f32::INFINITY);
+        self.clear_overdraw();
         u32::try_from(self.width * self.height)
             .expect("RenderTarget 최대 pixel 수는 u32 안에 들어가야 한다")
     }
@@ -565,6 +614,8 @@ pub struct FrameStats {
     pub min_mip_level: u32,
     pub max_mip_level: u32,
     pub invalid_lod_samples: u32,
+    pub overdrawn_pixels: u32,
+    pub max_overdraw: u32,
 }
 
 impl FrameStats {
@@ -598,6 +649,10 @@ impl FrameStats {
             && self.invalid_lod_samples <= self.mip_samples
             && ((self.mip_samples == 0 && self.min_mip_level == 0 && self.max_mip_level == 0)
                 || (self.mip_samples > 0 && self.min_mip_level <= self.max_mip_level))
+            && self.overdrawn_pixels <= self.covered_samples
+            && self.max_overdraw <= self.covered_samples
+            && ((self.overdrawn_pixels == 0 && self.max_overdraw == 0)
+                || (self.overdrawn_pixels > 0 && self.max_overdraw > 0))
     }
 }
 
@@ -1482,6 +1537,11 @@ impl Renderer {
             mip_debug_enabled: self.mip_debug_enabled,
         };
         let render_target = replacement_supersample.as_mut().unwrap_or(&mut replacement);
+        let overdraw_enabled = !self.texture_debug_enabled
+            && !self.transparency_debug_enabled
+            && !self.mip_debug_enabled
+            && self.pipeline_state.debug_mode == PipelineDebugMode::Overdraw;
+        render_target.set_overdraw_tracking(overdraw_enabled);
         if self.texture_debug_enabled {
             let texture = self
                 .textures
@@ -1516,6 +1576,9 @@ impl Renderer {
                 clip_vertices,
                 selected_vertex_index,
             );
+        }
+        if overdraw_enabled {
+            render_target.apply_overdraw_debug();
         }
         if let Some(source) = replacement_supersample.as_ref() {
             assert!(replacement.resolve_ssaa_2x_from(source));
@@ -1653,7 +1716,15 @@ impl Renderer {
             ),
         };
         let active_scene = self.active_scene();
+        let overdraw_enabled = !self.texture_debug_enabled
+            && !self.transparency_debug_enabled
+            && !self.mip_debug_enabled
+            && self.pipeline_state.debug_mode == PipelineDebugMode::Overdraw;
+        if self.supersample_target.is_some() {
+            self.target.set_overdraw_tracking(false);
+        }
         let render_target = self.supersample_target.as_mut().unwrap_or(&mut self.target);
+        render_target.set_overdraw_tracking(overdraw_enabled);
         let (draw_report, texture_debug_pixels) = if self.texture_debug_enabled {
             let texture = self
                 .textures
@@ -1733,6 +1804,11 @@ impl Renderer {
                 ),
                 0,
             )
+        };
+        let (overdrawn_pixels, max_overdraw) = if overdraw_enabled {
+            render_target.apply_overdraw_debug()
+        } else {
+            (0, 0)
         };
         if let Some(source) = self.supersample_target.as_ref() {
             assert!(self.target.resolve_ssaa_2x_from(source));
@@ -1826,6 +1902,8 @@ impl Renderer {
             min_mip_level: draw_report.min_mip_level,
             max_mip_level: draw_report.max_mip_level,
             invalid_lod_samples: draw_report.invalid_lod_samples,
+            overdrawn_pixels,
+            max_overdraw,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
@@ -1879,11 +1957,11 @@ impl Renderer {
     }
 
     pub fn set_winding_debug_mode(&mut self, mode: WindingDebugMode) {
-        self.pipeline_state.debug_mode = match mode {
+        self.set_pipeline_debug_mode(match mode {
             WindingDebugMode::VertexColor => PipelineDebugMode::Solid,
             WindingDebugMode::Facing => PipelineDebugMode::FrontBack,
             WindingDebugMode::Barycentric => PipelineDebugMode::Barycentric,
-        };
+        });
     }
 
     pub fn set_clip_debug_enabled(&mut self, enabled: bool) {
@@ -1955,20 +2033,30 @@ impl Renderer {
     }
 
     pub fn set_depth_debug_mode(&mut self, mode: DepthDebugMode) {
-        self.pipeline_state.debug_mode = match mode {
+        self.set_pipeline_debug_mode(match mode {
             DepthDebugMode::Off => PipelineDebugMode::Solid,
             DepthDebugMode::Grayscale => PipelineDebugMode::Depth,
             DepthDebugMode::Heatmap => PipelineDebugMode::DepthHeatmap,
-        };
+        });
     }
 
     pub fn set_pipeline_debug_mode(&mut self, mode: PipelineDebugMode) {
         self.pipeline_state.debug_mode = mode;
+        self.mip_debug_enabled = false;
+        self.texture_debug_enabled = false;
+        self.transparency_debug_enabled = false;
+        if mode != PipelineDebugMode::Overdraw {
+            self.target.set_overdraw_tracking(false);
+            if let Some(target) = self.supersample_target.as_mut() {
+                target.set_overdraw_tracking(false);
+            }
+        }
     }
 
     pub fn set_texture_debug_enabled(&mut self, enabled: bool) {
         self.texture_debug_enabled = enabled;
         if enabled {
+            self.pipeline_state.debug_mode = PipelineDebugMode::Solid;
             self.transparency_debug_enabled = false;
             self.mip_debug_enabled = false;
         }
@@ -2338,17 +2426,23 @@ impl Renderer {
 
     pub fn set_mip_debug_enabled(&mut self, enabled: bool) {
         self.mip_debug_enabled = enabled;
-        if enabled {
-            self.mipmap_enabled = true;
-            self.texture_debug_enabled = false;
-            self.transparency_debug_enabled = false;
-            self.clip_debug_enabled = false;
-            self.coverage_debug_enabled = false;
-            self.interpolation_debug_enabled = false;
-            self.perspective_debug_enabled = false;
-            self.depth_debug_enabled = false;
-            self.set_texture_sampling_enabled(true);
+        if !enabled {
+            return;
         }
+        self.pipeline_state.debug_mode = PipelineDebugMode::Solid;
+        self.target.set_overdraw_tracking(false);
+        if let Some(target) = self.supersample_target.as_mut() {
+            target.set_overdraw_tracking(false);
+        }
+        self.mipmap_enabled = true;
+        self.texture_debug_enabled = false;
+        self.transparency_debug_enabled = false;
+        self.clip_debug_enabled = false;
+        self.coverage_debug_enabled = false;
+        self.interpolation_debug_enabled = false;
+        self.perspective_debug_enabled = false;
+        self.depth_debug_enabled = false;
+        self.set_texture_sampling_enabled(true);
     }
 
     pub const fn mip_debug_enabled(&self) -> bool {
@@ -2470,7 +2564,9 @@ impl Renderer {
                 | PipelineDebugMode::NdotL
                 | PipelineDebugMode::Diffuse
                 | PipelineDebugMode::Specular
-                | PipelineDebugMode::ColorSpaceComparison => WindingDebugMode::VertexColor,
+                | PipelineDebugMode::ColorSpaceComparison
+                | PipelineDebugMode::Uv
+                | PipelineDebugMode::Overdraw => WindingDebugMode::VertexColor,
             },
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
@@ -2491,7 +2587,9 @@ impl Renderer {
                 | PipelineDebugMode::NdotL
                 | PipelineDebugMode::Diffuse
                 | PipelineDebugMode::Specular
-                | PipelineDebugMode::ColorSpaceComparison => DepthDebugMode::Off,
+                | PipelineDebugMode::ColorSpaceComparison
+                | PipelineDebugMode::Uv
+                | PipelineDebugMode::Overdraw => DepthDebugMode::Off,
             },
             transparency_debug_enabled: self.transparency_debug_enabled,
             frame_stats: self.stats,
@@ -2913,7 +3011,9 @@ fn draw_frame(
         | PipelineDebugMode::NdotL
         | PipelineDebugMode::Diffuse
         | PipelineDebugMode::Specular
-        | PipelineDebugMode::ColorSpaceComparison => target.render_gradient_checker(),
+        | PipelineDebugMode::ColorSpaceComparison
+        | PipelineDebugMode::Uv
+        | PipelineDebugMode::Overdraw => target.render_gradient_checker(),
     }
     draw_debug_scene(
         target,
@@ -3384,6 +3484,9 @@ fn submit_triangle(
         max_barycentric_sum_error = max_barycentric_sum_error.max(barycentric.sum_error());
         let depth = barycentric.interpolate_f32(ordered_depths);
         let point = ScreenPoint::new(sample.x as i32, sample.y as i32);
+        if options.pipeline_state.debug_mode == PipelineDebugMode::Overdraw {
+            target.record_overdraw(point);
+        }
         match target.test_depth(point, depth) {
             DepthTestResult::Passed => {}
             DepthTestResult::Failed => {
@@ -3395,16 +3498,21 @@ fn submit_triangle(
                 return;
             }
         }
+        let interpolation_mode = if options.pipeline_state.debug_mode == PipelineDebugMode::Uv {
+            AttributeInterpolationMode::PerspectiveCorrect
+        } else {
+            options.pipeline_state.attribute_interpolation_mode
+        };
         let fragment = match options.material.normal_mode {
             NormalMode::Smooth => FragmentInput::from_screen_vertices(
                 barycentric,
                 ordered_screen_vertices,
-                options.pipeline_state.attribute_interpolation_mode,
+                interpolation_mode,
             ),
             NormalMode::Flat => FragmentInput::from_screen_vertices_for_flat_normal(
                 barycentric,
                 ordered_screen_vertices,
-                options.pipeline_state.attribute_interpolation_mode,
+                interpolation_mode,
             ),
         };
         let Some(fragment) = fragment else {
@@ -3604,6 +3712,8 @@ fn submit_triangle(
                 let ndotl = lambert_ndotl(shading_normal, options.light);
                 debug_color(Vec4::new(ndotl, ndotl, ndotl, 1.0))
             }
+            PipelineDebugMode::Uv => uv_debug_color(fragment.uv()),
+            PipelineDebugMode::Overdraw => Color::rgb(0, 0, 0),
         };
         let source_alpha = policy_albedo.map_or(1.0, |albedo| albedo.w);
         if options.mip_debug_enabled {
@@ -3754,7 +3864,9 @@ fn submit_triangle(
         | PipelineDebugMode::NdotL
         | PipelineDebugMode::Diffuse
         | PipelineDebugMode::Specular
-        | PipelineDebugMode::ColorSpaceComparison => {
+        | PipelineDebugMode::ColorSpaceComparison
+        | PipelineDebugMode::Uv
+        | PipelineDebugMode::Overdraw => {
             // 제출 geometry는 positive winding이지만, 기존 Bresenham 방향과 edge
             // 덮어쓰기 순서를 보존하기 위해 vertex-color wireframe은 원본 순서로 그린다.
             let colors = generated.map(|vertex| debug_color(vertex.color));
@@ -3817,6 +3929,26 @@ fn triangle_id_color(triangle_id: u32) -> Color {
         Color::rgb(255, 112, 67),
     ];
     PALETTE[triangle_id as usize % PALETTE.len()]
+}
+
+fn uv_debug_color(uv: Vec2) -> Color {
+    debug_color(Vec4::new(
+        uv.x.rem_euclid(1.0),
+        uv.y.rem_euclid(1.0),
+        0.25,
+        1.0,
+    ))
+}
+
+fn overdraw_debug_color(count: u32) -> Color {
+    match count {
+        0 => Color::rgb(0, 0, 0),
+        1 => Color::rgb(38, 102, 255),
+        2 => Color::rgb(50, 205, 230),
+        3 => Color::rgb(48, 209, 88),
+        4 => Color::rgb(255, 214, 10),
+        _ => Color::rgb(255, 69, 58),
+    }
 }
 
 fn mip_debug_color(level: u32) -> Color {
@@ -6142,6 +6274,24 @@ mod tests {
                 ..valid
             },
             FrameStats {
+                overdrawn_pixels: 1,
+                ..valid
+            },
+            FrameStats {
+                max_overdraw: 1,
+                ..valid
+            },
+            FrameStats {
+                overdrawn_pixels: 121,
+                max_overdraw: 1,
+                ..valid
+            },
+            FrameStats {
+                overdrawn_pixels: 1,
+                max_overdraw: 121,
+                ..valid
+            },
+            FrameStats {
                 sample_counter_overflow: true,
                 ..valid
             },
@@ -7569,6 +7719,8 @@ mod tests {
     #[test]
     fn chapter_twenty_three_mip_debug_exclusivity_is_symmetric() {
         let mut renderer = Renderer::new(16, 16).unwrap();
+        renderer.set_mip_debug_enabled(false);
+        assert!(!renderer.mip_debug_enabled());
         renderer.set_mip_debug_enabled(true);
         assert!(renderer.texture_sampling_enabled());
         renderer.set_clip_debug_enabled(true);
@@ -7594,5 +7746,163 @@ mod tests {
         renderer.set_mip_debug_enabled(true);
         renderer.set_texture_sampling_enabled(false);
         assert!(!renderer.mip_debug_enabled());
+    }
+
+    #[test]
+    fn chapter_twenty_four_overdraw_storage_is_optional_and_palette_is_deterministic() {
+        let mut target = RenderTarget::new(2, 1).unwrap();
+        assert!(target.overdraw.is_none());
+        assert_eq!(target.apply_overdraw_debug(), (0, 0));
+        assert_eq!(overdraw_debug_color(0), Color::rgb(0, 0, 0));
+        assert_eq!(overdraw_debug_color(3), Color::rgb(48, 209, 88));
+        assert_eq!(overdraw_debug_color(4), Color::rgb(255, 214, 10));
+        assert_eq!(overdraw_debug_color(5), Color::rgb(255, 69, 58));
+        target.set_overdraw_tracking(true);
+        target.render_gradient_checker();
+        target.record_overdraw(ScreenPoint::new(0, 0));
+        target.record_overdraw(ScreenPoint::new(1, 0));
+        target.record_overdraw(ScreenPoint::new(1, 0));
+        target.record_overdraw(ScreenPoint::new(-1, 0));
+        assert_eq!(target.apply_overdraw_debug(), (2, 2));
+        assert_eq!(
+            target.color(),
+            &[
+                38, 102, 255, 255, // one layer
+                50, 205, 230, 255, // two layers
+            ]
+        );
+        target.clear_color(Color::rgb(1, 2, 3));
+        assert_eq!(target.apply_overdraw_debug(), (0, 0));
+        target.set_overdraw_tracking(false);
+        assert!(target.overdraw.is_none());
+    }
+
+    #[test]
+    fn chapter_twenty_four_uv_and_overdraw_views_preserve_pipeline_counts() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_texture_sampling_enabled(true);
+        let solid = renderer.update_and_render(0.0, InputSnapshot::default());
+        let solid_hash = fnv1a(renderer.color_buffer());
+
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Uv);
+        assert!(!renderer.mip_debug_enabled());
+        let uv = renderer.update_and_render(0.0, InputSnapshot::default());
+        let uv_hash = fnv1a(renderer.color_buffer());
+        assert_ne!(uv_hash, solid_hash);
+        renderer.set_attribute_interpolation_mode(AttributeInterpolationMode::Affine);
+        let uv_from_affine_setting = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(fnv1a(renderer.color_buffer()), uv_hash);
+        renderer.set_attribute_interpolation_mode(AttributeInterpolationMode::PerspectiveCorrect);
+
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Overdraw);
+        let overdraw = renderer.update_and_render(0.0, InputSnapshot::default());
+        let overdraw_hash = fnv1a(renderer.color_buffer());
+        assert_ne!(overdraw_hash, uv_hash);
+        assert_eq!((uv_hash, overdraw_hash), (0xc9fc_5025, 0x7033_4476));
+        assert!(overdraw.overdrawn_pixels > 0);
+        assert!(overdraw.max_overdraw >= 1);
+        assert!(renderer.target.overdraw.is_some());
+
+        for observed in [uv, uv_from_affine_setting, overdraw] {
+            assert_eq!(observed.input_vertices, solid.input_vertices);
+            assert_eq!(observed.input_triangles, solid.input_triangles);
+            assert_eq!(observed.generated_triangles, solid.generated_triangles);
+            assert_eq!(observed.submitted_triangles, solid.submitted_triangles);
+            assert_eq!(observed.culled_triangles, solid.culled_triangles);
+            assert_eq!(observed.covered_samples, solid.covered_samples);
+            assert_eq!(observed.depth_passed_samples, solid.depth_passed_samples);
+            assert_eq!(observed.depth_failed_samples, solid.depth_failed_samples);
+            assert!(observed.pipeline_relations_hold());
+        }
+
+        renderer.set_quality_mode(QualityMode::Ssaa2x).unwrap();
+        assert!(renderer.target.overdraw.is_none());
+        assert!(
+            renderer
+                .supersample_target
+                .as_ref()
+                .is_some_and(|target| target.overdraw.is_some())
+        );
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Solid);
+        assert!(renderer.target.overdraw.is_none());
+        assert!(
+            renderer
+                .supersample_target
+                .as_ref()
+                .is_some_and(|target| target.overdraw.is_none())
+        );
+        renderer.set_quality_mode(QualityMode::NoAa).unwrap();
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Overdraw);
+        renderer.update_and_render(0.0, InputSnapshot::default());
+
+        renderer.resize(48, 40).unwrap();
+        assert!(renderer.target.overdraw.is_some());
+        assert!(
+            renderer
+                .color_buffer()
+                .chunks_exact(4)
+                .any(|pixel| pixel == overdraw_debug_color(1).rgba())
+        );
+        renderer.resize(64, 64).unwrap();
+
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Solid);
+        let restored = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(fnv1a(renderer.color_buffer()), solid_hash);
+        assert_eq!((restored.overdrawn_pixels, restored.max_overdraw), (0, 0));
+        assert!(renderer.target.overdraw.is_none());
+    }
+
+    #[test]
+    fn chapter_twenty_four_mip_view_owns_resize_over_overdraw_in_both_quality_modes() {
+        let mut renderer = Renderer::new(32, 24).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_texture_debug_enabled(true);
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Uv);
+        assert!(!renderer.texture_debug_enabled());
+        renderer.set_transparency_debug_enabled(true);
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Overdraw);
+        assert!(!renderer.transparency_debug_enabled());
+        for (quality, width, height) in [(QualityMode::NoAa, 28, 20), (QualityMode::Ssaa2x, 24, 18)]
+        {
+            renderer.set_quality_mode(quality).unwrap();
+            renderer.set_pipeline_debug_mode(PipelineDebugMode::Overdraw);
+            renderer.update_and_render(0.0, InputSnapshot::default());
+            assert!(
+                renderer
+                    .supersample_target
+                    .as_ref()
+                    .map_or(renderer.target.overdraw.is_some(), |target| target
+                        .overdraw
+                        .is_some())
+            );
+
+            renderer.set_mip_debug_enabled(true);
+            assert_eq!(renderer.pipeline_state.debug_mode, PipelineDebugMode::Solid);
+            assert!(renderer.target.overdraw.is_none());
+            assert!(
+                renderer
+                    .supersample_target
+                    .as_ref()
+                    .is_none_or(|target| target.overdraw.is_none())
+            );
+            renderer.update_and_render(0.0, InputSnapshot::default());
+            renderer.resize(width, height).unwrap();
+            let resize_hash = fnv1a(renderer.color_buffer());
+            renderer.update_and_render(0.0, InputSnapshot::default());
+            assert_eq!(fnv1a(renderer.color_buffer()), resize_hash);
+            assert_eq!(
+                (renderer.stats.overdrawn_pixels, renderer.stats.max_overdraw),
+                (0, 0)
+            );
+            assert!(renderer.target.overdraw.is_none());
+            assert!(
+                renderer
+                    .supersample_target
+                    .as_ref()
+                    .is_none_or(|target| target.overdraw.is_none())
+            );
+        }
     }
 }

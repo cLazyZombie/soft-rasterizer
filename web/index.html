@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>23장 · Antialiasing과 Mipmap</h1>
+        <h1>24장 · Debug Views, Tests와 Profiling</h1>
       </div>
-      <p>Rust가 2x SSAA의 linear resolve와 perspective UV footprint 기반 nearest mip 선택을 처리합니다.</p>
+      <p>같은 Rust pipeline의 단계별 debug view와 불변조건, frame timing p50/p95를 함께 관찰합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="camera-mode">
           Camera
@@ -153,6 +153,8 @@
             <option value="9">Linear diffuse only</option>
             <option value="10">Blinn-Phong specular only</option>
             <option value="11">Linear correct / encoded wrong-way</option>
+            <option value="12">Perspective UV</option>
+            <option value="13">Overdraw</option>
           </select>
         </label>
         <label for="winding-debug">
@@ -305,7 +307,7 @@
       </div>
       <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
       <p class="space-legend">
-        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip
+        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip · UV/overdraw diagnostic post-view
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -347,6 +349,8 @@
         <dd id="transparency-status">초기화 중</dd>
         <dt>Quality / Mipmap</dt>
         <dd id="quality-status">초기화 중</dd>
+        <dt>Overdraw</dt>
+        <dd id="overdraw-stats">초기화 중</dd>
         <dt>Camera input</dt>
         <dd id="camera-status">초기화 중</dd>
         <dt>프레임</dt>
@@ -363,6 +367,8 @@
         <dd id="present-time">0.000 ms</dd>
         <dt>전체 프레임 단계</dt>
         <dd id="frame-time">0.000 ms</dd>
+        <dt>최근 frame timing 분포</dt>
+        <dd id="timing-window">warm-up 전</dd>
       </dl>
       <div id="error" role="alert"></div>
     </main>

@@ -3,6 +3,7 @@ import { InputCollector } from "./input.js";
 import { readObjFileBytes, validateObjFileSize } from "./mesh-upload.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
+import { FrameTimingRing, summarizeFrameTimings } from "./frame-timing.js";
 
 const MAX_FRAME_DT_SECONDS = 0.1;
 
@@ -60,6 +61,8 @@ function rendererStats(renderer) {
     minMipLevel: renderer.stats_min_mip_level(),
     maxMipLevel: renderer.stats_max_mip_level(),
     invalidLodSamples: renderer.stats_invalid_lod_samples(),
+    overdrawnPixels: renderer.stats_overdrawn_pixels(),
+    maxOverdraw: renderer.stats_max_overdraw(),
   };
 }
 
@@ -145,6 +148,7 @@ async function bootstrap() {
   let resizeScheduled = false;
   let currentSize = initialSize;
   let lastFrameMetrics = null;
+  const frameTimingWindow = new FrameTimingRing();
   let lastInputSnapshot = new Float64Array(8);
   let coordinateDebugText = "좌표 계산 대기 중";
   let textureStatusText = "fallback checkerboard · 2 × 2 · 2 mip levels · texture 0";
@@ -228,6 +232,16 @@ async function bootstrap() {
         lastFrameMetrics.totalMs,
       );
     }
+    const timingSummary = frameTimingWindow.summary();
+    document.querySelector("#timing-window").textContent =
+      timingSummary.count === 0
+        ? "warm-up 전"
+        : `${timingSummary.count} frames · ` +
+          `update p50 ${formatMilliseconds(timingSummary.updateMs.p50)} / p95 ${formatMilliseconds(timingSummary.updateMs.p95)} · ` +
+          `present p50 ${formatMilliseconds(timingSummary.presentMs.p50)} / p95 ${formatMilliseconds(timingSummary.presentMs.p95)} · ` +
+          `total p50 ${formatMilliseconds(timingSummary.totalMs.p50)} / p95 ${formatMilliseconds(timingSummary.totalMs.p95)}`;
+    document.querySelector("#overdraw-stats").textContent =
+      `${renderer.stats_overdrawn_pixels()} pixels · max ${renderer.stats_max_overdraw()} layers`;
   };
 
   const renderFrame = (dtSeconds) => {
@@ -252,7 +266,9 @@ async function bootstrap() {
       presentMs: presentEnd - presentStart,
       totalMs: presentEnd - frameStart,
     };
+    frameTimingWindow.push(lastFrameMetrics);
     updateStatus();
+    return lastFrameMetrics;
   };
 
   const setCullMode = (mode) => {
@@ -265,12 +281,19 @@ async function bootstrap() {
     cameraModeSelect.value = String(mode);
   };
 
-  const setPipelineDebugMode = (mode) => {
-    renderer.set_pipeline_debug_mode(mode);
+  const syncPipelineViewControls = (mode) => {
     pipelineDebugModeSelect.value = String(mode);
     windingDebugCheckbox.checked = mode === 6;
     barycentricDebugCheckbox.checked = mode === 3;
     depthDebugModeSelect.value = String(mode === 4 ? 1 : mode === 5 ? 2 : 0);
+  };
+
+  const setPipelineDebugMode = (mode) => {
+    renderer.set_pipeline_debug_mode(mode);
+    syncPipelineViewControls(mode);
+    textureDebugCheckbox.checked = false;
+    transparencyDebugCheckbox.checked = false;
+    syncMipControls();
   };
 
   const setWindingDebugMode = (mode) => {
@@ -366,6 +389,7 @@ async function bootstrap() {
     renderer.set_texture_debug_enabled(enabled);
     textureDebugCheckbox.checked = enabled;
     if (enabled) {
+      syncPipelineViewControls(0);
       transparencyDebugCheckbox.checked = false;
       renderer.set_texture_sampling_enabled(false);
       textureSamplingCheckbox.checked = false;
@@ -466,7 +490,7 @@ async function bootstrap() {
       perspectiveDebugCheckbox.checked = false;
       depthDebugCheckbox.checked = false;
       textureDebugCheckbox.checked = false;
-      setPipelineDebugMode(0);
+      syncPipelineViewControls(0);
     }
     syncMipControls();
   };
@@ -495,6 +519,7 @@ async function bootstrap() {
     renderer.set_mip_debug_enabled(enabled);
     syncMipControls();
     if (enabled) {
+      syncPipelineViewControls(0);
       textureDebugCheckbox.checked = false;
       transparencyDebugCheckbox.checked = false;
       clipDebugCheckbox.checked = false;
@@ -904,6 +929,7 @@ async function bootstrap() {
     typedArrayViewRebuilds: presenter.viewRebuilds,
     updateAndRenderCalls: updateCalls,
     lastFrameMetrics,
+    timingWindow: frameTimingWindow.summary(),
     resizeEvents,
     contextKind: "2d",
     camera: {
@@ -1016,6 +1042,48 @@ async function bootstrap() {
     stats: rendererStats(renderer),
   });
 
+  const runBenchmark = (warmupFrames, sampleFrames, fixedDtSeconds) => {
+    if (!Number.isInteger(warmupFrames) || warmupFrames < 0 || warmupFrames > 120) {
+      throw new Error("benchmark warm-up frame 수는 0..120 정수여야 합니다");
+    }
+    if (!Number.isInteger(sampleFrames) || sampleFrames < 1 || sampleFrames > 240) {
+      throw new Error("benchmark sample frame 수는 1..240 정수여야 합니다");
+    }
+    if (
+      !Number.isFinite(fixedDtSeconds) ||
+      fixedDtSeconds < 0 ||
+      fixedDtSeconds > MAX_FRAME_DT_SECONDS
+    ) {
+      throw new Error(`benchmark fixed dt는 0..${MAX_FRAME_DT_SECONDS}초여야 합니다`);
+    }
+    for (let frame = 0; frame < warmupFrames; frame += 1) {
+      renderFrame(fixedDtSeconds);
+    }
+    const samples = [];
+    for (let frame = 0; frame < sampleFrames; frame += 1) {
+      samples.push(renderFrame(fixedDtSeconds));
+    }
+    const stats = rendererStats(renderer);
+    return {
+      buildMode: "release Wasm · test automation web",
+      browser: navigator.userAgent,
+      device: {
+        hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+        deviceMemoryGiB: navigator.deviceMemory ?? null,
+        deviceScaleFactor: window.devicePixelRatio || 1,
+      },
+      resolution: [renderer.render_width(), renderer.render_height()],
+      logicalResolution: [renderer.width(), renderer.height()],
+      warmupFrames,
+      sampleFrames,
+      fixedDtSeconds,
+      triangles: stats.inputTriangles,
+      coveredSamples: stats.coveredSamples,
+      shadedSamples: stats.shadedSamples,
+      timings: summarizeFrameTimings(samples),
+    };
+  };
+
   const onAnimationFrame = (timestamp) => {
     const dtSeconds =
       previousTimestamp === null
@@ -1027,6 +1095,7 @@ async function bootstrap() {
     if (__AUTOMATION__) {
       window.__softRasterizer = Object.freeze({
         ready: true,
+        runBenchmark,
         advanceFrame(requestedDtSeconds) {
           renderFrame(requestedDtSeconds);
           return snapshot();

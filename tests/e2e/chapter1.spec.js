@@ -1,6 +1,7 @@
 import { expect, test } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import { FrameTimingRing, summarizeFrameTimings } from "../../web/frame-timing.js";
 
 const EXECUTION_MODE = process.env.SOFT_RASTERIZER_E2E_MODE ?? "unspecified";
 
@@ -2848,5 +2849,177 @@ test("antialiasing_mipmap: 2x SSAA linear resolve와 perspective nearest mip를 
       noAa: noAa.stats.shadedSamples,
       ssaa: ssaa.stats.shadedSamples,
     },
+  });
+});
+
+test("diagnostics_profiling: UV/overdraw view와 release p50/p95 report를 연결한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "diagnostics_profiling" },
+    { type: "steps", description: "47" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, { cullMode: 0, windingDebugMode: 0 });
+  const baseline = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(baseline).toMatchObject({
+    pipelineDebugMode: 0,
+    stats: { overdrawnPixels: 0, maxOverdraw: 0 },
+  });
+  const invariantCounts = (snapshot) => ({
+    inputTriangles: snapshot.stats.inputTriangles,
+    generatedTriangles: snapshot.stats.generatedTriangles,
+    submittedTriangles: snapshot.stats.submittedTriangles,
+    culledTriangles: snapshot.stats.culledTriangles,
+    coveredSamples: snapshot.stats.coveredSamples,
+    depthPassedSamples: snapshot.stats.depthPassedSamples,
+    depthFailedSamples: snapshot.stats.depthFailedSamples,
+  });
+
+  await page.locator("#pipeline-debug-mode").selectOption("12");
+  const uv = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(uv.pipelineDebugMode).toBe(12);
+  expect([uv.stats.overdrawnPixels, uv.stats.maxOverdraw]).toEqual([0, 0]);
+  expect(uv.pixelHash).not.toBe(baseline.pixelHash);
+  expect(invariantCounts(uv)).toEqual(invariantCounts(baseline));
+  expect(uv.pixelHash).toBe("170555a9");
+
+  await page.locator("#pipeline-debug-mode").selectOption("13");
+  const overdraw = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(overdraw.pipelineDebugMode).toBe(13);
+  expect(overdraw.stats.overdrawnPixels).toBeGreaterThan(0);
+  expect(overdraw.stats.maxOverdraw).toBeGreaterThan(1);
+  await expect(page.locator("#overdraw-stats")).toContainText("pixels · max");
+  expect(overdraw.pixelHash).not.toBe(uv.pixelHash);
+  expect(invariantCounts(overdraw)).toEqual(invariantCounts(baseline));
+  expect(overdraw.pixelHash).toBe("3769fdf6");
+
+  await page.locator("#mip-debug").check();
+  await expect(page.locator("#pipeline-debug-mode")).toHaveValue("0");
+  await expect(page.locator("#mip-debug")).toBeChecked();
+  expect(await page.evaluate(() => window.__softRasterizer.snapshot())).toMatchObject({
+    pipelineDebugMode: 0,
+    quality: { mipDebugEnabled: true },
+    stats: { overdrawnPixels: 0, maxOverdraw: 0 },
+  });
+  await page.locator("#pipeline-debug-mode").selectOption("13");
+  await expect(page.locator("#mip-debug")).not.toBeChecked();
+  expect(
+    await page.evaluate(() => window.__softRasterizer.snapshot().pixelHash),
+  ).toBe(overdraw.pixelHash);
+
+  await page.locator("#texture-debug").check();
+  await expect(page.locator("#pipeline-debug-mode")).toHaveValue("0");
+  await expect(page.locator("#texture-debug")).toBeChecked();
+  await page.locator("#pipeline-debug-mode").selectOption("12");
+  await expect(page.locator("#texture-debug")).not.toBeChecked();
+  expect(
+    await page.evaluate(() => window.__softRasterizer.snapshot().pixelHash),
+  ).toBe(uv.pixelHash);
+
+  await page.locator("#transparency-debug").check();
+  await expect(page.locator("#pipeline-debug-mode")).toHaveValue("0");
+  await expect(page.locator("#transparency-debug")).toBeChecked();
+  await page.locator("#pipeline-debug-mode").selectOption("13");
+  await expect(page.locator("#transparency-debug")).not.toBeChecked();
+  expect(
+    await page.evaluate(() => window.__softRasterizer.snapshot().pixelHash),
+  ).toBe(overdraw.pixelHash);
+
+  await page.locator("#pipeline-debug-mode").selectOption("0");
+  const restored = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restored.pixelHash).toBe(baseline.pixelHash);
+  expect([restored.stats.overdrawnPixels, restored.stats.maxOverdraw]).toEqual([0, 0]);
+
+  const invalidBenchmark = await page.evaluate(() => {
+    const errors = [];
+    for (const args of [[-1, 1, 0], [0, 0, 0], [0, 1, 0.2]]) {
+      try {
+        window.__softRasterizer.runBenchmark(...args);
+        errors.push(null);
+      } catch (error) {
+        errors.push(error instanceof Error ? error.message : String(error));
+      }
+    }
+    return errors;
+  });
+  expect(invalidBenchmark[0]).toContain("warm-up");
+  expect(invalidBenchmark[1]).toContain("sample");
+  expect(invalidBenchmark[2]).toContain("fixed dt");
+  const percentileFixture = summarizeFrameTimings(
+    [9, 1, 7, 3, 5].map((value) => ({ updateMs: value, presentMs: value, totalMs: value })),
+  );
+  expect(percentileFixture).toEqual({
+    count: 5,
+    updateMs: { p50: 5, p95: 9 },
+    presentMs: { p50: 5, p95: 9 },
+    totalMs: { p50: 5, p95: 9 },
+  });
+  const wrappedRing = new FrameTimingRing(3);
+  for (const value of [1, 2, 100, 3]) {
+    wrappedRing.push({ updateMs: value, presentMs: value, totalMs: value });
+  }
+  expect(wrappedRing.summary()).toEqual({
+    count: 3,
+    updateMs: { p50: 3, p95: 100 },
+    presentMs: { p50: 3, p95: 100 },
+    totalMs: { p50: 3, p95: 100 },
+  });
+
+  const benchmark = await page.evaluate(() => window.__softRasterizer.runBenchmark(3, 7, 0));
+  expect(benchmark.buildMode).toContain("release Wasm");
+  expect(benchmark).toMatchObject({
+    warmupFrames: 3,
+    sampleFrames: 7,
+    fixedDtSeconds: 0,
+  });
+  expect(benchmark.resolution).toEqual([960, 540]);
+  expect(benchmark.logicalResolution).toEqual([960, 540]);
+  expect({
+    triangles: benchmark.triangles,
+    coveredSamples: benchmark.coveredSamples,
+    shadedSamples: benchmark.shadedSamples,
+  }).toEqual({
+    triangles: baseline.stats.inputTriangles,
+    coveredSamples: baseline.stats.coveredSamples,
+    shadedSamples: baseline.stats.shadedSamples,
+  });
+  expect(benchmark.timings.count).toBe(7);
+  for (const stage of ["updateMs", "presentMs", "totalMs"]) {
+    const timing = benchmark.timings[stage];
+    expect([
+      Number.isFinite(timing.p50),
+      timing.p50 >= 0,
+      Number.isFinite(timing.p95),
+      timing.p95 >= timing.p50,
+    ]).toEqual([true, true, true, true]);
+  }
+  const afterBenchmark = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(afterBenchmark.pixelHash).toBe(baseline.pixelHash);
+  expect(afterBenchmark.timingWindow.count).toBeGreaterThanOrEqual(7);
+
+  await page.locator("#pipeline-debug-mode").selectOption("13");
+  const finalOverdraw = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(finalOverdraw.pipelineDebugMode).toBe(13);
+  expect(finalOverdraw.pixelHash).toBe(overdraw.pixelHash);
+  await expect(page.locator("#timing-window")).toContainText("p50");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter24-diagnostics-profiling.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter24-diagnostics-profiling", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, finalOverdraw, 0, browserLog, screenshotPath, {
+    baselineHash: baseline.pixelHash,
+    uvHash: uv.pixelHash,
+    overdrawHash: overdraw.pixelHash,
+    benchmark,
   });
 });

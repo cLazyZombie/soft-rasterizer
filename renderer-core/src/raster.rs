@@ -66,6 +66,8 @@ pub enum PipelineDebugMode {
     Diffuse,
     Specular,
     ColorSpaceComparison,
+    Uv,
+    Overdraw,
 }
 
 impl PipelineDebugMode {
@@ -83,6 +85,8 @@ impl PipelineDebugMode {
             Self::Diffuse => "linear diffuse only",
             Self::Specular => "Blinn-Phong specular only",
             Self::ColorSpaceComparison => "linear correct / encoded wrong-way",
+            Self::Uv => "perspective UV",
+            Self::Overdraw => "covered sample overdraw",
         }
     }
 }
@@ -1008,6 +1012,11 @@ mod tests {
         );
         assert_eq!(PipelineDebugMode::Normal.label(), "world normal RGB");
         assert_eq!(PipelineDebugMode::NdotL.label(), "Lambert N dot L");
+        assert_eq!(PipelineDebugMode::Uv.label(), "perspective UV");
+        assert_eq!(
+            PipelineDebugMode::Overdraw.label(),
+            "covered sample overdraw"
+        );
         assert_eq!(PipelineDebugMode::default(), PipelineDebugMode::Solid);
         assert_eq!(DepthDebugMode::Off.label(), "off");
         assert_eq!(DepthDebugMode::Grayscale.label(), "grayscale");

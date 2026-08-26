@@ -268,6 +268,8 @@ impl Renderer {
             9 => PipelineDebugMode::Diffuse,
             10 => PipelineDebugMode::Specular,
             11 => PipelineDebugMode::ColorSpaceComparison,
+            12 => PipelineDebugMode::Uv,
+            13 => PipelineDebugMode::Overdraw,
             _ => return Err(format!("알 수 없는 pipeline debug mode입니다: {mode}")),
         };
         self.core.set_pipeline_debug_mode(mode);
@@ -867,6 +869,14 @@ impl Renderer {
     pub fn stats_invalid_lod_samples(&self) -> u32 {
         self.stats().invalid_lod_samples
     }
+
+    pub fn stats_overdrawn_pixels(&self) -> u32 {
+        self.stats().overdrawn_pixels
+    }
+
+    pub fn stats_max_overdraw(&self) -> u32 {
+        self.stats().max_overdraw
+    }
 }
 
 const fn invalid_interpolation_samples(stats: FrameStats) -> u32 {
@@ -1007,6 +1017,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · covered {} · shaded samples {} · counter overflow {} · S=256 pixel center/top-left\n\
          quality stats render scale {} · resolved {} · mip samples {} · level {}..{} · invalid LOD {}\n\
+         diagnostic stats overdrawn pixels {} · max overdraw {}\n\
          interpolation stats max |lambda sum - 1| {:.9} · mode {}\n\
          inv_w stats samples {} · invalid {} · q range [{:.6}, {:.6}]\n\
          depth stats passed {} · failed {} · invalid {} · strict < · clear +infinity · debug {}\n\
@@ -1044,6 +1055,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.min_mip_level,
         snapshot.frame_stats.max_mip_level,
         snapshot.frame_stats.invalid_lod_samples,
+        snapshot.frame_stats.overdrawn_pixels,
+        snapshot.frame_stats.max_overdraw,
         snapshot.frame_stats.max_barycentric_sum_error,
         snapshot.attribute_interpolation_mode.label(),
         snapshot.frame_stats.interpolated_inv_w_samples,
@@ -1450,7 +1463,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_maps_all_pipeline_debug_modes_through_chapter_nineteen() {
+    fn adapter_maps_all_pipeline_debug_modes_through_chapter_twenty_four() {
         let mut renderer = Renderer::new(64, 64).unwrap();
         renderer.set_debug_lines_enabled(true);
         let expected_labels = [
@@ -1466,6 +1479,8 @@ mod tests {
             "linear diffuse only",
             "Blinn-Phong specular only",
             "linear correct / encoded wrong-way",
+            "perspective UV",
+            "covered sample overdraw",
         ];
         let mut reference_counts = None;
         for (mode, expected_label) in expected_labels.into_iter().enumerate() {
@@ -1489,7 +1504,7 @@ mod tests {
         }
         assert!(
             renderer
-                .set_pipeline_debug_mode(12)
+                .set_pipeline_debug_mode(14)
                 .unwrap_err()
                 .contains("pipeline debug mode")
         );
@@ -1932,6 +1947,31 @@ mod tests {
         assert_eq!(
             (renderer.render_width(), renderer.render_height()),
             (16, 20)
+        );
+    }
+
+    #[test]
+    fn adapter_maps_chapter_twenty_four_uv_overdraw_and_stats() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_pipeline_debug_mode(12).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_overdrawn_pixels(), 0);
+        assert_eq!(renderer.stats_max_overdraw(), 0);
+
+        renderer.set_pipeline_debug_mode(13).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.stats_overdrawn_pixels() > 0);
+        assert!(renderer.stats_max_overdraw() >= 1);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("diagnostic stats overdrawn pixels")
+        );
+        assert!(
+            renderer
+                .set_pipeline_debug_mode(14)
+                .unwrap_err()
+                .contains("pipeline debug mode")
         );
     }
 }
