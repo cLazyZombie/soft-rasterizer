@@ -1,12 +1,13 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 20장까지 homogeneous clipping 뒤 scalar cube pipeline, linear texture sampling,
-//! Blinn-Phong 조명과 프레임 단위 Orbit/Fly 카메라 입력 경로를 조립한다.
+//! 21장까지 homogeneous clipping 뒤 scalar mesh pipeline, linear texture sampling,
+//! Blinn-Phong 조명, Orbit/Fly 입력과 검증된 외부 OBJ 경로를 조립한다.
 
 pub mod camera;
 pub mod camera_control;
 pub mod clip;
 pub mod color;
+pub mod import;
 pub mod math;
 pub mod mesh;
 pub mod raster;
@@ -22,6 +23,7 @@ use camera::{
 use camera_control::{CameraControlInput, CameraController, CameraMode};
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use color::{srgb_decode_channel, srgb_decode_rgba, srgb_encode_rgba};
+use import::{MeshBounds, ObjImportError, import_obj};
 use math::{Mat4, Vec2, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
@@ -511,6 +513,18 @@ pub struct TextureAssetStatus {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MeshAssetStatus {
+    pub active_mesh_id: MeshId,
+    pub source_positions: usize,
+    pub source_faces: usize,
+    pub internal_vertices: usize,
+    pub triangles: usize,
+    pub successful_uploads: u32,
+    pub failed_uploads: u32,
+    pub source_bounds: MeshBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct DirectionalLight {
     pub surface_to_light: Vec3,
     pub color: Vec3,
@@ -897,7 +911,7 @@ fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mu
     materials.get_mut(id.0 as usize)
 }
 
-/// 렌더 타깃과 scalar cube pipeline/texture/lighting/camera 상태를 소유한다.
+/// 렌더 타깃과 scalar mesh pipeline/texture/lighting/camera 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -920,6 +934,12 @@ pub struct Renderer {
     directional_light: DirectionalLight,
     camera_controller: CameraController,
     mesh: Mesh,
+    mesh_source_positions: usize,
+    mesh_source_faces: usize,
+    mesh_source_bounds: MeshBounds,
+    mesh_upload_successes: u32,
+    mesh_upload_failures: u32,
+    next_mesh_id: u32,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
     clip_debug_mesh: Mesh,
@@ -958,6 +978,12 @@ impl Renderer {
         let textures = TextureStore::new();
         let active_texture_id = textures.fallback_id();
         let mesh = unit_cube_mesh();
+        let mesh_source_bounds = MeshBounds {
+            source_min: Vec3::new(-0.5, -0.5, -0.5),
+            source_max: Vec3::new(0.5, 0.5, 0.5),
+            source_center: Vec3::ZERO,
+            source_half_extent: 0.5,
+        };
         let draw_item = DrawItem::new(
             MeshId(0),
             MaterialId(0),
@@ -1004,6 +1030,12 @@ impl Renderer {
             directional_light: DirectionalLight::default(),
             camera_controller: CameraController::default(),
             mesh,
+            mesh_source_positions: 24,
+            mesh_source_faces: 12,
+            mesh_source_bounds,
+            mesh_upload_successes: 0,
+            mesh_upload_failures: 0,
+            next_mesh_id: 1,
             draw_item,
             mesh_scene,
             clip_debug_mesh,
@@ -1039,6 +1071,10 @@ impl Renderer {
         Ok(renderer)
     }
 
+    fn primary_selected_vertex_index(&self) -> usize {
+        CUBE_SELECTED_VERTEX_INDEX.min(self.mesh.vertices().len().saturating_sub(1))
+    }
+
     pub fn resize(&mut self, width: usize, height: usize) -> Result<(), RenderTargetError> {
         if width == self.width() && height == self.height() {
             return Ok(());
@@ -1068,7 +1104,7 @@ impl Renderer {
             ActiveScene::Cube => (
                 &self.mesh,
                 replacement_scene.clip_vertices.as_slice(),
-                CUBE_SELECTED_VERTEX_INDEX,
+                self.primary_selected_vertex_index(),
             ),
             ActiveScene::Clipping => (
                 &self.clip_debug_mesh,
@@ -1218,7 +1254,11 @@ impl Renderer {
             }
         }
         let (mesh, scene, selected_vertex_index) = match self.active_scene() {
-            ActiveScene::Cube => (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX),
+            ActiveScene::Cube => (
+                &self.mesh,
+                &self.mesh_scene,
+                self.primary_selected_vertex_index(),
+            ),
             ActiveScene::Clipping => (
                 &self.clip_debug_mesh,
                 &self.clip_debug_scene,
@@ -1649,6 +1689,75 @@ impl Renderer {
         }
     }
 
+    pub fn load_obj(&mut self, bytes: &[u8]) -> Result<MeshId, ObjImportError> {
+        let imported = match import_obj(bytes) {
+            Ok(imported) => imported,
+            Err(error) => {
+                self.mesh_upload_failures = self.mesh_upload_failures.saturating_add(1);
+                return Err(error);
+            }
+        };
+        let Some(next_mesh_id) = self.next_mesh_id.checked_add(1) else {
+            self.mesh_upload_failures = self.mesh_upload_failures.saturating_add(1);
+            return Err(ObjImportError::LimitExceeded {
+                kind: "mesh ID",
+                max: u32::MAX as usize,
+            });
+        };
+        let mesh_id = MeshId(self.next_mesh_id);
+        let bounds = imported.bounds();
+        let source_positions = imported.source_position_count();
+        let source_faces = imported.source_face_count();
+        let mesh = imported.into_mesh();
+        let model = Transform {
+            translation: Vec3::ZERO,
+            rotation_radians: Vec3::new(0.35, 0.0, 0.0),
+            scale: Vec3::new(1.0, 1.0, 1.0),
+        };
+        let camera_controller = CameraController::default();
+        let camera_pose = camera_controller.pose();
+        let mut mesh_scene = MeshScene::with_capacity(&mesh);
+        mesh_scene.rebuild_cube_with_camera(
+            &mesh,
+            model,
+            camera_pose.eye,
+            camera_pose.target,
+            self.width(),
+            self.height(),
+        );
+
+        self.mesh = mesh;
+        self.mesh_source_positions = source_positions;
+        self.mesh_source_faces = source_faces;
+        self.mesh_source_bounds = bounds;
+        self.mesh_upload_successes = self.mesh_upload_successes.saturating_add(1);
+        self.next_mesh_id = next_mesh_id;
+        self.draw_item.mesh_id = mesh_id;
+        self.draw_item.model = model;
+        self.mesh_scene = mesh_scene;
+        self.camera_controller = camera_controller;
+        self.clip_debug_enabled = false;
+        self.coverage_debug_enabled = false;
+        self.interpolation_debug_enabled = false;
+        self.perspective_debug_enabled = false;
+        self.depth_debug_enabled = false;
+        self.texture_debug_enabled = false;
+        Ok(mesh_id)
+    }
+
+    pub fn mesh_asset_status(&self) -> MeshAssetStatus {
+        MeshAssetStatus {
+            active_mesh_id: self.draw_item.mesh_id,
+            source_positions: self.mesh_source_positions,
+            source_faces: self.mesh_source_faces,
+            internal_vertices: self.mesh.vertices().len(),
+            triangles: self.mesh.triangle_count(),
+            successful_uploads: self.mesh_upload_successes,
+            failed_uploads: self.mesh_upload_failures,
+            source_bounds: self.mesh_source_bounds,
+        }
+    }
+
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.draw_item.model.rotation_radians.y = rotation_y_radians;
         self.mesh_scene.rebuild_cube(
@@ -1689,7 +1798,7 @@ impl Renderer {
                 ActiveScene::Cube => (
                     &self.mesh,
                     &self.mesh_scene,
-                    CUBE_SELECTED_VERTEX_INDEX,
+                    self.primary_selected_vertex_index(),
                     self.draw_item.model.rotation_radians.y,
                     self.draw_item.material_id.0,
                 ),
@@ -4674,6 +4783,101 @@ mod tests {
         renderer.resize(80, 40).unwrap();
         assert_eq!(renderer.camera_pose(), after);
         assert_eq!(renderer.mesh_scene.camera_world, after.eye);
+    }
+
+    #[test]
+    fn chapter_twenty_one_obj_upload_is_owned_framed_and_failure_atomic() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert_eq!(
+            renderer.mesh_asset_status(),
+            MeshAssetStatus {
+                active_mesh_id: MeshId(0),
+                source_positions: 24,
+                source_faces: 12,
+                internal_vertices: 24,
+                triangles: 12,
+                successful_uploads: 0,
+                failed_uploads: 0,
+                source_bounds: MeshBounds {
+                    source_min: Vec3::new(-0.5, -0.5, -0.5),
+                    source_max: Vec3::new(0.5, 0.5, 0.5),
+                    source_center: Vec3::ZERO,
+                    source_half_extent: 0.5,
+                },
+            }
+        );
+        renderer.set_clip_debug_enabled(true);
+        renderer.set_texture_debug_enabled(true);
+        renderer.set_camera_mode(CameraMode::Fly).unwrap();
+        renderer.update_and_render(
+            0.1,
+            InputSnapshot::new([INPUT_FORWARD, 0, 0], Vec2::ZERO, 0.0, 0, 0).unwrap(),
+        );
+
+        let mut source =
+            b"v 10 20 30\nv 12 20 30\nv 10 24 30\nvt 0 0\nvt 1 0\nvt 0 1\nf 1/1 3/3 2/2\n".to_vec();
+        assert_eq!(renderer.load_obj(&source).unwrap(), MeshId(1));
+        source.fill(0);
+        assert_eq!(renderer.camera_mode(), CameraMode::Orbit);
+        assert_eq!(renderer.camera_pose().eye, CAMERA_EYE);
+        assert!(!renderer.clip_debug_enabled);
+        assert!(!renderer.texture_debug_enabled());
+        assert_eq!(renderer.mesh.vertices().len(), 3);
+        assert_eq!(renderer.primary_selected_vertex_index(), 2);
+        assert_eq!(renderer.mesh.vertices()[0].uv, Vec2::new(0.0, 1.0));
+        assert_eq!(
+            renderer.mesh_source_bounds.source_center,
+            Vec3::new(11.0, 22.0, 30.0)
+        );
+
+        let rendered = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(rendered.input_vertices, 3);
+        assert_eq!(rendered.input_triangles, 1);
+        assert_eq!(rendered.invalid_values, 0);
+        assert!(rendered.covered_samples > 0);
+        let color = renderer.color_buffer().to_vec();
+        let mesh = renderer.mesh.clone();
+        let scene = renderer.mesh_scene.clone();
+        let camera = renderer.camera_pose();
+
+        let error = renderer.load_obj(b"v 0 0 0\nf 1 2 3\n").unwrap_err();
+        assert!(error.to_string().contains("범위"));
+        assert_eq!(renderer.mesh, mesh);
+        assert_eq!(renderer.mesh_scene, scene);
+        assert_eq!(renderer.camera_pose(), camera);
+        assert_eq!(renderer.color_buffer(), color);
+        assert_eq!(
+            renderer.mesh_asset_status(),
+            MeshAssetStatus {
+                active_mesh_id: MeshId(1),
+                source_positions: 3,
+                source_faces: 1,
+                internal_vertices: 3,
+                triangles: 1,
+                successful_uploads: 1,
+                failed_uploads: 1,
+                source_bounds: MeshBounds {
+                    source_min: Vec3::new(10.0, 20.0, 30.0),
+                    source_max: Vec3::new(12.0, 24.0, 30.0),
+                    source_center: Vec3::new(11.0, 22.0, 30.0),
+                    source_half_extent: 2.0,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn chapter_twenty_one_mesh_id_exhaustion_keeps_the_active_mesh() {
+        let mut renderer = Renderer::new(32, 32).unwrap();
+        renderer.next_mesh_id = u32::MAX;
+        let initial_mesh = renderer.mesh.clone();
+        let error = renderer
+            .load_obj(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+            .unwrap_err();
+        assert!(error.to_string().contains("mesh ID"));
+        assert_eq!(renderer.mesh, initial_mesh);
+        assert_eq!(renderer.mesh_upload_successes, 0);
+        assert_eq!(renderer.mesh_upload_failures, 1);
     }
 
     #[test]

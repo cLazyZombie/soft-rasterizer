@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 15장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling, 여섯 평면 homogeneous clipping, 고정소수점 coverage, strict 깊이 검사와 perspective-correct 속성 보간을 구현하고 하나의 scalar 컬러 큐브 pipeline으로 조립했습니다. `PipelineState`는 culling, 속성 보간과 solid/wireframe/triangle ID/barycentric/depth/front-back 표시를 한곳에서 관리하며 모든 debug view는 같은 Rust coverage/depth 경로를 사용합니다. 두 삼각형 quad, R/G/B triangle, near/far overlap, 기울어진 procedural UV checker와 회전 컬러 큐브를 실제 Rust-Wasm-Canvas 2D 경로에서 확인할 수 있습니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 21장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct 속성, texture/lighting, Orbit/Fly 입력과 외부 OBJ import를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -77,6 +77,17 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - Rust/Wasm이 픽셀을 만들고 Canvas 2D는 완성된 RGBA8 이미지만 표시
 
 세부 수식과 외부 에셋 변환 규칙은 [좌표계 결정 문서](doc/decisions/coordinates.md)를 기준으로 합니다.
+
+## 21장 OBJ import 범위
+
+- 파일은 UTF-8 OBJ, 최대 8 MiB다. JS는 크기와 비동기 파일 읽기를 맡고 Rust가 text parsing과 Mesh 검증을 소유한다.
+- 입력 좌표 profile은 이미 내부와 같은 LH `+X` right, `+Y` up, `+Z` forward다. 다른 DCC 축을 추측해서 바꾸지 않는다.
+- `v x y z`, `vt u v`, `vn x y z`, `f`를 지원한다. `o`, `g`, `s`, `usemtl`, `mtllib`은 metadata로 무시하며 그 밖의 record는 오류다.
+- face token은 `v`, `v/vt`, `v//vn`, `v/vt/vn`과 양수 1-based/음수 상대 index를 지원한다. 최대 8정점의 planar convex face만 fan으로 삼각분할하고 오목·비평면 face는 거부한다.
+- vertex dedup key는 position/UV/normal index tuple 전체다. OBJ의 texture V는 importer에서 내부 top-left 규약으로 한 번 뒤집는다.
+- normal이 없으면 source position 단위로 면적 가중 normal을 생성한다. smoothing group은 아직 해석하지 않으므로 누락 normal은 같은 position에서 smooth하다는 것이 baseline hard-edge 정책이다.
+- 참조된 source bounds를 이용해 geometry를 중심 기준 `[-0.75, 0.75]` 범위로 정규화하므로 아주 크거나 작은 유한 모델도 기본 카메라에 들어온다. 원본 bounds는 asset status에 남는다.
+- glTF runtime parser는 이 장의 baseline에 포함하지 않는다. 확장 경계에는 Khronos glTF 2.0의 X reflection, triangle winding swap, normal/tangent handedness와 `C*M*C` 행렬 adapter 및 수학 fixture만 둔다.
 
 ## 교재
 

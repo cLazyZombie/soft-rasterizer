@@ -276,6 +276,71 @@ impl Renderer {
         self.core.set_model_rotation_y(rotation_y_radians);
     }
 
+    pub fn load_obj(&mut self, bytes: &[u8]) -> Result<u32, String> {
+        match self.core.load_obj(bytes) {
+            Ok(id) => {
+                self.last_error.clear();
+                Ok(id.0)
+            }
+            Err(error) => {
+                self.last_error = error.to_string();
+                Err(self.last_error.clone())
+            }
+        }
+    }
+
+    pub fn active_mesh_id(&self) -> u32 {
+        self.core.mesh_asset_status().active_mesh_id.0
+    }
+
+    pub fn mesh_source_positions(&self) -> u32 {
+        self.core.mesh_asset_status().source_positions as u32
+    }
+
+    pub fn mesh_source_faces(&self) -> u32 {
+        self.core.mesh_asset_status().source_faces as u32
+    }
+
+    pub fn mesh_internal_vertices(&self) -> u32 {
+        self.core.mesh_asset_status().internal_vertices as u32
+    }
+
+    pub fn mesh_triangles(&self) -> u32 {
+        self.core.mesh_asset_status().triangles as u32
+    }
+
+    pub fn mesh_upload_successes(&self) -> u32 {
+        self.core.mesh_asset_status().successful_uploads
+    }
+
+    pub fn mesh_upload_failures(&self) -> u32 {
+        self.core.mesh_asset_status().failed_uploads
+    }
+
+    pub fn mesh_source_min_x(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_min.x
+    }
+
+    pub fn mesh_source_min_y(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_min.y
+    }
+
+    pub fn mesh_source_min_z(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_min.z
+    }
+
+    pub fn mesh_source_max_x(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_max.x
+    }
+
+    pub fn mesh_source_max_y(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_max.y
+    }
+
+    pub fn mesh_source_max_z(&self) -> f32 {
+        self.core.mesh_asset_status().source_bounds.source_max.z
+    }
+
     pub fn upload_texture_rgba(
         &mut self,
         width: u32,
@@ -747,7 +812,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
     } else if snapshot.clip_debug_enabled {
         "clip debug mesh"
     } else {
-        "indexed cube mesh"
+        "indexed mesh"
     };
     let scene_suffix = if snapshot.depth_debug_enabled {
         if snapshot.depth_order_reversed {
@@ -1275,7 +1340,7 @@ mod tests {
         let text = renderer.coordinate_debug_text();
         assert!(text.contains("선택 정점 v6"));
         assert!(text.contains("X-ray overlay off · culling/depth 무관"));
-        assert!(text.contains("indexed cube mesh · vertices 24 · indices 36 · triangles 12"));
+        assert!(text.contains("indexed mesh · vertices 24 · indices 36 · triangles 12"));
         assert!(text.contains("winding screen y-down orient2d > 0 front · cull back"));
         assert!(text.contains(
             "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0"
@@ -1556,5 +1621,43 @@ mod tests {
         assert_eq!(renderer.stats_frame_index(), frame_index);
         assert!(renderer.update_and_render(0.0, 0));
         assert_eq!(renderer.last_error(), "");
+    }
+
+    #[test]
+    fn adapter_loads_chapter_twenty_one_obj_and_preserves_it_on_failure() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert_eq!(renderer.active_mesh_id(), 0);
+        assert_eq!(renderer.mesh_source_positions(), 24);
+        assert_eq!(renderer.mesh_source_faces(), 12);
+        assert_eq!(renderer.mesh_internal_vertices(), 24);
+        assert_eq!(renderer.mesh_triangles(), 12);
+        assert_eq!(renderer.mesh_upload_successes(), 0);
+        assert_eq!(renderer.mesh_upload_failures(), 0);
+
+        let id = renderer
+            .load_obj(b"v -2 -1 4\nv 2 -1 4\nv 0 3 4\nf 1 3 2\n")
+            .unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(renderer.active_mesh_id(), 1);
+        assert_eq!(renderer.mesh_source_positions(), 3);
+        assert_eq!(renderer.mesh_source_faces(), 1);
+        assert_eq!(renderer.mesh_internal_vertices(), 3);
+        assert_eq!(renderer.mesh_triangles(), 1);
+        assert_eq!(renderer.mesh_upload_successes(), 1);
+        assert_eq!(renderer.mesh_upload_failures(), 0);
+        assert_eq!(renderer.mesh_source_min_x(), -2.0);
+        assert_eq!(renderer.mesh_source_min_y(), -1.0);
+        assert_eq!(renderer.mesh_source_min_z(), 4.0);
+        assert_eq!(renderer.mesh_source_max_x(), 2.0);
+        assert_eq!(renderer.mesh_source_max_y(), 3.0);
+        assert_eq!(renderer.mesh_source_max_z(), 4.0);
+        assert_eq!(renderer.last_error(), "");
+
+        let error = renderer.load_obj(b"v 0 0 0\nf 1 2 3\n").unwrap_err();
+        assert!(error.contains("범위"));
+        assert_eq!(renderer.last_error(), error);
+        assert_eq!(renderer.active_mesh_id(), 1);
+        assert_eq!(renderer.mesh_upload_successes(), 1);
+        assert_eq!(renderer.mesh_upload_failures(), 1);
     }
 }

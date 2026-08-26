@@ -322,7 +322,7 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 단색 coverage와 wireframe�
     "X-ray overlay on · culling/depth 무관",
   );
   await expect(page.locator("#coordinate-debug")).toContainText(
-    "indexed cube mesh · vertices 24 · indices 36 · triangles 12 · material 0",
+    "indexed mesh · vertices 24 · indices 36 · triangles 12 · material 0",
   );
   await expect(page.locator("#coordinate-debug")).toContainText("normal (");
   await expect(page.locator("#coordinate-debug")).toContainText("UV (");
@@ -1418,7 +1418,7 @@ test("triangle_pipeline: 15장 scalar 컬러 큐브가 통합 debug view를 공�
     depthDebugEnabled: false,
   });
   await expect(page.locator("#coordinate-debug")).toContainText(
-    "indexed cube mesh · vertices 24 · indices 36 · triangles 12 · material 0",
+    "indexed mesh · vertices 24 · indices 36 · triangles 12 · material 0",
   );
   await expect(page.locator("#coordinate-debug")).toContainText(
     "pipeline state debug solid vertex color · strict depth test/write · material 0",
@@ -2440,5 +2440,140 @@ test("input_camera: DOM collector를 거쳐 Orbit/Fly와 focus 해제를 검증�
     displacement30,
     diagonalDisplacement,
     invalidInputError: invalidInput.error,
+  });
+});
+
+test("asset_failure: 실제 OBJ 파일을 Rust Mesh로 바꾸고 실패 시 기존 scene을 유지한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "asset_failure" },
+    { type: "steps", description: "28" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  await page.evaluate(() =>
+    window.__softRasterizer.uploadTextureRgba(2, 2, [
+      255, 40, 30, 255, 30, 255, 80, 255, 30, 80, 255, 255, 245, 225, 80, 255,
+    ]),
+  );
+  await page.locator("#texture-sampling").check();
+  await page.locator("#lighting-enabled").check();
+
+  const pyramidObj = [
+    "# LH +X right, +Y up, +Z forward",
+    "v -1 -1 0",
+    "v 1 -1 0",
+    "v 1 1 0",
+    "v -1 1 0",
+    "v 0 0 1",
+    "vt 0 0",
+    "vt 1 0",
+    "vt 1 1",
+    "vt 0 1",
+    "vt 0.5 0.5",
+    "f 1/1 4/4 3/3 2/2",
+    "f 1/1 2/2 5/5",
+    "f 2/1 3/2 5/5",
+    "f 3/1 4/2 5/5",
+    "f -2/1 -5/2 -1/5",
+    "",
+  ].join("\n");
+  await page.evaluate((source) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([source], "pyramid.obj", { type: "text/plain" }));
+    const input = document.querySelector("#mesh-file");
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, pyramidObj);
+  await expect
+    .poll(async () => page.evaluate(() => window.__softRasterizer.snapshot().meshStatus))
+    .toMatchObject({
+      activeId: 1,
+      sourcePositions: 5,
+      sourceFaces: 5,
+      triangles: 6,
+      successes: 1,
+      failures: 0,
+      sourceMin: [-1, -1, 0],
+      sourceMax: [1, 1, 1],
+    });
+  const loaded = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(loaded.meshStatus.internalVertices).toBeGreaterThan(5);
+  expect(loaded).toMatchObject({
+    textureSamplingEnabled: true,
+    lightingEnabled: true,
+    camera: { mode: 0, eye: [0, 0, -3] },
+  });
+  expect(loaded.stats.inputVertices).toBe(loaded.meshStatus.internalVertices);
+  expect(loaded.stats.inputTriangles).toBe(6);
+  expect(loaded.stats.textureSamples).toBe(loaded.stats.shadedSamples);
+  expect(loaded.stats.lightingSamples).toBe(loaded.stats.shadedSamples);
+  expect(loaded.stats.shadedSamples).toBeGreaterThan(0);
+  expect(loaded.pixelHash).toBe("0091a2b0");
+  await expect(page.locator("#mesh-status")).toContainText("LH +X/+Y/+Z profile");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter21-obj-import.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter21-obj-import", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+
+  const malformedObj = "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 99\n";
+  await page.evaluate((source) => {
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([source], "broken.obj", { type: "text/plain" }));
+    const input = document.querySelector("#mesh-file");
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  }, malformedObj);
+  await expect(page.locator("#error")).toContainText("범위를 벗어났습니다");
+  const afterMalformed = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(afterMalformed.meshStatus).toMatchObject({
+    activeId: 1,
+    successes: 1,
+    failures: 1,
+  });
+  expect(afterMalformed.pixelHash).toBe(loaded.pixelHash);
+  expect(afterMalformed.stats.inputVertices).toBe(loaded.stats.inputVertices);
+
+  const oversized = await page.evaluate(() => window.__softRasterizer.testOversizedObjGuard());
+  expect(oversized.bufferRead).toBe(false);
+  expect(oversized.error).toContain("8 MiB");
+  const invalidSize = await page.evaluate(() =>
+    window.__softRasterizer.validateObjFileSize(Number.NaN),
+  );
+  expect(invalidSize.bytes).toBeNull();
+  expect(invalidSize.error).toContain("안전한 정수");
+
+  const latest = await page.evaluate(() =>
+    window.__softRasterizer.testLatestObjSelectionWins(),
+  );
+  expect(latest.afterSecond.meshStatus).toMatchObject({
+    activeId: 2,
+    sourcePositions: 3,
+    sourceFaces: 1,
+    internalVertices: 3,
+    triangles: 1,
+    successes: 2,
+    failures: 1,
+  });
+  expect(latest.afterFirst.meshStatus).toEqual(latest.afterSecond.meshStatus);
+  expect(latest.afterFirst.pixelHash).toBe(latest.afterSecond.pixelHash);
+  expect(latest.afterFirst.pixelHash).toBe("ce7e6853");
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, loaded, 0, browserLog, screenshotPath, {
+    malformedError: afterMalformed.meshStatus.text,
+    oversized,
+    loadedMeshStatus: loaded.meshStatus,
+    latestSelectionHash: latest.afterFirst.pixelHash,
+    latestSelectionMeshStatus: latest.afterFirst.meshStatus,
   });
 });

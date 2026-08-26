@@ -1,5 +1,6 @@
 import init, { Renderer } from "./pkg/renderer_wasm.js";
 import { InputCollector } from "./input.js";
+import { readObjFileBytes, validateObjFileSize } from "./mesh-upload.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
 
@@ -90,6 +91,8 @@ async function bootstrap() {
   const depthOrderReversedCheckbox = document.querySelector("#depth-order-reversed");
   const depthDebugModeSelect = document.querySelector("#depth-debug-mode");
   const textureFileInput = document.querySelector("#texture-file");
+  const meshFileInput = document.querySelector("#mesh-file");
+  const meshStatusOutput = document.querySelector("#mesh-status");
   const textureDebugCheckbox = document.querySelector("#texture-debug");
   const textureStatusOutput = document.querySelector("#texture-status");
   const textureSamplingCheckbox = document.querySelector("#texture-sampling");
@@ -127,6 +130,8 @@ async function bootstrap() {
   let coordinateDebugText = "좌표 계산 대기 중";
   let textureStatusText = "fallback checkerboard · 2 × 2 · texture 0";
   let textureDecodeGeneration = 0;
+  let meshStatusText = "내장 cube · mesh 0 · 24 vertices · 12 triangles";
+  let meshLoadGeneration = 0;
 
   const updateStatus = () => {
     document.querySelector("#internal-size").textContent = `${currentSize.width} × ${currentSize.height} px`;
@@ -168,6 +173,7 @@ async function bootstrap() {
       `${pipelineDebugModeSelect.options[pipelineDebugModeSelect.selectedIndex].text} · 같은 Rust coverage/depth 경로`;
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     textureStatusOutput.textContent = textureStatusText;
+    meshStatusOutput.textContent = meshStatusText;
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
@@ -420,6 +426,36 @@ async function bootstrap() {
     }
   };
 
+  const syncPrimarySceneControls = () => {
+    cameraModeSelect.value = "0";
+    clipDebugCheckbox.checked = false;
+    coverageDebugCheckbox.checked = false;
+    interpolationDebugCheckbox.checked = false;
+    perspectiveDebugCheckbox.checked = false;
+    depthDebugCheckbox.checked = false;
+    textureDebugCheckbox.checked = false;
+  };
+
+  const uploadObjBytes = (bytes, label = "OBJ") => {
+    try {
+      const id = renderer.load_obj(bytes);
+      syncPrimarySceneControls();
+      meshStatusText =
+        `${label} 로드 완료 · mesh ${id} · ` +
+        `${renderer.mesh_internal_vertices()} vertices · ${renderer.mesh_triangles()} triangles · ` +
+        "LH +X/+Y/+Z profile · Rust 소유";
+      errorOutput.textContent = "";
+      renderFrame(0);
+      return { id, error: null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      meshStatusText = `OBJ 로드 실패 · 기존 mesh ${renderer.active_mesh_id()} 유지`;
+      errorOutput.textContent = message;
+      updateStatus();
+      return { id: null, error: message };
+    }
+  };
+
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCameraMode(Number(cameraModeSelect.value));
   setCullMode(Number(cullModeSelect.value));
@@ -616,6 +652,41 @@ async function bootstrap() {
     }
   });
 
+  const readAndUploadObjFile = async (file, read = readObjFileBytes) => {
+    const generation = ++meshLoadGeneration;
+    meshStatusText = `OBJ 읽는 중 · ${file.name}`;
+    updateStatus();
+    try {
+      const bytes = await read(file);
+      if (generation !== meshLoadGeneration) {
+        bytes.fill(0);
+        return false;
+      }
+      const result = uploadObjBytes(bytes, file.name);
+      bytes.fill(0);
+      return result.id !== null;
+    } catch (error) {
+      if (generation !== meshLoadGeneration) {
+        return false;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      meshStatusText = `OBJ 로드 실패 · 기존 mesh ${renderer.active_mesh_id()} 유지`;
+      errorOutput.textContent = message;
+      updateStatus();
+      return false;
+    } finally {
+      if (generation === meshLoadGeneration) {
+        meshFileInput.value = "";
+      }
+    }
+  };
+  meshFileInput.addEventListener("change", async () => {
+    const [file] = meshFileInput.files;
+    if (file !== undefined) {
+      await readAndUploadObjFile(file);
+    }
+  });
+
   const applyDisplayResize = () => {
     resizeScheduled = false;
     const size = logicalRenderSize(canvas);
@@ -732,6 +803,26 @@ async function bootstrap() {
       failures: renderer.texture_upload_failures(),
       text: textureStatusText,
     },
+    meshStatus: {
+      activeId: renderer.active_mesh_id(),
+      sourcePositions: renderer.mesh_source_positions(),
+      sourceFaces: renderer.mesh_source_faces(),
+      internalVertices: renderer.mesh_internal_vertices(),
+      triangles: renderer.mesh_triangles(),
+      successes: renderer.mesh_upload_successes(),
+      failures: renderer.mesh_upload_failures(),
+      sourceMin: [
+        renderer.mesh_source_min_x(),
+        renderer.mesh_source_min_y(),
+        renderer.mesh_source_min_z(),
+      ],
+      sourceMax: [
+        renderer.mesh_source_max_x(),
+        renderer.mesh_source_max_y(),
+        renderer.mesh_source_max_z(),
+      ],
+      text: meshStatusText,
+    },
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -811,6 +902,69 @@ async function bootstrap() {
           pixels.fill(0);
           renderFrame(0);
           return { ...result, snapshot: snapshot() };
+        },
+        uploadObjText(source, label = "automation.obj") {
+          const bytes = new TextEncoder().encode(source);
+          const result = uploadObjBytes(bytes, label);
+          bytes.fill(0);
+          return { ...result, snapshot: snapshot() };
+        },
+        validateObjFileSize(size) {
+          try {
+            return { bytes: validateObjFileSize(size), error: null };
+          } catch (error) {
+            return {
+              bytes: null,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
+        async testOversizedObjGuard() {
+          let bufferRead = false;
+          const file = new Blob([]);
+          Object.defineProperty(file, "size", { value: 8 * 1024 * 1024 + 1 });
+          try {
+            await readObjFileBytes(file, {
+              readBuffer: async () => {
+                bufferRead = true;
+                return new ArrayBuffer(0);
+              },
+            });
+            return { error: null, bufferRead };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              bufferRead,
+            };
+          }
+        },
+        async testLatestObjSelectionWins() {
+          let resolveFirst;
+          let resolveSecond;
+          const firstBytes = new Promise((resolve) => {
+            resolveFirst = resolve;
+          });
+          const secondBytes = new Promise((resolve) => {
+            resolveSecond = resolve;
+          });
+          const first = readAndUploadObjFile(
+            new File([], "first.obj", { type: "text/plain" }),
+            () => firstBytes,
+          );
+          const second = readAndUploadObjFile(
+            new File([], "second.obj", { type: "text/plain" }),
+            () => secondBytes,
+          );
+          resolveSecond(
+            new TextEncoder().encode("v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 3 2\n"),
+          );
+          await second;
+          const afterSecond = snapshot();
+          resolveFirst(
+            new TextEncoder().encode("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 3 2\n"),
+          );
+          await first;
+          return { afterSecond, afterFirst: snapshot() };
         },
         validateDecodedTextureSize(width, height) {
           try {

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 20장</title>
+    <title>소프트웨어 래스터라이저 · 21장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>20장 · 마우스/키보드와 Orbit/Fly 카메라</h1>
+        <h1>21장 · 외부 OBJ 모델 로딩</h1>
       </div>
-      <p>Canvas가 focus된 동안 드래그/휠로 Orbit하고, Fly 모드에서 WASD·방향키로 이동합니다.</p>
+      <p>LH +X/+Y/+Z OBJ subset을 Rust가 검증·정규화해 기존 texture/lighting pipeline으로 렌더링합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="camera-mode">
           Camera
@@ -206,13 +206,17 @@
           Texture 파일
           <input id="texture-file" type="file" accept="image/png,image/jpeg" />
         </label>
+        <label for="mesh-file">
+          OBJ 모델
+          <input id="mesh-file" type="file" accept=".obj,text/plain" />
+        </label>
         <label for="texture-debug">
           <input id="texture-debug" type="checkbox" />
           Texture 원본 debug
         </label>
         <label for="texture-sampling">
           <input id="texture-sampling" type="checkbox" />
-          큐브 Texture sampling
+          Mesh Texture sampling
         </label>
         <label for="texture-filter">
           Filter
@@ -290,6 +294,8 @@
         <dd id="math-convention">초기화 중</dd>
         <dt>Texture asset</dt>
         <dd id="texture-status">fallback 준비 중</dd>
+        <dt>Mesh asset</dt>
+        <dd id="mesh-status">내장 cube 준비 중</dd>
         <dt>Texture sampler</dt>
         <dd id="texture-sampler">초기화 중</dd>
         <dt>Texture samples</dt>
