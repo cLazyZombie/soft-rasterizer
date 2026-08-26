@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 15장</title>
+    <title>소프트웨어 래스터라이저 · 16장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>15장 · 파이프라인 조립과 컬러 3D 큐브</h1>
+        <h1>16장 · 웹 이미지 입력과 Texture 메모리</h1>
       </div>
-      <p>변환부터 fragment 색 기록까지 한 scalar Rust pipeline으로 연결하고, 같은 coverage/depth 위에서 debug view만 바꿉니다.</p>
+      <p>PNG/JPEG를 브라우저에서 RGBA8로 디코딩해 한 번 Wasm에 업로드하고, Rust가 소유한 원본 방향과 채널을 debug 화면에서 확인합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="cull-mode">
           Culling
@@ -190,6 +190,14 @@
             <option value="2">Range heatmap</option>
           </select>
         </label>
+        <label for="texture-file">
+          Texture 파일
+          <input id="texture-file" type="file" accept="image/png,image/jpeg" />
+        </label>
+        <label for="texture-debug">
+          <input id="texture-debug" type="checkbox" />
+          Texture 원본 debug
+        </label>
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
@@ -219,6 +227,8 @@
         <dd id="pipeline-algorithm">초기화 중</dd>
         <dt>수학 규약</dt>
         <dd id="math-convention">초기화 중</dd>
+        <dt>Texture asset</dt>
+        <dd id="texture-status">fallback 준비 중</dd>
         <dt>프레임</dt>
         <dd id="frame-index">0</dd>
         <dt>고수준 렌더 호출</dt>

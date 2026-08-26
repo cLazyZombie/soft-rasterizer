@@ -1545,3 +1545,143 @@ test("resize_memory_view: CSS 논리 해상도로 resize하고 Wasm view를 재�
   expect(browserLog.errors).toEqual([]);
   recordEvidence(testInfo, after, 0.05, browserLog, screenshotPath, { memoryGrowth });
 });
+
+test("texture_upload: 브라우저 RGBA8 디코드와 Rust 소유 texture debug 경로", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "texture_upload" },
+    { type: "steps", description: "15" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  await page.evaluate(async () => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 2;
+    canvas.height = 2;
+    const context = canvas.getContext("2d");
+    const image = context.createImageData(2, 2);
+    image.data.set([
+      255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+    ]);
+    context.putImageData(image, 0, 0);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const transfer = new DataTransfer();
+    transfer.items.add(new File([blob], "corners.png", { type: "image/png" }));
+    const input = document.querySelector("#texture-file");
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect
+    .poll(async () => page.evaluate(() => window.__softRasterizer.snapshot().textureStatus))
+    .toMatchObject({ activeId: 1, width: 2, height: 2, successes: 1, failures: 0 });
+  await expect(page.locator("#texture-status")).toContainText("Rust 소유 복사");
+
+  const corners = await page.locator("#framebuffer").evaluate((canvas) => {
+    const context = canvas.getContext("2d");
+    const points = [
+      [0, 0],
+      [canvas.width - 1, 0],
+      [0, canvas.height - 1],
+      [canvas.width - 1, canvas.height - 1],
+    ];
+    return points.map(([x, y]) => Array.from(context.getImageData(x, y, 1, 1).data));
+  });
+  expect(corners).toEqual([
+    [255, 0, 0, 255],
+    [0, 255, 0, 255],
+    [0, 0, 255, 255],
+    [255, 255, 255, 255],
+  ]);
+
+  const beforeMalformed = await page.evaluate(() => window.__softRasterizer.snapshot());
+  await page.evaluate(() => {
+    const transfer = new DataTransfer();
+    transfer.items.add(
+      new File([new Uint8Array([0, 1, 2, 3])], "broken.png", { type: "image/png" }),
+    );
+    const input = document.querySelector("#texture-file");
+    input.files = transfer.files;
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(page.locator("#error")).toContainText("RGBA8로 디코딩하지 못했습니다");
+  const afterMalformed = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(afterMalformed.pixelHash).toBe(beforeMalformed.pixelHash);
+  expect(afterMalformed.textureStatus).toMatchObject({
+    activeId: 1,
+    successes: 1,
+    failures: 0,
+  });
+  await expect(page.locator("#texture-status")).toContainText("디코딩 실패");
+
+  const oversized = await page.evaluate(() =>
+    window.__softRasterizer.testOversizedDecodeGuard(),
+  );
+  expect(oversized).toMatchObject({ canvasCreated: false, bitmapClosed: true });
+  expect(oversized.error).toContain("16777216");
+
+  const failed = await page.evaluate(() =>
+    window.__softRasterizer.uploadTextureRgba(2, 2, new Array(15).fill(0)),
+  );
+  expect(failed.id).toBeNull();
+  expect(failed.error).toContain("16이어야");
+  expect(failed.snapshot.textureStatus).toMatchObject({ activeId: 1, successes: 1, failures: 1 });
+
+  const owned = await page.evaluate(() =>
+    window.__softRasterizer.uploadTextureRgba(1, 1, [12, 34, 56, 78]),
+  );
+  expect(owned).toMatchObject({ id: 2, error: null });
+  expect(owned.snapshot.stats).toMatchObject({
+    inputTriangles: 0,
+    textureDebugPixels: 960 * 540,
+    textureUploadSuccesses: 2,
+    textureUploadFailures: 1,
+    activeTextureId: 2,
+  });
+  const ownedPixel = await page
+    .locator("#framebuffer")
+    .evaluate((canvas) => Array.from(canvas.getContext("2d").getImageData(0, 0, 1, 1).data));
+  expect(ownedPixel).toEqual([12, 34, 56, 255]);
+
+  const stable = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.05));
+  expect(stable.pixelHash).toBe(owned.snapshot.pixelHash);
+  expect(stable.textureStatus).toMatchObject({ activeId: 2, successes: 2, failures: 1 });
+
+  const latestSelection = await page.evaluate(() =>
+    window.__softRasterizer.testLatestTextureSelectionWins(),
+  );
+  expect(latestSelection.afterSecond.textureStatus).toMatchObject({
+    activeId: 3,
+    width: 1,
+    height: 1,
+    successes: 3,
+    failures: 1,
+  });
+  expect(latestSelection.afterFirst.textureStatus).toMatchObject({
+    activeId: 3,
+    successes: 3,
+    failures: 1,
+  });
+  expect(latestSelection.afterFirst.pixelHash).toBe(latestSelection.afterSecond.pixelHash);
+  expect(latestSelection.afterFirst.textureStatus.text).toContain("texture 3");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter16-texture-upload.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter16-texture-upload", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, latestSelection.afterFirst, 0.05, browserLog, screenshotPath, {
+    textureCorners: corners,
+    failedUpload: failed.error,
+    malformedDecode: afterMalformed.textureStatus.text,
+    oversizedDecode: oversized,
+  });
+});

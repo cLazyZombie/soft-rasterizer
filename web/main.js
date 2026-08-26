@@ -1,5 +1,6 @@
 import init, { Renderer } from "./pkg/renderer_wasm.js";
 import { FramebufferPresenter } from "./present.js";
+import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
 
 const MAX_FRAME_DT_SECONDS = 0.1;
 
@@ -42,6 +43,10 @@ function rendererStats(renderer) {
     sampleCounterOverflow: renderer.stats_sample_counter_overflow(),
     debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
+    textureDebugPixels: renderer.stats_texture_debug_pixels(),
+    textureUploadSuccesses: renderer.stats_texture_upload_successes(),
+    textureUploadFailures: renderer.stats_texture_upload_failures(),
+    activeTextureId: renderer.stats_active_texture_id(),
   };
 }
 
@@ -85,6 +90,9 @@ async function bootstrap() {
   const depthDebugCheckbox = document.querySelector("#depth-debug");
   const depthOrderReversedCheckbox = document.querySelector("#depth-order-reversed");
   const depthDebugModeSelect = document.querySelector("#depth-debug-mode");
+  const textureFileInput = document.querySelector("#texture-file");
+  const textureDebugCheckbox = document.querySelector("#texture-debug");
+  const textureStatusOutput = document.querySelector("#texture-status");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -103,6 +111,8 @@ async function bootstrap() {
   let currentSize = initialSize;
   let lastFrameMetrics = null;
   let coordinateDebugText = "좌표 계산 대기 중";
+  let textureStatusText = "fallback checkerboard · 2 × 2 · texture 0";
+  let textureDecodeGeneration = 0;
 
   const updateStatus = () => {
     document.querySelector("#internal-size").textContent = `${currentSize.width} × ${currentSize.height} px`;
@@ -122,6 +132,7 @@ async function bootstrap() {
     document.querySelector("#pipeline-algorithm").textContent =
       `${pipelineDebugModeSelect.options[pipelineDebugModeSelect.selectedIndex].text} · 같은 Rust coverage/depth 경로`;
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
+    textureStatusOutput.textContent = textureStatusText;
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
@@ -256,6 +267,28 @@ async function bootstrap() {
     setPipelineDebugMode(mode === 1 ? 4 : mode === 2 ? 5 : 0);
   };
 
+  const setTextureDebugEnabled = (enabled) => {
+    renderer.set_texture_debug_enabled(enabled);
+    textureDebugCheckbox.checked = enabled;
+  };
+
+  const uploadTextureRgba = (width, height, pixels) => {
+    try {
+      const id = renderer.upload_texture_rgba(width, height, pixels);
+      textureStatusText = `업로드 완료 · ${width} × ${height} · texture ${id} · Rust 소유 복사`;
+      errorOutput.textContent = "";
+      setTextureDebugEnabled(true);
+      renderFrame(0);
+      return { id, error: null };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      textureStatusText = `업로드 실패 · 기존 texture ${renderer.active_texture_id()} 유지`;
+      errorOutput.textContent = message;
+      updateStatus();
+      return { id: null, error: message };
+    }
+  };
+
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCullMode(Number(cullModeSelect.value));
   setClipDebugEnabled(clipDebugCheckbox.checked);
@@ -266,6 +299,7 @@ async function bootstrap() {
   setDepthDebugEnabled(depthDebugCheckbox.checked);
   setDepthOrderReversed(depthOrderReversedCheckbox.checked);
   setPipelineDebugMode(Number(pipelineDebugModeSelect.value));
+  setTextureDebugEnabled(textureDebugCheckbox.checked);
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -314,6 +348,42 @@ async function bootstrap() {
   depthDebugModeSelect.addEventListener("change", () => {
     setDepthDebugMode(Number(depthDebugModeSelect.value));
     renderFrame(0);
+  });
+  textureDebugCheckbox.addEventListener("change", () => {
+    setTextureDebugEnabled(textureDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  const decodeAndUploadTextureFile = async (file, decode = decodeImageFileToRgba) => {
+    const generation = ++textureDecodeGeneration;
+    textureStatusText = `디코딩 중 · ${file.name}`;
+    updateStatus();
+    try {
+      const decoded = await decode(file);
+      if (generation !== textureDecodeGeneration) {
+        return false;
+      }
+      uploadTextureRgba(decoded.width, decoded.height, decoded.pixels);
+      return true;
+    } catch (error) {
+      if (generation !== textureDecodeGeneration) {
+        return false;
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      textureStatusText = `디코딩 실패 · 기존 texture ${renderer.active_texture_id()} 유지`;
+      errorOutput.textContent = message;
+      updateStatus();
+      return false;
+    } finally {
+      if (generation === textureDecodeGeneration) {
+        textureFileInput.value = "";
+      }
+    }
+  };
+  textureFileInput.addEventListener("change", async () => {
+    const [file] = textureFileInput.files;
+    if (file !== undefined) {
+      await decodeAndUploadTextureFile(file);
+    }
   });
 
   const applyDisplayResize = () => {
@@ -374,6 +444,15 @@ async function bootstrap() {
     depthDebugEnabled: depthDebugCheckbox.checked,
     depthOrderReversed: depthOrderReversedCheckbox.checked,
     depthDebugMode: Number(depthDebugModeSelect.value),
+    textureDebugEnabled: textureDebugCheckbox.checked,
+    textureStatus: {
+      activeId: renderer.active_texture_id(),
+      width: renderer.active_texture_width(),
+      height: renderer.active_texture_height(),
+      successes: renderer.texture_upload_successes(),
+      failures: renderer.texture_upload_failures(),
+      text: textureStatusText,
+    },
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -408,6 +487,74 @@ async function bootstrap() {
         setDepthDebugEnabled,
         setDepthOrderReversed,
         setDepthDebugMode,
+        setTextureDebugEnabled,
+        uploadTextureRgba(width, height, pixelValues) {
+          const pixels = Uint8Array.from(pixelValues);
+          const result = uploadTextureRgba(width, height, pixels);
+          pixels.fill(0);
+          renderFrame(0);
+          return { ...result, snapshot: snapshot() };
+        },
+        validateDecodedTextureSize(width, height) {
+          try {
+            return { pixelCount: validateDecodedTextureSize(width, height), error: null };
+          } catch (error) {
+            return {
+              pixelCount: null,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
+        async testOversizedDecodeGuard() {
+          let canvasCreated = false;
+          let bitmapClosed = false;
+          try {
+            await decodeImageFileToRgba(new Blob([]), {
+              createBitmap: async () => ({
+                width: 16_777_217,
+                height: 1,
+                close() {
+                  bitmapClosed = true;
+                },
+              }),
+              createCanvas: () => {
+                canvasCreated = true;
+                throw new Error("크기 검사 전에 Canvas를 만들면 안 됩니다.");
+              },
+            });
+            return { error: null, canvasCreated, bitmapClosed };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              canvasCreated,
+              bitmapClosed,
+            };
+          }
+        },
+        async testLatestTextureSelectionWins() {
+          let resolveFirst;
+          let resolveSecond;
+          const firstDecoded = new Promise((resolve) => {
+            resolveFirst = resolve;
+          });
+          const secondDecoded = new Promise((resolve) => {
+            resolveSecond = resolve;
+          });
+          const first = decodeAndUploadTextureFile(
+            new File([], "first.png", { type: "image/png" }),
+            () => firstDecoded,
+          );
+          const second = decodeAndUploadTextureFile(
+            new File([], "second.png", { type: "image/png" }),
+            () => secondDecoded,
+          );
+          resolveSecond({ width: 1, height: 1, pixels: new Uint8Array([20, 40, 60, 255]) });
+          await second;
+          const afterSecond = snapshot();
+          resolveFirst({ width: 1, height: 1, pixels: new Uint8Array([200, 10, 10, 255]) });
+          await first;
+          return { afterSecond, afterFirst: snapshot() };
+        },
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },

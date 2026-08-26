@@ -1,13 +1,14 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 15장까지 homogeneous clipping 뒤 fixed-point coverage, strict depth test와
-//! perspective-correct fragment 속성 복원을 하나의 scalar cube pipeline으로 조립한다.
+//! 16장까지 homogeneous clipping 뒤 scalar cube pipeline과 브라우저에서 한 번
+//! 업로드한 RGBA8 texture의 검증된 소유/debug 경로를 조립한다.
 
 pub mod camera;
 pub mod clip;
 pub mod math;
 pub mod mesh;
 pub mod raster;
+pub mod texture;
 pub mod transform;
 
 use std::error::Error;
@@ -24,6 +25,7 @@ use raster::{
     PipelineDebugMode, ScreenVertex, TriangleDisposition, TriangleSetup, TriangleSetupError,
     WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
+use texture::{Texture, TextureColorSpace, TextureError, TextureId, TextureStore};
 #[cfg(test)]
 use transform::CoordinateSpace;
 use transform::{
@@ -228,6 +230,25 @@ impl RenderTarget {
         self.depth.fill(f32::INFINITY);
     }
 
+    /// Texture row 0을 화면 row 0에 두고 nearest로 전체 target에 확대한다.
+    pub fn render_texture_nearest(&mut self, texture: &Texture) -> u32 {
+        for y in 0..self.height {
+            let texture_y = nearest_texture_coordinate(y, self.height, texture.height());
+            for x in 0..self.width {
+                let texture_x = nearest_texture_coordinate(x, self.width, texture.width());
+                let source = texture
+                    .texel_rgba8(texture_x, texture_y)
+                    .expect("검증된 nearest 좌표는 texture 내부여야 한다");
+                let byte_index = 4 * (y * self.width + x);
+                self.color[byte_index..byte_index + 4]
+                    .copy_from_slice(&[source[0], source[1], source[2], 255]);
+            }
+        }
+        self.depth.fill(f32::INFINITY);
+        u32::try_from(self.width * self.height)
+            .expect("RenderTarget 최대 pixel 수는 u32 안에 들어가야 한다")
+    }
+
     pub fn draw_point(&mut self, point: ScreenPoint, color: Color) -> u32 {
         u32::from(self.put_pixel(point, color))
     }
@@ -283,6 +304,15 @@ impl RenderTarget {
         }
         written
     }
+}
+
+fn nearest_texture_coordinate(
+    target_coordinate: usize,
+    target_extent: usize,
+    texture_extent: usize,
+) -> usize {
+    let scaled = target_coordinate as u64 * texture_extent as u64;
+    (scaled / target_extent as u64) as usize
 }
 
 fn walk_bresenham(
@@ -352,6 +382,10 @@ pub struct FrameStats {
     pub sample_counter_overflow: bool,
     pub debug_pixels: u32,
     pub invalid_values: u32,
+    pub texture_debug_pixels: u32,
+    pub texture_upload_successes: u32,
+    pub texture_upload_failures: u32,
+    pub active_texture_id: u32,
 }
 
 impl FrameStats {
@@ -405,6 +439,15 @@ impl Default for PipelineState {
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct InputSnapshot {
     packed_bits: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct TextureAssetStatus {
+    pub active_texture_id: TextureId,
+    pub active_width: usize,
+    pub active_height: usize,
+    pub successful_uploads: u32,
+    pub failed_uploads: u32,
 }
 
 impl InputSnapshot {
@@ -599,7 +642,7 @@ enum ActiveScene {
     Depth,
 }
 
-/// 렌더 타깃과 3-15장 scalar cube pipeline/debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-16장 scalar cube pipeline/texture debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -613,6 +656,11 @@ pub struct Renderer {
     perspective_debug_enabled: bool,
     depth_debug_enabled: bool,
     depth_order_reversed: bool,
+    texture_debug_enabled: bool,
+    textures: TextureStore,
+    active_texture_id: TextureId,
+    texture_upload_successes: u32,
+    texture_upload_failures: u32,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -649,6 +697,8 @@ impl Renderer {
 
     pub fn new(width: usize, height: usize) -> Result<Self, RenderTargetError> {
         let target = RenderTarget::new(width, height)?;
+        let textures = TextureStore::new();
+        let active_texture_id = textures.fallback_id();
         let mesh = unit_cube_mesh();
         let draw_item = DrawItem::new(
             MeshId(0),
@@ -687,6 +737,11 @@ impl Renderer {
             perspective_debug_enabled: false,
             depth_debug_enabled: false,
             depth_order_reversed: false,
+            texture_debug_enabled: false,
+            textures,
+            active_texture_id,
+            texture_upload_successes: 0,
+            texture_upload_failures: 0,
             mesh,
             draw_item,
             mesh_scene,
@@ -770,14 +825,22 @@ impl Renderer {
             ),
         };
         let draw_options = FrameDrawOptions::from_renderer(self);
-        draw_frame(
-            &mut replacement,
-            draw_options,
-            mesh,
-            &mut self.clipper,
-            clip_vertices,
-            selected_vertex_index,
-        );
+        if self.texture_debug_enabled {
+            let texture = self
+                .textures
+                .get(self.active_texture_id)
+                .expect("active texture ID는 저장소에 존재해야 한다");
+            replacement.render_texture_nearest(texture);
+        } else {
+            draw_frame(
+                &mut replacement,
+                draw_options,
+                mesh,
+                &mut self.clipper,
+                clip_vertices,
+                selected_vertex_index,
+            );
+        }
         self.target = replacement;
         self.mesh_scene = replacement_scene;
         self.clip_debug_scene = replacement_clip_debug_scene;
@@ -798,38 +861,42 @@ impl Renderer {
         } else {
             rotation_y
         };
-        match self.active_scene() {
-            ActiveScene::Cube => self.mesh_scene.rebuild_cube(
-                &self.mesh,
-                self.draw_item.model,
-                self.target.width(),
-                self.target.height(),
-            ),
-            ActiveScene::Clipping => self.clip_debug_scene.rebuild_identity_debug(
-                &self.clip_debug_mesh,
-                self.target.width(),
-                self.target.height(),
-            ),
-            ActiveScene::Coverage => self.coverage_debug_scene.rebuild_identity_debug(
-                &self.coverage_debug_mesh,
-                self.target.width(),
-                self.target.height(),
-            ),
-            ActiveScene::Interpolation => self.interpolation_debug_scene.rebuild_identity_debug(
-                &self.interpolation_debug_mesh,
-                self.target.width(),
-                self.target.height(),
-            ),
-            ActiveScene::Perspective => self.perspective_debug_scene.rebuild_perspective_debug(
-                &self.perspective_debug_mesh,
-                self.target.width(),
-                self.target.height(),
-            ),
-            ActiveScene::Depth => self.depth_debug_scene.rebuild_identity_debug(
-                &self.depth_debug_near_first_mesh,
-                self.target.width(),
-                self.target.height(),
-            ),
+        if !self.texture_debug_enabled {
+            match self.active_scene() {
+                ActiveScene::Cube => self.mesh_scene.rebuild_cube(
+                    &self.mesh,
+                    self.draw_item.model,
+                    self.target.width(),
+                    self.target.height(),
+                ),
+                ActiveScene::Clipping => self.clip_debug_scene.rebuild_identity_debug(
+                    &self.clip_debug_mesh,
+                    self.target.width(),
+                    self.target.height(),
+                ),
+                ActiveScene::Coverage => self.coverage_debug_scene.rebuild_identity_debug(
+                    &self.coverage_debug_mesh,
+                    self.target.width(),
+                    self.target.height(),
+                ),
+                ActiveScene::Interpolation => {
+                    self.interpolation_debug_scene.rebuild_identity_debug(
+                        &self.interpolation_debug_mesh,
+                        self.target.width(),
+                        self.target.height(),
+                    )
+                }
+                ActiveScene::Perspective => self.perspective_debug_scene.rebuild_perspective_debug(
+                    &self.perspective_debug_mesh,
+                    self.target.width(),
+                    self.target.height(),
+                ),
+                ActiveScene::Depth => self.depth_debug_scene.rebuild_identity_debug(
+                    &self.depth_debug_near_first_mesh,
+                    self.target.width(),
+                    self.target.height(),
+                ),
+            }
         }
         let (mesh, scene, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX),
@@ -863,21 +930,47 @@ impl Renderer {
                 DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
             ),
         };
-        let draw_report = draw_frame(
-            &mut self.target,
-            FrameDrawOptions {
-                debug_lines_enabled: self.debug_lines_enabled,
-                pipeline_state: self.pipeline_state,
-                uv_checker_enabled: self.perspective_debug_enabled,
-            },
-            mesh,
-            &mut self.clipper,
-            &scene.clip_vertices,
-            selected_vertex_index,
-        );
-        let active_vertex_count = mesh.vertices().len() as u32;
-        let transformed_vertex_count = scene.traces.len() as u32;
-        let active_triangle_count = mesh.triangle_count() as u32;
+        let (draw_report, texture_debug_pixels) = if self.texture_debug_enabled {
+            let texture = self
+                .textures
+                .get(self.active_texture_id)
+                .expect("active texture ID는 저장소에 존재해야 한다");
+            (
+                FrameDrawReport::default(),
+                self.target.render_texture_nearest(texture),
+            )
+        } else {
+            (
+                draw_frame(
+                    &mut self.target,
+                    FrameDrawOptions {
+                        debug_lines_enabled: self.debug_lines_enabled,
+                        pipeline_state: self.pipeline_state,
+                        uv_checker_enabled: self.perspective_debug_enabled,
+                    },
+                    mesh,
+                    &mut self.clipper,
+                    &scene.clip_vertices,
+                    selected_vertex_index,
+                ),
+                0,
+            )
+        };
+        let active_vertex_count = if self.texture_debug_enabled {
+            0
+        } else {
+            mesh.vertices().len() as u32
+        };
+        let transformed_vertex_count = if self.texture_debug_enabled {
+            0
+        } else {
+            scene.traces.len() as u32
+        };
+        let active_triangle_count = if self.texture_debug_enabled {
+            0
+        } else {
+            mesh.triangle_count() as u32
+        };
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
@@ -906,11 +999,17 @@ impl Renderer {
             max_interpolated_inv_w: draw_report.max_interpolated_inv_w,
             sample_counter_overflow: draw_report.sample_counter_overflow,
             debug_pixels: draw_report.debug_pixels,
-            invalid_values: scene
-                .diagnostics
-                .invalid_values
-                .saturating_add(draw_report.invalid_values)
-                .saturating_add(u32::from(invalid_dt)),
+            invalid_values: (if self.texture_debug_enabled {
+                0
+            } else {
+                scene.diagnostics.invalid_values
+            })
+            .saturating_add(draw_report.invalid_values)
+            .saturating_add(u32::from(invalid_dt)),
+            texture_debug_pixels,
+            texture_upload_successes: self.texture_upload_successes,
+            texture_upload_failures: self.texture_upload_failures,
+            active_texture_id: self.active_texture_id.0,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
@@ -1008,6 +1107,57 @@ impl Renderer {
 
     pub fn set_pipeline_debug_mode(&mut self, mode: PipelineDebugMode) {
         self.pipeline_state.debug_mode = mode;
+    }
+
+    pub fn set_texture_debug_enabled(&mut self, enabled: bool) {
+        self.texture_debug_enabled = enabled;
+    }
+
+    pub const fn texture_debug_enabled(&self) -> bool {
+        self.texture_debug_enabled
+    }
+
+    pub fn upload_texture_rgba8(
+        &mut self,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+        color_space: TextureColorSpace,
+    ) -> Result<TextureId, TextureError> {
+        match self
+            .textures
+            .upload_rgba8(width, height, pixels, color_space)
+        {
+            Ok(id) => {
+                self.active_texture_id = id;
+                self.texture_upload_successes = self.texture_upload_successes.saturating_add(1);
+                Ok(id)
+            }
+            Err(error) => {
+                self.texture_upload_failures = self.texture_upload_failures.saturating_add(1);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn set_active_texture(&mut self, id: TextureId) -> Result<(), TextureError> {
+        self.textures.get(id)?;
+        self.active_texture_id = id;
+        Ok(())
+    }
+
+    pub fn texture_asset_status(&self) -> TextureAssetStatus {
+        let active = self
+            .textures
+            .get(self.active_texture_id)
+            .expect("active texture ID는 저장소에 존재해야 한다");
+        TextureAssetStatus {
+            active_texture_id: self.active_texture_id,
+            active_width: active.width(),
+            active_height: active.height(),
+            successful_uploads: self.texture_upload_successes,
+            failed_uploads: self.texture_upload_failures,
+        }
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -3970,6 +4120,117 @@ mod tests {
                 fnv1a(chapter_fifteen.color()),
             ),
             (640, 215, Some((16, 15, 47, 45)), 0x02e7_136f, 0x186c_d1de,)
+        );
+    }
+
+    #[test]
+    fn chapter_sixteen_texture_debug_preserves_rgba_channel_and_row_direction() {
+        let texture = Texture::from_rgba8(
+            2,
+            2,
+            &[255, 0, 0, 1, 0, 255, 0, 2, 0, 0, 255, 3, 255, 255, 255, 4],
+            TextureColorSpace::Srgb,
+        )
+        .unwrap();
+        let mut target = RenderTarget::new(4, 4).unwrap();
+        assert_eq!(target.render_texture_nearest(&texture), 16);
+
+        let pixel = |x: usize, y: usize| {
+            let byte = 4 * (y * target.width() + x);
+            &target.color()[byte..byte + 4]
+        };
+        assert_eq!(pixel(0, 0), [255, 0, 0, 255]);
+        assert_eq!(pixel(3, 0), [0, 255, 0, 255]);
+        assert_eq!(pixel(0, 3), [0, 0, 255, 255]);
+        assert_eq!(pixel(3, 3), [255, 255, 255, 255]);
+        assert!(target.depth().iter().all(|value| value.is_infinite()));
+    }
+
+    #[test]
+    fn chapter_sixteen_nearest_scaling_cannot_overflow_wasm32_coordinates() {
+        let texture_extent = texture::MAX_TEXTURE_PIXEL_COUNT;
+        let target_extent = 960;
+        let coordinates: Vec<_> = (0..target_extent)
+            .map(|position| nearest_texture_coordinate(position, target_extent, texture_extent))
+            .collect();
+        assert_eq!(coordinates[0], 0);
+        assert!(coordinates.windows(2).all(|pair| pair[0] <= pair[1]));
+        assert!(coordinates[target_extent - 1] < texture_extent);
+        assert_eq!(
+            coordinates[target_extent - 1],
+            ((target_extent - 1) as u64 * texture_extent as u64 / target_extent as u64) as usize
+        );
+    }
+
+    #[test]
+    fn chapter_sixteen_renderer_upload_status_and_failure_keep_active_texture() {
+        let mut renderer = Renderer::new(4, 4).unwrap();
+        assert_eq!(
+            renderer.texture_asset_status(),
+            TextureAssetStatus {
+                active_texture_id: TextureId(0),
+                active_width: 2,
+                active_height: 2,
+                successful_uploads: 0,
+                failed_uploads: 0,
+            }
+        );
+        let uploaded = renderer
+            .upload_texture_rgba8(
+                2,
+                2,
+                &[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                ],
+                TextureColorSpace::Srgb,
+            )
+            .unwrap();
+        assert_eq!(uploaded, TextureId(1));
+        let failure = renderer
+            .upload_texture_rgba8(2, 2, &[0; 15], TextureColorSpace::Srgb)
+            .unwrap_err();
+        assert_eq!(
+            failure,
+            TextureError::ByteLengthMismatch {
+                expected: 16,
+                actual: 15,
+            }
+        );
+        assert_eq!(renderer.texture_asset_status().active_texture_id, uploaded);
+        assert_eq!(renderer.texture_asset_status().successful_uploads, 1);
+        assert_eq!(renderer.texture_asset_status().failed_uploads, 1);
+        assert_eq!(
+            renderer.set_active_texture(TextureId(99)),
+            Err(TextureError::InvalidTextureId(TextureId(99)))
+        );
+
+        renderer.set_texture_debug_enabled(true);
+        assert!(renderer.texture_debug_enabled());
+        renderer.set_model_rotation_y(f32::NAN);
+        let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(stats.texture_debug_pixels, 16);
+        assert_eq!(stats.texture_upload_successes, 1);
+        assert_eq!(stats.texture_upload_failures, 1);
+        assert_eq!(stats.active_texture_id, uploaded.0);
+        assert_eq!(stats.input_triangles, 0);
+        assert_eq!(stats.invalid_values, 0);
+        assert!(stats.pipeline_relations_hold());
+        assert_eq!(&renderer.color_buffer()[0..4], &[255, 0, 0, 255]);
+
+        renderer.resize(2, 2).unwrap();
+        assert_eq!(
+            renderer.color_buffer(),
+            [
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ]
+        );
+        renderer.set_texture_debug_enabled(false);
+        assert!(!renderer.texture_debug_enabled());
+        assert!(
+            renderer
+                .update_and_render(0.0, InputSnapshot::default())
+                .input_triangles
+                > 0
         );
     }
 }

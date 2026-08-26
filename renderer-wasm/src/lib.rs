@@ -6,6 +6,7 @@ use renderer_core::{
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
+    texture::{TextureColorSpace, TextureId},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -139,6 +140,63 @@ impl Renderer {
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.core.set_model_rotation_y(rotation_y_radians);
+    }
+
+    pub fn upload_texture_rgba(
+        &mut self,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<u32, String> {
+        match self.core.upload_texture_rgba8(
+            width as usize,
+            height as usize,
+            pixels,
+            TextureColorSpace::Srgb,
+        ) {
+            Ok(id) => {
+                self.last_error.clear();
+                Ok(id.0)
+            }
+            Err(error) => {
+                self.last_error = error.to_string();
+                Err(self.last_error.clone())
+            }
+        }
+    }
+
+    pub fn set_active_texture(&mut self, id: u32) -> Result<(), String> {
+        self.core
+            .set_active_texture(TextureId(id))
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn set_texture_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_texture_debug_enabled(enabled);
+    }
+
+    pub fn texture_debug_enabled(&self) -> bool {
+        self.core.texture_debug_enabled()
+    }
+
+    pub fn active_texture_id(&self) -> u32 {
+        self.core.texture_asset_status().active_texture_id.0
+    }
+
+    pub fn active_texture_width(&self) -> u32 {
+        self.core.texture_asset_status().active_width as u32
+    }
+
+    pub fn active_texture_height(&self) -> u32 {
+        self.core.texture_asset_status().active_height as u32
+    }
+
+    pub fn texture_upload_successes(&self) -> u32 {
+        self.core.texture_asset_status().successful_uploads
+    }
+
+    pub fn texture_upload_failures(&self) -> u32 {
+        self.core.texture_asset_status().failed_uploads
     }
 
     pub fn coordinate_debug_text(&self) -> String {
@@ -279,6 +337,22 @@ impl Renderer {
 
     pub fn stats_invalid_values(&self) -> u32 {
         self.stats().invalid_values
+    }
+
+    pub fn stats_texture_debug_pixels(&self) -> u32 {
+        self.stats().texture_debug_pixels
+    }
+
+    pub fn stats_texture_upload_successes(&self) -> u32 {
+        self.stats().texture_upload_successes
+    }
+
+    pub fn stats_texture_upload_failures(&self) -> u32 {
+        self.stats().texture_upload_failures
+    }
+
+    pub fn stats_active_texture_id(&self) -> u32 {
+        self.stats().active_texture_id
     }
 }
 
@@ -932,5 +1006,53 @@ mod tests {
     fn adapter_constructor_returns_explicit_error_for_zero_dimensions() {
         let error = Renderer::new(0, 1).unwrap_err();
         assert!(error.contains("0보다"));
+    }
+
+    #[test]
+    fn adapter_uploads_owned_texture_and_exposes_chapter_sixteen_status() {
+        let mut renderer = Renderer::new(4, 4).unwrap();
+        assert_eq!(renderer.active_texture_id(), 0);
+        assert_eq!(
+            (
+                renderer.active_texture_width(),
+                renderer.active_texture_height()
+            ),
+            (2, 2)
+        );
+        assert_eq!(
+            (
+                renderer.texture_upload_successes(),
+                renderer.texture_upload_failures()
+            ),
+            (0, 0)
+        );
+
+        let mut source = [
+            255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+        ];
+        assert_eq!(renderer.upload_texture_rgba(2, 2, &source).unwrap(), 1);
+        source.fill(0);
+        renderer.set_texture_debug_enabled(true);
+        assert!(renderer.texture_debug_enabled());
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_texture_debug_pixels(), 16);
+        assert_eq!(renderer.stats_texture_upload_successes(), 1);
+        assert_eq!(renderer.stats_texture_upload_failures(), 0);
+        assert_eq!(renderer.stats_active_texture_id(), 1);
+        assert_eq!(&renderer.core.color_buffer()[0..4], &[255, 0, 0, 255]);
+
+        let error = renderer.upload_texture_rgba(2, 2, &[0; 15]).unwrap_err();
+        assert!(error.contains("16이어야"));
+        assert_eq!(renderer.last_error(), error);
+        assert_eq!(renderer.active_texture_id(), 1);
+        assert_eq!(renderer.texture_upload_failures(), 1);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_texture_upload_failures(), 1);
+
+        assert!(renderer.set_active_texture(99).unwrap_err().contains("99"));
+        renderer.set_active_texture(0).unwrap();
+        assert_eq!(renderer.active_texture_id(), 0);
+        renderer.set_texture_debug_enabled(false);
+        assert!(!renderer.texture_debug_enabled());
     }
 }
