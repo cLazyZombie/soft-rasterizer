@@ -46,6 +46,8 @@ P rows:
 - `z_view=n`은 `z_ndc=0`, `z_view=f`는 `z_ndc=1`이다.
 - clip 범위는 `-w<=x<=w`, `-w<=y<=w`, `0<=z<=w`다. plane distance는 `x+w`, `w-x`, `y+w`, `w-y`, `z`, `w-z`를 유지한다.
 - depth clear는 `+infinity`, 통과는 유한한 `0..1` 후보에 대한 strict `<`다. 작은 NDC 깊이가 가깝다.
+- 13장의 depth candidate는 screen-space barycentric으로 `z_ndc`를 affine 보간한다. `DEPTH_RANGE_EPSILON=1e-6` 안의 수치 이탈만 `0..1`로 clamp하고, 그보다 큰 이탈과 NaN/Inf는 `invalid_depth_samples`에 기록해 거부한다. 비변경 depth 판정은 fragment 색 계산보다 먼저 하지만, 깊이 갱신은 유효한 최종 색과 함께 commit한다. pass/fail/invalid 통계도 분리한다.
+- depth debug grayscale은 `round(z_ndc*255)`, range heatmap은 near blue에서 mid green을 거쳐 far red로 매핑한다. 빈 픽셀은 `[12,18,28,255]`이고, debug mode는 geometry/depth count를 바꾸지 않는다. 깊이 배열은 JS로 복사하지 않고 Rust가 같은 RGBA8 표시 경로에 debug 색을 쓴다.
 
 ## Homogeneous clipping
 
@@ -68,6 +70,7 @@ P rows:
 - bbox는 양자화 정점의 보수적인 정수 범위를 화면에 clamp한다. 첫 픽셀 중심에서 edge 세 개를 한 번 계산하고 x에는 `-dy*S`, y에는 `dx*S`를 더한다. coverage를 통과해 색을 기록한 sample 수는 `shaded_samples`, setup을 통과한 삼각형 수는 `rasterized_triangles`로 관찰한다.
 - coverage가 만든 `e0,e1,e2`는 각각 v0,v1,v2 반대 edge이며, `lambda_i=e_i/area`로 재사용한다. triangle setup은 `inv_area`를 한 번만 만들고 각 sample에서는 곱셈으로 barycentric 좌표를 복원한다. 공개 barycentric 생성자는 `0<=e_i<=area`와 `e0+e1+e2==area`를 검증한다.
 - 12장의 정점 색은 screen-space affine 보간이며 `FragmentInput`은 barycentric과 affine color만 소유한다. UV/world position/normal의 perspective-correct 보간은 14장까지 만들지 않는다. `max_barycentric_sum_error`로 프레임의 최대 `|lambda0+lambda1+lambda2-1|`를 관찰하고, non-finite fragment 입력/결과는 색을 쓰지 않은 채 `invalid_values`에 기록한다.
+- 13장의 `z_ndc`도 같은 barycentric으로 screen-space affine 보간하지만 일반 정점 속성처럼 다시 perspective 보정하지 않는다. strict depth의 동일값 tie는 먼저 통과한 sample을 보존한다. near/far overlap fixture는 triangle 제출 순서를 뒤집어도 최종 RGBA와 depth가 exact match해야 한다.
 
 ## 카메라 입력
 
@@ -95,6 +98,7 @@ Fly에서 W/S는 `+forward/-forward`, D/A는 `+right/-right`다. 양의 pointer 
 - canonical `look_at_lh` identity와 `eye+k*F -> (0,0,k)`
 - `perspective_lh_zo`의 `+near -> 0`, `+far -> 1`, `w_clip=z_view`
 - 앞점 `w>0`, 뒤점 `w<0`과 clipping-before-divide
+- near/far overlap triangle의 제출 순서 독립 RGBA/depth와 strict tie, exact far `z_ndc=1` 첫 통과
 - LH 큐브의 outward normal, screen `area>0`과 culling 일치
 - orbit yaw=0, pointer yaw 부호와 W/A/S/D 이동
 - transparent `view_depth=z_view` descending

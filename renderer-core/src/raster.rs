@@ -1,5 +1,5 @@
-//! 9장의 screen-space winding/culling, 11장의 fixed-point coverage와
-//! 12장의 barycentric/affine color 보간 계약.
+//! 9장의 screen-space winding/culling, 11장의 fixed-point coverage,
+//! 12장의 barycentric/affine color와 13장의 depth debug 계약.
 
 use crate::{camera::ViewportPosition, math::Vec4};
 
@@ -40,6 +40,24 @@ pub enum WindingDebugMode {
     VertexColor,
     Facing,
     Barycentric,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum DepthDebugMode {
+    #[default]
+    Off,
+    Grayscale,
+    Heatmap,
+}
+
+impl DepthDebugMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Grayscale => "grayscale",
+            Self::Heatmap => "range heatmap",
+        }
+    }
 }
 
 impl WindingDebugMode {
@@ -218,6 +236,10 @@ impl BarycentricCoordinates {
     }
 
     pub fn interpolate_vec4(self, values: [Vec4; 3]) -> Vec4 {
+        values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
+    }
+
+    pub fn interpolate_f32(self, values: [f32; 3]) -> f32 {
         values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
     }
 
@@ -657,6 +679,9 @@ mod tests {
         assert_eq!(WindingDebugMode::VertexColor.label(), "vertex color");
         assert_eq!(WindingDebugMode::Facing.label(), "front green / back red");
         assert_eq!(WindingDebugMode::Barycentric.label(), "barycentric RGB");
+        assert_eq!(DepthDebugMode::Off.label(), "off");
+        assert_eq!(DepthDebugMode::Grayscale.label(), "grayscale");
+        assert_eq!(DepthDebugMode::Heatmap.label(), "range heatmap");
     }
 
     #[test]
@@ -681,6 +706,12 @@ mod tests {
             assert!(barycentric.sum_error() <= f32::EPSILON);
             let fragment = FragmentInput::from_affine_color(barycentric, colors).unwrap();
             assert_eq!(fragment.affine_color(), barycentric.debug_color());
+            assert!(
+                (barycentric.interpolate_f32([0.0, 0.5, 1.0])
+                    - (0.0 * expected[0] + 0.5 * expected[1] + expected[2]))
+                    .abs()
+                    <= f32::EPSILON
+            );
         }
         assert_eq!(BarycentricCoordinates::from_edge_values([1, 0, 0], 0), None);
         assert_eq!(

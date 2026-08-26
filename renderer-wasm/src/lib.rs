@@ -3,7 +3,7 @@
 use renderer_core::{
     CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
     math::Vec4,
-    raster::{CullMode, WindingDebugMode},
+    raster::{CullMode, DepthDebugMode, WindingDebugMode},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -81,6 +81,25 @@ impl Renderer {
 
     pub fn set_interpolation_debug_enabled(&mut self, enabled: bool) {
         self.core.set_interpolation_debug_enabled(enabled);
+    }
+
+    pub fn set_depth_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_depth_debug_enabled(enabled);
+    }
+
+    pub fn set_depth_order_reversed(&mut self, reversed: bool) {
+        self.core.set_depth_order_reversed(reversed);
+    }
+
+    pub fn set_depth_debug_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => DepthDebugMode::Off,
+            1 => DepthDebugMode::Grayscale,
+            2 => DepthDebugMode::Heatmap,
+            _ => return Err(format!("알 수 없는 depth debug mode입니다: {mode}")),
+        };
+        self.core.set_depth_debug_mode(mode);
+        Ok(())
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -179,6 +198,18 @@ impl Renderer {
         self.stats().shaded_samples
     }
 
+    pub fn stats_depth_passed_samples(&self) -> u32 {
+        self.stats().depth_passed_samples
+    }
+
+    pub fn stats_depth_failed_samples(&self) -> u32 {
+        self.stats().depth_failed_samples
+    }
+
+    pub fn stats_invalid_depth_samples(&self) -> u32 {
+        self.stats().invalid_depth_samples
+    }
+
     pub fn stats_max_barycentric_sum_error(&self) -> f32 {
         self.stats().max_barycentric_sum_error
     }
@@ -232,7 +263,12 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         },
     );
     let attributes = snapshot.selected_attributes;
-    let pipeline = if snapshot.interpolation_debug_enabled {
+    let pipeline = if snapshot.depth_debug_enabled {
+        format!(
+            "depth overlap fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
+            snapshot.aspect
+        )
+    } else if snapshot.interpolation_debug_enabled {
         format!(
             "affine RGB fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
             snapshot.aspect
@@ -256,7 +292,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             snapshot.aspect
         )
     };
-    let scene_name = if snapshot.interpolation_debug_enabled {
+    let scene_name = if snapshot.depth_debug_enabled {
+        "near/far overlap triangle mesh"
+    } else if snapshot.interpolation_debug_enabled {
         "barycentric RGB triangle mesh"
     } else if snapshot.coverage_debug_enabled {
         "coverage quad mesh"
@@ -265,7 +303,13 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
     } else {
         "indexed cube mesh"
     };
-    let scene_suffix = if snapshot.interpolation_debug_enabled {
+    let scene_suffix = if snapshot.depth_debug_enabled {
+        if snapshot.depth_order_reversed {
+            " · far-first submission"
+        } else {
+            " · near-first submission"
+        }
+    } else if snapshot.interpolation_debug_enabled {
         " · vertex colors R/G/B"
     } else if snapshot.coverage_debug_enabled {
         " · 두 삼각형/공유 대각선"
@@ -291,6 +335,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · shaded samples {} · S=256 pixel center/top-left\n\
          interpolation stats max |lambda sum - 1| {:.9}\n\
+         depth stats passed {} · failed {} · invalid {} · strict < · clear +infinity · debug {}\n\
          선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
@@ -316,6 +361,10 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.rasterized_triangles,
         snapshot.frame_stats.shaded_samples,
         snapshot.frame_stats.max_barycentric_sum_error,
+        snapshot.frame_stats.depth_passed_samples,
+        snapshot.frame_stats.depth_failed_samples,
+        snapshot.frame_stats.invalid_depth_samples,
+        snapshot.depth_debug_mode.label(),
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
         attributes.normal_world.x,
@@ -385,6 +434,9 @@ mod tests {
         assert_eq!(renderer.stats_max_clip_polygon_vertices(), 3);
         assert_eq!(renderer.stats_rasterized_triangles(), 4);
         assert_eq!(renderer.stats_shaded_samples(), 0);
+        assert_eq!(renderer.stats_depth_passed_samples(), 0);
+        assert_eq!(renderer.stats_depth_failed_samples(), 0);
+        assert_eq!(renderer.stats_invalid_depth_samples(), 0);
         assert_eq!(renderer.stats_max_barycentric_sum_error(), 0.0);
         assert!(renderer.stats_debug_pixels() > 0);
         assert_eq!(renderer.stats_invalid_values(), 0);
@@ -516,6 +568,63 @@ mod tests {
         ));
         assert!(text.contains("cull back · debug barycentric RGB"));
         assert!(text.contains("interpolation stats max |lambda sum - 1| 0.000000119"));
+
+        renderer.set_clip_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.coordinate_debug_text().contains("clip debug mesh"));
+    }
+
+    #[test]
+    fn adapter_exposes_depth_order_stats_and_debug_modes() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_depth_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_input_vertices(), 6);
+        assert_eq!(renderer.stats_input_triangles(), 2);
+        assert_eq!(renderer.stats_submitted_triangles(), 2);
+        assert_eq!(renderer.stats_rasterized_triangles(), 2);
+        assert_eq!(renderer.stats_shaded_samples(), 1_199);
+        assert_eq!(renderer.stats_depth_passed_samples(), 1_199);
+        assert_eq!(renderer.stats_depth_failed_samples(), 202);
+        assert_eq!(renderer.stats_invalid_depth_samples(), 0);
+        let text = renderer.coordinate_debug_text();
+        assert!(text.contains(
+            "depth overlap fixture · identity M/V/P vertex stage · viewport aspect 1.000"
+        ));
+        assert!(text.contains(
+            "near/far overlap triangle mesh · vertices 6 · indices 6 · triangles 2 · material 0 · near-first submission"
+        ));
+        assert!(text.contains(
+            "depth stats passed 1199 · failed 202 · invalid 0 · strict < · clear +infinity · debug off"
+        ));
+
+        renderer.set_depth_order_reversed(true);
+        renderer.set_depth_debug_mode(1).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_shaded_samples(), 1_401);
+        assert_eq!(renderer.stats_depth_passed_samples(), 1_401);
+        assert_eq!(renderer.stats_depth_failed_samples(), 0);
+        let text = renderer.coordinate_debug_text();
+        assert!(text.contains("far-first submission"));
+        assert!(text.contains("debug grayscale"));
+
+        renderer.set_depth_debug_mode(2).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("debug range heatmap")
+        );
+        assert!(
+            renderer
+                .set_depth_debug_mode(3)
+                .unwrap_err()
+                .contains("depth debug mode")
+        );
+        renderer.set_depth_debug_mode(0).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.coordinate_debug_text().contains("debug off"));
 
         renderer.set_clip_debug_enabled(true);
         renderer.update_and_render(0.0, 0);

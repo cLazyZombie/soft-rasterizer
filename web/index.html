@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 12장</title>
+    <title>소프트웨어 래스터라이저 · 13장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,10 +119,10 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>12장 · Barycentric 좌표와 속성 보간</h1>
+        <h1>13장 · 깊이 버퍼와 가려짐</h1>
       </div>
-      <p>고정소수점 edge 값을 면적으로 나눈 barycentric 좌표로 정점 색을 affine 보간합니다.</p>
-      <div class="controls" role="group" aria-label="Culling, clipping, coverage와 interpolation debug 설정">
+      <p>affine z_ndc와 strict less 깊이 검사로 삼각형 제출 순서와 무관한 가려짐을 만듭니다.</p>
+      <div class="controls" role="group" aria-label="Culling, clipping, interpolation과 depth debug 설정">
         <label for="cull-mode">
           Culling
           <select id="cull-mode">
@@ -151,10 +151,26 @@
           <input id="interpolation-debug" type="checkbox" />
           R/G/B affine triangle fixture
         </label>
+        <label for="depth-debug">
+          <input id="depth-debug" type="checkbox" />
+          Near/Far overlap fixture
+        </label>
+        <label for="depth-order-reversed">
+          <input id="depth-order-reversed" type="checkbox" />
+          Far triangle 먼저 제출
+        </label>
+        <label for="depth-debug-mode">
+          Depth view
+          <select id="depth-debug-mode">
+            <option value="0" selected>끔 (정점 색)</option>
+            <option value="1">Grayscale</option>
+            <option value="2">Range heatmap</option>
+          </select>
+        </label>
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
-        clip → fan → divide/viewport → edge/top-left → barycentric/affine color · 선택 정점 흰색(X-ray)
+        clip → fan → divide/viewport → edge/top-left → barycentric → affine z_ndc → strict depth &lt; → color · 선택 정점 흰색(X-ray)
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -174,6 +190,8 @@
         <dd id="coverage-algorithm">초기화 중</dd>
         <dt>보간 알고리즘</dt>
         <dd id="interpolation-algorithm">초기화 중</dd>
+        <dt>깊이 알고리즘</dt>
+        <dd id="depth-algorithm">초기화 중</dd>
         <dt>수학 규약</dt>
         <dd id="math-convention">초기화 중</dd>
         <dt>프레임</dt>

@@ -1,6 +1,7 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 12장까지 homogeneous clipping 뒤 fixed-point coverage와 affine color 보간으로 mesh를 그린다.
+//! 13장까지 homogeneous clipping 뒤 fixed-point coverage, affine color와 z_ndc 보간,
+//! strict depth test로 mesh를 그린다.
 
 pub mod camera;
 pub mod clip;
@@ -19,7 +20,7 @@ use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use math::{Mat4, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
-    CullMode, FaceOrientation, FragmentInput, TriangleDisposition, TriangleSetup,
+    CullMode, DepthDebugMode, FaceOrientation, FragmentInput, TriangleDisposition, TriangleSetup,
     TriangleSetupError, WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
 #[cfg(test)]
@@ -31,12 +32,15 @@ use transform::{
 
 /// 4096 × 4096 RGBA8와 깊이 버퍼까지만 허용한다.
 pub const MAX_PIXEL_COUNT: usize = 16_777_216;
+pub const DEPTH_RANGE_EPSILON: f32 = 1.0e-6;
 const MAX_FRAME_DT_SECONDS: f32 = 0.1;
 const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
 const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
 const CLIP_DEBUG_SELECTED_VERTEX_INDEX: usize = 2;
 const COVERAGE_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
+const DEPTH_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
+const DEPTH_DEBUG_BACKGROUND: Color = Color::rgb(12, 18, 28);
 const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
 const CAMERA_TARGET: Vec3 = Vec3::ZERO;
 const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
@@ -71,6 +75,13 @@ impl ScreenPoint {
     pub const fn new(x: i32, y: i32) -> Self {
         Self { x, y }
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DepthTestResult {
+    Passed,
+    Failed,
+    Invalid,
 }
 
 /// 렌더 타깃 생성 또는 크기 변경이 거부된 이유다.
@@ -141,14 +152,57 @@ impl RenderTarget {
         self.depth.fill(f32::INFINITY);
     }
 
-    pub fn put_pixel(&mut self, point: ScreenPoint, color: Color) -> bool {
+    fn pixel_index(&self, point: ScreenPoint) -> Option<usize> {
         let (Ok(x), Ok(y)) = (usize::try_from(point.x), usize::try_from(point.y)) else {
+            return None;
+        };
+        (x < self.width && y < self.height).then_some(y * self.width + x)
+    }
+
+    fn normalized_depth_candidate(
+        &self,
+        point: ScreenPoint,
+        candidate: f32,
+    ) -> Option<(usize, f32)> {
+        if !candidate.is_finite()
+            || !(-DEPTH_RANGE_EPSILON..=1.0 + DEPTH_RANGE_EPSILON).contains(&candidate)
+        {
+            return None;
+        }
+        Some((self.pixel_index(point)?, candidate.clamp(0.0, 1.0)))
+    }
+
+    pub fn test_depth(&self, point: ScreenPoint, candidate: f32) -> DepthTestResult {
+        let Some((pixel_index, candidate)) = self.normalized_depth_candidate(point, candidate)
+        else {
+            return DepthTestResult::Invalid;
+        };
+        if candidate < self.depth[pixel_index] {
+            DepthTestResult::Passed
+        } else {
+            DepthTestResult::Failed
+        }
+    }
+
+    fn commit_depth_and_color(&mut self, point: ScreenPoint, candidate: f32, color: Color) -> bool {
+        let Some((pixel_index, candidate)) = self.normalized_depth_candidate(point, candidate)
+        else {
             return false;
         };
-        if x >= self.width || y >= self.height {
+        if candidate >= self.depth[pixel_index] {
             return false;
         }
-        let byte_index = 4 * (y * self.width + x);
+        self.depth[pixel_index] = candidate;
+        let byte_index = 4 * pixel_index;
+        self.color[byte_index..byte_index + 4].copy_from_slice(&color.rgba());
+        true
+    }
+
+    pub fn put_pixel(&mut self, point: ScreenPoint, color: Color) -> bool {
+        let Some(pixel_index) = self.pixel_index(point) else {
+            return false;
+        };
+        let byte_index = 4 * pixel_index;
         self.color[byte_index..byte_index + 4].copy_from_slice(&color.rgba());
         true
     }
@@ -282,6 +336,9 @@ pub struct FrameStats {
     pub max_clip_polygon_vertices: u32,
     pub rasterized_triangles: u32,
     pub shaded_samples: u32,
+    pub depth_passed_samples: u32,
+    pub depth_failed_samples: u32,
+    pub invalid_depth_samples: u32,
     pub max_barycentric_sum_error: f32,
     pub debug_pixels: u32,
     pub invalid_values: u32,
@@ -448,6 +505,9 @@ pub struct CoordinateDebugSnapshot {
     pub clip_debug_enabled: bool,
     pub coverage_debug_enabled: bool,
     pub interpolation_debug_enabled: bool,
+    pub depth_debug_enabled: bool,
+    pub depth_order_reversed: bool,
+    pub depth_debug_mode: DepthDebugMode,
     pub frame_stats: FrameStats,
 }
 
@@ -457,9 +517,10 @@ enum ActiveScene {
     Clipping,
     Coverage,
     Interpolation,
+    Depth,
 }
 
-/// 렌더 타깃과 3-12장 indexed mesh/clipping/coverage/interpolation debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-13장 indexed mesh/clipping/coverage/interpolation/depth debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -471,6 +532,9 @@ pub struct Renderer {
     clip_debug_enabled: bool,
     coverage_debug_enabled: bool,
     interpolation_debug_enabled: bool,
+    depth_debug_enabled: bool,
+    depth_order_reversed: bool,
+    depth_debug_mode: DepthDebugMode,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -480,12 +544,17 @@ pub struct Renderer {
     coverage_debug_scene: MeshScene,
     interpolation_debug_mesh: Mesh,
     interpolation_debug_scene: MeshScene,
+    depth_debug_near_first_mesh: Mesh,
+    depth_debug_far_first_mesh: Mesh,
+    depth_debug_scene: MeshScene,
     clipper: TriangleClipper,
 }
 
 impl Renderer {
     const fn active_scene(&self) -> ActiveScene {
-        if self.interpolation_debug_enabled {
+        if self.depth_debug_enabled {
+            ActiveScene::Depth
+        } else if self.interpolation_debug_enabled {
             ActiveScene::Interpolation
         } else if self.coverage_debug_enabled {
             ActiveScene::Coverage
@@ -517,6 +586,10 @@ impl Renderer {
         let interpolation_debug_mesh = interpolation_debug_fixture();
         let interpolation_debug_scene =
             MeshScene::new_identity_debug(&interpolation_debug_mesh, width, height);
+        let depth_debug_near_first_mesh = depth_debug_fixture(false);
+        let depth_debug_far_first_mesh = depth_debug_fixture(true);
+        let depth_debug_scene =
+            MeshScene::new_identity_debug(&depth_debug_near_first_mesh, width, height);
         let mut renderer = Self {
             target,
             stats: FrameStats::default(),
@@ -527,6 +600,9 @@ impl Renderer {
             clip_debug_enabled: false,
             coverage_debug_enabled: false,
             interpolation_debug_enabled: false,
+            depth_debug_enabled: false,
+            depth_order_reversed: false,
+            depth_debug_mode: DepthDebugMode::Off,
             mesh,
             draw_item,
             mesh_scene,
@@ -536,6 +612,9 @@ impl Renderer {
             coverage_debug_scene,
             interpolation_debug_mesh,
             interpolation_debug_scene,
+            depth_debug_near_first_mesh,
+            depth_debug_far_first_mesh,
+            depth_debug_scene,
             clipper: TriangleClipper::default(),
         };
         let draw_options = FrameDrawOptions::from_renderer(&renderer);
@@ -562,6 +641,8 @@ impl Renderer {
             MeshScene::new_identity_debug(&self.coverage_debug_mesh, width, height);
         let replacement_interpolation_debug_scene =
             MeshScene::new_identity_debug(&self.interpolation_debug_mesh, width, height);
+        let replacement_depth_debug_scene =
+            MeshScene::new_identity_debug(&self.depth_debug_near_first_mesh, width, height);
         let (mesh, clip_vertices, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (
                 &self.mesh,
@@ -585,6 +666,15 @@ impl Renderer {
                     .as_slice(),
                 INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
             ),
+            ActiveScene::Depth => (
+                if self.depth_order_reversed {
+                    &self.depth_debug_far_first_mesh
+                } else {
+                    &self.depth_debug_near_first_mesh
+                },
+                replacement_depth_debug_scene.clip_vertices.as_slice(),
+                DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
         };
         let draw_options = FrameDrawOptions::from_renderer(self);
         draw_frame(
@@ -600,6 +690,7 @@ impl Renderer {
         self.clip_debug_scene = replacement_clip_debug_scene;
         self.coverage_debug_scene = replacement_coverage_debug_scene;
         self.interpolation_debug_scene = replacement_interpolation_debug_scene;
+        self.depth_debug_scene = replacement_depth_debug_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
@@ -635,6 +726,11 @@ impl Renderer {
                 self.target.width(),
                 self.target.height(),
             ),
+            ActiveScene::Depth => self.depth_debug_scene.rebuild_identity_debug(
+                &self.depth_debug_near_first_mesh,
+                self.target.width(),
+                self.target.height(),
+            ),
         }
         let (mesh, scene, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX),
@@ -653,6 +749,15 @@ impl Renderer {
                 &self.interpolation_debug_scene,
                 INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
             ),
+            ActiveScene::Depth => (
+                if self.depth_order_reversed {
+                    &self.depth_debug_far_first_mesh
+                } else {
+                    &self.depth_debug_near_first_mesh
+                },
+                &self.depth_debug_scene,
+                DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
         };
         let draw_report = draw_frame(
             &mut self.target,
@@ -660,6 +765,7 @@ impl Renderer {
                 debug_lines_enabled: self.debug_lines_enabled,
                 cull_mode: self.cull_mode,
                 winding_debug_mode: self.winding_debug_mode,
+                depth_debug_mode: self.depth_debug_mode,
             },
             mesh,
             &mut self.clipper,
@@ -686,6 +792,9 @@ impl Renderer {
             max_clip_polygon_vertices: draw_report.max_clip_polygon_vertices,
             rasterized_triangles: draw_report.rasterized_triangles,
             shaded_samples: draw_report.shaded_samples,
+            depth_passed_samples: draw_report.depth_passed_samples,
+            depth_failed_samples: draw_report.depth_failed_samples,
+            invalid_depth_samples: draw_report.invalid_depth_samples,
             max_barycentric_sum_error: draw_report.max_barycentric_sum_error,
             debug_pixels: draw_report.debug_pixels,
             invalid_values: scene
@@ -718,6 +827,7 @@ impl Renderer {
         if enabled {
             self.coverage_debug_enabled = false;
             self.interpolation_debug_enabled = false;
+            self.depth_debug_enabled = false;
         }
     }
 
@@ -726,6 +836,7 @@ impl Renderer {
         if enabled {
             self.clip_debug_enabled = false;
             self.interpolation_debug_enabled = false;
+            self.depth_debug_enabled = false;
         }
     }
 
@@ -734,7 +845,25 @@ impl Renderer {
         if enabled {
             self.clip_debug_enabled = false;
             self.coverage_debug_enabled = false;
+            self.depth_debug_enabled = false;
         }
+    }
+
+    pub fn set_depth_debug_enabled(&mut self, enabled: bool) {
+        self.depth_debug_enabled = enabled;
+        if enabled {
+            self.clip_debug_enabled = false;
+            self.coverage_debug_enabled = false;
+            self.interpolation_debug_enabled = false;
+        }
+    }
+
+    pub fn set_depth_order_reversed(&mut self, reversed: bool) {
+        self.depth_order_reversed = reversed;
+    }
+
+    pub fn set_depth_debug_mode(&mut self, mode: DepthDebugMode) {
+        self.depth_debug_mode = mode;
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -802,6 +931,17 @@ impl Renderer {
                     0.0,
                     0,
                 ),
+                ActiveScene::Depth => (
+                    if self.depth_order_reversed {
+                        &self.depth_debug_far_first_mesh
+                    } else {
+                        &self.depth_debug_near_first_mesh
+                    },
+                    &self.depth_debug_scene,
+                    DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                ),
             };
         let selected_vertex = scene.traces[selected_vertex_index];
         CoordinateDebugSnapshot {
@@ -827,6 +967,9 @@ impl Renderer {
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
             interpolation_debug_enabled: self.interpolation_debug_enabled,
+            depth_debug_enabled: self.depth_debug_enabled,
+            depth_order_reversed: self.depth_order_reversed,
+            depth_debug_mode: self.depth_debug_mode,
             frame_stats: self.stats,
         }
     }
@@ -910,6 +1053,36 @@ fn interpolation_debug_fixture() -> Mesh {
         .expect("고정 barycentric RGB triangle 계약은 항상 유효해야 한다")
 }
 
+fn depth_debug_fixture(far_first: bool) -> Mesh {
+    let near = Vec4::new(1.0, 0.2, 0.15, 1.0);
+    let far = Vec4::new(0.15, 0.35, 1.0, 1.0);
+    let vertices = [
+        (Vec3::new(-0.75, 0.65, 0.25), near),
+        (Vec3::new(0.35, 0.65, 0.25), near),
+        (Vec3::new(-0.20, -0.65, 0.25), near),
+        (Vec3::new(-0.35, 0.45, 0.75), far),
+        (Vec3::new(0.75, 0.45, 0.75), far),
+        (Vec3::new(0.25, -0.75, 0.75), far),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (position, color))| {
+        mesh::Vertex::new(
+            position,
+            Vec3::Z,
+            math::Vec2::new((index % 3) as f32 * 0.5, (index / 3) as f32),
+            color,
+        )
+    })
+    .collect();
+    let indices = if far_first {
+        vec![3, 4, 5, 0, 1, 2]
+    } else {
+        vec![0, 1, 2, 3, 4, 5]
+    };
+    Mesh::new(vertices, indices).expect("고정 near/far depth fixture 계약은 항상 유효해야 한다")
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 struct FrameDrawReport {
     submitted_triangles: u32,
@@ -922,6 +1095,9 @@ struct FrameDrawReport {
     max_clip_polygon_vertices: u32,
     rasterized_triangles: u32,
     shaded_samples: u32,
+    depth_passed_samples: u32,
+    depth_failed_samples: u32,
+    invalid_depth_samples: u32,
     max_barycentric_sum_error: f32,
     debug_pixels: u32,
     invalid_values: u32,
@@ -932,6 +1108,14 @@ struct FrameDrawOptions {
     debug_lines_enabled: bool,
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
+    depth_debug_mode: DepthDebugMode,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RasterDrawOptions {
+    cull_mode: CullMode,
+    winding_debug_mode: WindingDebugMode,
+    depth_debug_mode: DepthDebugMode,
 }
 
 impl FrameDrawOptions {
@@ -940,6 +1124,15 @@ impl FrameDrawOptions {
             debug_lines_enabled: renderer.debug_lines_enabled,
             cull_mode: renderer.cull_mode,
             winding_debug_mode: renderer.winding_debug_mode,
+            depth_debug_mode: renderer.depth_debug_mode,
+        }
+    }
+
+    const fn raster(self) -> RasterDrawOptions {
+        RasterDrawOptions {
+            cull_mode: self.cull_mode,
+            winding_debug_mode: self.winding_debug_mode,
+            depth_debug_mode: self.depth_debug_mode,
         }
     }
 }
@@ -952,7 +1145,12 @@ fn draw_frame(
     clip_vertices: &[ClipVertex],
     selected_vertex_index: usize,
 ) -> FrameDrawReport {
-    target.render_gradient_checker();
+    match options.depth_debug_mode {
+        DepthDebugMode::Off => target.render_gradient_checker(),
+        DepthDebugMode::Grayscale | DepthDebugMode::Heatmap => {
+            target.clear_color(DEPTH_DEBUG_BACKGROUND);
+        }
+    }
     draw_debug_scene(
         target,
         options,
@@ -979,8 +1177,7 @@ fn draw_debug_scene(
         return draw_mesh(
             target,
             false,
-            options.cull_mode,
-            options.winding_debug_mode,
+            options.raster(),
             mesh,
             clipper,
             clip_vertices,
@@ -990,8 +1187,7 @@ fn draw_debug_scene(
         let mut report = draw_mesh(
             target,
             false,
-            options.cull_mode,
-            options.winding_debug_mode,
+            options.raster(),
             mesh,
             clipper,
             clip_vertices,
@@ -1022,15 +1218,7 @@ fn draw_debug_scene(
         ));
     }
 
-    let mut report = draw_mesh(
-        target,
-        true,
-        options.cull_mode,
-        options.winding_debug_mode,
-        mesh,
-        clipper,
-        clip_vertices,
-    );
+    let mut report = draw_mesh(target, true, options.raster(), mesh, clipper, clip_vertices);
     written = written.saturating_add(report.debug_pixels);
     if let Some(selected) = clip_vertices
         .get(selected_vertex_index)
@@ -1078,8 +1266,7 @@ fn project_inside_clip(
 fn draw_mesh(
     target: &mut RenderTarget,
     draw_enabled: bool,
-    cull_mode: CullMode,
-    winding_debug_mode: WindingDebugMode,
+    options: RasterDrawOptions,
     mesh: &Mesh,
     clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
@@ -1125,8 +1312,7 @@ fn draw_mesh(
             submit_triangle(
                 target,
                 draw_enabled,
-                cull_mode,
-                winding_debug_mode,
+                options,
                 *generated,
                 [first, second, third],
                 &mut report,
@@ -1139,13 +1325,12 @@ fn draw_mesh(
 fn submit_triangle(
     target: &mut RenderTarget,
     draw_enabled: bool,
-    cull_mode: CullMode,
-    winding_debug_mode: WindingDebugMode,
+    options: RasterDrawOptions,
     generated: [ClipVertex; 3],
     positions: [ViewportPosition; 3],
     report: &mut FrameDrawReport,
 ) {
-    let (source_orientation, order) = match classify_triangle(positions, cull_mode) {
+    let (source_orientation, order) = match classify_triangle(positions, options.cull_mode) {
         TriangleDisposition::Submit {
             source_orientation,
             order,
@@ -1182,35 +1367,66 @@ fn submit_triangle(
         }
     };
     let ordered_colors = order.map(|index| generated[index].color);
+    let ordered_depths = order.map(|index| positions[index].z_ndc);
     let facing_color = match source_orientation {
         FaceOrientation::Front => Color::rgb(72, 232, 112),
         FaceOrientation::Back => Color::rgb(255, 82, 92),
     };
     let mut max_barycentric_sum_error = 0.0_f32;
     let mut shaded_samples = 0_u32;
+    let mut depth_passed_samples = 0_u32;
+    let mut depth_failed_samples = 0_u32;
+    let mut invalid_depth_samples = 0_u32;
     let mut invalid_values = 0_u32;
     setup.rasterize(|sample| {
         let barycentric = setup.covered_barycentric(sample.edge_values);
         max_barycentric_sum_error = max_barycentric_sum_error.max(barycentric.sum_error());
+        let depth = barycentric.interpolate_f32(ordered_depths);
+        let point = ScreenPoint::new(sample.x as i32, sample.y as i32);
+        match target.test_depth(point, depth) {
+            DepthTestResult::Passed => {}
+            DepthTestResult::Failed => {
+                depth_failed_samples = depth_failed_samples.saturating_add(1);
+                return;
+            }
+            DepthTestResult::Invalid => {
+                invalid_depth_samples = invalid_depth_samples.saturating_add(1);
+                return;
+            }
+        }
         let Some(fragment) = FragmentInput::from_affine_color(barycentric, ordered_colors) else {
             invalid_values = invalid_values.saturating_add(1);
             return;
         };
-        let fill_color = match winding_debug_mode {
-            WindingDebugMode::VertexColor => debug_color(fragment.affine_color()),
-            WindingDebugMode::Facing => facing_color,
-            WindingDebugMode::Barycentric => debug_color(fragment.barycentric().debug_color()),
+        let fill_color = match options.depth_debug_mode {
+            DepthDebugMode::Off => match options.winding_debug_mode {
+                WindingDebugMode::VertexColor => debug_color(fragment.affine_color()),
+                WindingDebugMode::Facing => facing_color,
+                WindingDebugMode::Barycentric => debug_color(fragment.barycentric().debug_color()),
+            },
+            DepthDebugMode::Grayscale => depth_grayscale_color(depth),
+            DepthDebugMode::Heatmap => depth_heatmap_color(depth),
         };
-        let written = target.put_pixel(
-            ScreenPoint::new(sample.x as i32, sample.y as i32),
-            fill_color,
+        let written = target.commit_depth_and_color(point, depth, fill_color);
+        debug_assert!(
+            written,
+            "통과한 depth와 clamp된 coverage sample은 색/깊이를 함께 기록해야 한다"
         );
-        debug_assert!(written, "clamp된 coverage sample은 렌더 타깃 내부여야 한다");
+        depth_passed_samples = depth_passed_samples.saturating_add(u32::from(written));
         shaded_samples = shaded_samples.saturating_add(u32::from(written));
     });
     report.submitted_triangles = report.submitted_triangles.saturating_add(1);
     report.rasterized_triangles = report.rasterized_triangles.saturating_add(1);
     report.shaded_samples = report.shaded_samples.saturating_add(shaded_samples);
+    report.depth_passed_samples = report
+        .depth_passed_samples
+        .saturating_add(depth_passed_samples);
+    report.depth_failed_samples = report
+        .depth_failed_samples
+        .saturating_add(depth_failed_samples);
+    report.invalid_depth_samples = report
+        .invalid_depth_samples
+        .saturating_add(invalid_depth_samples);
     report.max_barycentric_sum_error = report
         .max_barycentric_sum_error
         .max(max_barycentric_sum_error);
@@ -1220,7 +1436,7 @@ fn submit_triangle(
     }
     let screen_positions = positions.map(viewport_screen_point);
     let ordered_positions = order.map(|index| screen_positions[index]);
-    let (wireframe_positions, edge_colors) = match winding_debug_mode {
+    let (wireframe_positions, edge_colors) = match options.winding_debug_mode {
         WindingDebugMode::VertexColor => {
             // 제출 geometry는 positive winding이지만, 기존 Bresenham 방향과 edge
             // 덮어쓰기 순서를 보존하기 위해 vertex-color wireframe은 원본 순서로 그린다.
@@ -1248,6 +1464,21 @@ fn debug_color(color: Vec4) -> Color {
         normalized_channel_to_u8(color.y),
         normalized_channel_to_u8(color.z),
     )
+}
+
+fn depth_grayscale_color(depth: f32) -> Color {
+    let channel = normalized_channel_to_u8(depth);
+    Color::rgb(channel, channel, channel)
+}
+
+fn depth_heatmap_color(depth: f32) -> Color {
+    let depth = depth.clamp(0.0, 1.0);
+    debug_color(Vec4::new(
+        (2.0 * depth - 1.0).max(0.0),
+        1.0 - (2.0 * depth - 1.0).abs(),
+        (1.0 - 2.0 * depth).max(0.0),
+        1.0,
+    ))
 }
 
 fn viewport_screen_point(position: ViewportPosition) -> ScreenPoint {
@@ -1312,6 +1543,17 @@ mod tests {
         ViewportPosition { x, y, z_ndc: 0.5 }
     }
 
+    const fn raster_options(
+        cull_mode: CullMode,
+        winding_debug_mode: WindingDebugMode,
+    ) -> RasterDrawOptions {
+        RasterDrawOptions {
+            cull_mode,
+            winding_debug_mode,
+            depth_debug_mode: DepthDebugMode::Off,
+        }
+    }
+
     #[test]
     fn target_has_expected_lengths_opaque_clear_and_depth_values() {
         let mut target = RenderTarget::new(3, 2).expect("3x2 target should be valid");
@@ -1329,6 +1571,64 @@ mod tests {
                 .all(|pixel| pixel == [7, 11, 13, 255])
         );
         assert!(target.depth().iter().all(|depth| *depth == f32::INFINITY));
+    }
+
+    #[test]
+    fn depth_test_uses_finite_zero_to_one_strict_less_and_epsilon_clamp() {
+        let mut target = RenderTarget::new(2, 1).unwrap();
+        let first = ScreenPoint::new(0, 0);
+        assert_eq!(target.test_depth(first, 1.0), DepthTestResult::Passed);
+        assert!(target.depth()[0].is_infinite());
+        assert!(target.commit_depth_and_color(first, 1.0, Color::rgb(1, 2, 3)));
+        assert_eq!(target.depth()[0], 1.0);
+        assert_eq!(target.test_depth(first, 1.0), DepthTestResult::Failed);
+        assert!(!target.commit_depth_and_color(first, 1.0, Color::rgb(4, 5, 6)));
+        assert_eq!(target.test_depth(first, 0.25), DepthTestResult::Passed);
+        assert!(target.commit_depth_and_color(first, 0.25, Color::rgb(7, 8, 9)));
+        assert_eq!(target.test_depth(first, 0.75), DepthTestResult::Failed);
+        assert_eq!(target.depth()[0], 0.25);
+        assert_eq!(&target.color()[..4], &[7, 8, 9, 255]);
+
+        let second = ScreenPoint::new(1, 0);
+        assert_eq!(
+            target.test_depth(second, -DEPTH_RANGE_EPSILON / 2.0),
+            DepthTestResult::Passed
+        );
+        assert!(target.commit_depth_and_color(
+            second,
+            -DEPTH_RANGE_EPSILON / 2.0,
+            Color::rgb(10, 11, 12),
+        ));
+        assert_eq!(target.depth()[1], 0.0);
+        target.clear_color(Color::rgb(1, 2, 3));
+        assert!(target.depth().iter().all(|depth| depth.is_infinite()));
+        assert_eq!(
+            target.test_depth(second, 1.0 + DEPTH_RANGE_EPSILON / 2.0),
+            DepthTestResult::Passed
+        );
+        assert!(target.commit_depth_and_color(
+            second,
+            1.0 + DEPTH_RANGE_EPSILON / 2.0,
+            Color::rgb(13, 14, 15),
+        ));
+        assert_eq!(target.depth()[1], 1.0);
+
+        let depth_before_invalid = target.depth().to_vec();
+        for (point, candidate) in [
+            (first, f32::NAN),
+            (first, f32::INFINITY),
+            (first, -2.0 * DEPTH_RANGE_EPSILON),
+            (first, 1.0 + 2.0 * DEPTH_RANGE_EPSILON),
+            (ScreenPoint::new(-1, 0), 0.5),
+            (ScreenPoint::new(2, 0), 0.5),
+        ] {
+            assert_eq!(
+                target.test_depth(point, candidate),
+                DepthTestResult::Invalid
+            );
+            assert!(!target.commit_depth_and_color(point, candidate, Color::rgb(16, 17, 18)));
+        }
+        assert_eq!(target.depth(), depth_before_invalid);
     }
 
     #[test]
@@ -1540,7 +1840,13 @@ mod tests {
             renderer
                 .depth_buffer()
                 .iter()
-                .all(|depth| *depth == f32::INFINITY)
+                .any(|depth| depth.is_finite())
+        );
+        assert!(
+            renderer
+                .depth_buffer()
+                .iter()
+                .all(|depth| { depth.is_infinite() || (0.0..=1.0).contains(depth) })
         );
         assert_eq!(renderer.framebuffer_generation(), 1);
     }
@@ -1618,11 +1924,11 @@ mod tests {
     }
 
     #[test]
-    fn chapter_eleven_double_sided_flat_coverage_matches_64_by_64_golden_hash() {
+    fn chapter_thirteen_double_sided_depth_coverage_matches_64_by_64_golden_hash() {
         let mut renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
         renderer.set_cull_mode(CullMode::None);
         renderer.update_and_render(0.0, InputSnapshot::default());
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x06f6_b714);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x833d_8997);
     }
 
     #[test]
@@ -1718,13 +2024,18 @@ mod tests {
         assert_eq!(stats.invalid_triangles, 0);
         assert_eq!(stats.rasterized_triangles, 2);
         assert_eq!(stats.shaded_samples, 32 * 32);
+        assert_eq!(stats.depth_passed_samples, 32 * 32);
+        assert_eq!(stats.depth_failed_samples, 0);
+        assert_eq!(stats.invalid_depth_samples, 0);
         assert!(stats.max_barycentric_sum_error <= 2.0 * f32::EPSILON);
         assert_eq!(stats.debug_pixels, 0);
-        assert!(
+        assert_eq!(
             renderer
                 .depth_buffer()
                 .iter()
-                .all(|depth| depth.is_infinite())
+                .filter(|depth| **depth == 0.5)
+                .count(),
+            32 * 32
         );
 
         let orange = [255, 89, 38, 255];
@@ -1794,13 +2105,25 @@ mod tests {
         assert_eq!(affine.submitted_triangles, 1);
         assert_eq!(affine.rasterized_triangles, 1);
         assert_eq!(affine.shaded_samples, 882);
+        assert_eq!(affine.depth_passed_samples, 882);
+        assert_eq!(affine.depth_failed_samples, 0);
+        assert_eq!(affine.invalid_depth_samples, 0);
         assert_eq!(affine.max_barycentric_sum_error, f32::EPSILON);
         assert_eq!(affine.debug_pixels, 0);
+        assert_eq!(
+            renderer
+                .depth_buffer()
+                .iter()
+                .filter(|depth| depth.is_finite())
+                .count(),
+            affine.shaded_samples as usize
+        );
         assert!(
             renderer
                 .depth_buffer()
                 .iter()
-                .all(|depth| depth.is_infinite())
+                .filter(|depth| depth.is_finite())
+                .all(|depth| (*depth - 0.5).abs() <= f32::EPSILON)
         );
 
         let near_red = pixel(&renderer.target, 13, 13);
@@ -1868,16 +2191,256 @@ mod tests {
     }
 
     #[test]
-    fn chapter_twelve_invalid_fragment_color_is_counted_without_writing_a_sample() {
+    fn chapter_thirteen_invalid_fragment_does_not_commit_an_invisible_occluder() {
         let mesh = interpolation_debug_fixture();
         let scene = MeshScene::new_identity_debug(&mesh, 64, 64);
-        let mut generated: [ClipVertex; 3] = scene.clip_vertices.clone().try_into().unwrap();
-        generated[1].color.x = f32::NAN;
-        let positions = [
+        let valid_generated: [ClipVertex; 3] = scene.clip_vertices.clone().try_into().unwrap();
+        let mut invalid_generated = valid_generated;
+        for vertex in &mut invalid_generated {
+            vertex.color = Vec4::new(f32::MAX, f32::MAX, f32::MAX, f32::MAX);
+        }
+        let invalid_positions = [
+            ViewportPosition {
+                x: 0.0,
+                y: 0.0,
+                z_ndc: 0.25,
+            },
+            ViewportPosition {
+                x: 0.125,
+                y: 0.0,
+                z_ndc: 0.25,
+            },
+            ViewportPosition {
+                x: 0.875,
+                y: 0.875,
+                z_ndc: 0.25,
+            },
+        ];
+        let farther_positions = invalid_positions.map(|position| ViewportPosition {
+            z_ndc: 0.75,
+            ..position
+        });
+
+        let mut near_first_target = RenderTarget::new(1, 1).unwrap();
+        near_first_target.render_gradient_checker();
+        let color_before = near_first_target.color().to_vec();
+        let depth_before = near_first_target.depth().to_vec();
+        let mut invalid_near_first = FrameDrawReport::default();
+        submit_triangle(
+            &mut near_first_target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            invalid_generated,
+            invalid_positions,
+            &mut invalid_near_first,
+        );
+        assert_eq!(invalid_near_first.submitted_triangles, 1);
+        assert_eq!(invalid_near_first.rasterized_triangles, 1);
+        assert_eq!(invalid_near_first.shaded_samples, 0);
+        assert_eq!(invalid_near_first.depth_passed_samples, 0);
+        assert_eq!(invalid_near_first.depth_failed_samples, 0);
+        assert_eq!(invalid_near_first.invalid_depth_samples, 0);
+        assert_eq!(invalid_near_first.invalid_values, 1);
+        assert_eq!(near_first_target.color(), color_before);
+        assert_eq!(near_first_target.depth(), depth_before);
+
+        let mut farther_after_invalid = FrameDrawReport::default();
+        submit_triangle(
+            &mut near_first_target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            valid_generated,
+            farther_positions,
+            &mut farther_after_invalid,
+        );
+        assert_eq!(farther_after_invalid.shaded_samples, 1);
+        assert_eq!(farther_after_invalid.depth_passed_samples, 1);
+        assert_eq!(farther_after_invalid.depth_failed_samples, 0);
+
+        let expected_color = near_first_target.color().to_vec();
+        let expected_depth = near_first_target.depth().to_vec();
+        let mut far_first_target = RenderTarget::new(1, 1).unwrap();
+        far_first_target.render_gradient_checker();
+        let mut far_first_report = FrameDrawReport::default();
+        submit_triangle(
+            &mut far_first_target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            valid_generated,
+            farther_positions,
+            &mut far_first_report,
+        );
+        submit_triangle(
+            &mut far_first_target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            invalid_generated,
+            invalid_positions,
+            &mut far_first_report,
+        );
+        assert_eq!(far_first_report.shaded_samples, 1);
+        assert_eq!(far_first_report.depth_passed_samples, 1);
+        assert_eq!(far_first_report.depth_failed_samples, 0);
+        assert_eq!(far_first_report.invalid_values, 1);
+        assert_eq!(far_first_target.color(), expected_color);
+        assert_eq!(far_first_target.depth(), expected_depth);
+    }
+
+    #[test]
+    fn chapter_thirteen_depth_is_order_independent_and_debug_views_are_deterministic() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_depth_debug_enabled(true);
+        let near_first = renderer.update_and_render(0.0, InputSnapshot::default());
+        let near_first_color = renderer.color_buffer().to_vec();
+        let near_first_depth = renderer.depth_buffer().to_vec();
+        let near_first_hash = fnv1a(&near_first_color);
+
+        renderer.set_depth_order_reversed(true);
+        let far_first = renderer.update_and_render(0.0, InputSnapshot::default());
+        let far_first_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(renderer.color_buffer(), near_first_color);
+        assert_eq!(renderer.depth_buffer(), near_first_depth);
+        assert_eq!(far_first_hash, near_first_hash);
+        assert_eq!(near_first.input_vertices, 6);
+        assert_eq!(near_first.input_triangles, 2);
+        assert_eq!(near_first.submitted_triangles, 2);
+        assert_eq!(near_first.rasterized_triangles, 2);
+        assert_eq!(near_first.invalid_depth_samples, 0);
+        assert_eq!(far_first.invalid_depth_samples, 0);
+        assert_eq!(near_first.depth_passed_samples, near_first.shaded_samples);
+        assert_eq!(far_first.depth_passed_samples, far_first.shaded_samples);
+        assert!(near_first.depth_failed_samples > 0);
+        assert_eq!(far_first.depth_failed_samples, 0);
+        assert!(far_first.depth_passed_samples > near_first.depth_passed_samples);
+
+        let base_samples = [
+            pixel(&renderer.target, 30, 25),
+            pixel(&renderer.target, 48, 25),
+            pixel(&renderer.target, 15, 20),
+            pixel(&renderer.target, 0, 0),
+        ];
+        renderer.set_depth_debug_mode(DepthDebugMode::Grayscale);
+        let grayscale = renderer.update_and_render(0.0, InputSnapshot::default());
+        let grayscale_hash = fnv1a(renderer.color_buffer());
+        let grayscale_samples = [
+            pixel(&renderer.target, 30, 25),
+            pixel(&renderer.target, 48, 25),
+            pixel(&renderer.target, 15, 20),
+            pixel(&renderer.target, 0, 0),
+        ];
+        renderer.set_depth_debug_mode(DepthDebugMode::Heatmap);
+        let heatmap = renderer.update_and_render(0.0, InputSnapshot::default());
+        let heatmap_hash = fnv1a(renderer.color_buffer());
+        let heatmap_samples = [
+            pixel(&renderer.target, 30, 25),
+            pixel(&renderer.target, 48, 25),
+            pixel(&renderer.target, 15, 20),
+            pixel(&renderer.target, 0, 0),
+        ];
+        assert_eq!(
+            grayscale.depth_passed_samples,
+            far_first.depth_passed_samples
+        );
+        assert_eq!(
+            grayscale.depth_failed_samples,
+            far_first.depth_failed_samples
+        );
+        assert_eq!(heatmap.depth_passed_samples, far_first.depth_passed_samples);
+        assert_eq!(heatmap.depth_failed_samples, far_first.depth_failed_samples);
+
+        assert_eq!(
+            (
+                near_first.depth_passed_samples,
+                near_first.depth_failed_samples,
+                far_first.depth_passed_samples,
+                near_first_hash,
+                grayscale_hash,
+                heatmap_hash,
+                base_samples,
+                grayscale_samples,
+                heatmap_samples,
+            ),
+            (
+                1_199,
+                202,
+                1_401,
+                0x373e_c577,
+                0x52eb_59c7,
+                0x5cbf_6a73,
+                [
+                    [255, 51, 38, 255],
+                    [38, 89, 255, 255],
+                    [255, 51, 38, 255],
+                    [0, 0, 220, 255],
+                ],
+                [
+                    [64, 64, 64, 255],
+                    [191, 191, 191, 255],
+                    [64, 64, 64, 255],
+                    [12, 18, 28, 255],
+                ],
+                [
+                    [0, 128, 128, 255],
+                    [128, 128, 0, 255],
+                    [0, 128, 128, 255],
+                    [12, 18, 28, 255],
+                ],
+            )
+        );
+
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert!(snapshot.depth_debug_enabled);
+        assert!(snapshot.depth_order_reversed);
+        assert_eq!(snapshot.depth_debug_mode, DepthDebugMode::Heatmap);
+        assert!(!snapshot.clip_debug_enabled);
+        assert!(!snapshot.coverage_debug_enabled);
+        assert!(!snapshot.interpolation_debug_enabled);
+        assert_eq!(snapshot.mesh_vertices, 6);
+        assert_eq!(snapshot.mesh_triangles, 2);
+        assert_eq!(snapshot.frame_stats, heatmap);
+
+        renderer.set_depth_debug_mode(DepthDebugMode::Grayscale);
+        renderer.resize(128, 64).unwrap();
+        assert_eq!(renderer.framebuffer_generation(), 1);
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.input_triangles, 2);
+        assert_eq!(resized.invalid_depth_samples, 0);
+        let resized_snapshot = renderer.coordinate_debug_snapshot();
+        assert!(resized_snapshot.depth_debug_enabled);
+        let selected = resized_snapshot.selected_viewport.unwrap();
+        assert_close(selected.x, 16.0);
+        assert_close(selected.y, 11.2);
+        assert_close(selected.z_ndc, 0.25);
+
+        renderer.set_interpolation_debug_enabled(true);
+        let interpolation = renderer.coordinate_debug_snapshot();
+        assert!(interpolation.interpolation_debug_enabled);
+        assert!(!interpolation.depth_debug_enabled);
+
+        renderer.set_depth_debug_enabled(true);
+        renderer.set_depth_order_reversed(false);
+        renderer.resize(64, 64).unwrap();
+        assert_eq!(renderer.framebuffer_generation(), 2);
+        let resized_near_first = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized_near_first.depth_passed_samples, 1_199);
+        assert_eq!(resized_near_first.depth_failed_samples, 202);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x52eb_59c7);
+    }
+
+    #[test]
+    fn chapter_thirteen_invalid_interpolated_depth_is_counted_before_shading() {
+        let mesh = interpolation_debug_fixture();
+        let scene = MeshScene::new_identity_debug(&mesh, 64, 64);
+        let generated: [ClipVertex; 3] = scene.clip_vertices.clone().try_into().unwrap();
+        let mut positions = [
             scene.diagnostic_viewport_positions[0].unwrap(),
             scene.diagnostic_viewport_positions[1].unwrap(),
             scene.diagnostic_viewport_positions[2].unwrap(),
         ];
+        for position in &mut positions {
+            position.z_ndc = 2.0;
+        }
         let mut target = RenderTarget::new(64, 64).unwrap();
         target.render_gradient_checker();
         let color_before = target.color().to_vec();
@@ -1885,8 +2448,7 @@ mod tests {
         submit_triangle(
             &mut target,
             false,
-            CullMode::None,
-            WindingDebugMode::VertexColor,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
             generated,
             positions,
             &mut report,
@@ -1894,9 +2456,12 @@ mod tests {
 
         assert_eq!(report.submitted_triangles, 1);
         assert_eq!(report.rasterized_triangles, 1);
+        assert_eq!(report.depth_passed_samples, 0);
+        assert_eq!(report.depth_failed_samples, 0);
+        assert!(report.invalid_depth_samples > 0);
         assert_eq!(report.shaded_samples, 0);
-        assert!(report.invalid_values > 0);
         assert_eq!(target.color(), color_before);
+        assert!(target.depth().iter().all(|depth| depth.is_infinite()));
     }
 
     #[test]
@@ -1982,8 +2547,7 @@ mod tests {
         let reversed_back = draw_mesh(
             &mut target,
             false,
-            CullMode::Back,
-            WindingDebugMode::VertexColor,
+            raster_options(CullMode::Back, WindingDebugMode::VertexColor),
             &reversed,
             &mut clipper,
             &reversed_scene.clip_vertices,
@@ -2001,8 +2565,7 @@ mod tests {
         let reversed_front = draw_mesh(
             &mut target,
             false,
-            CullMode::Front,
-            WindingDebugMode::VertexColor,
+            raster_options(CullMode::Front, WindingDebugMode::VertexColor),
             &reversed,
             &mut clipper,
             &reversed_scene.clip_vertices,
@@ -2044,6 +2607,28 @@ mod tests {
     }
 
     #[test]
+    fn double_sided_depth_matches_backface_culled_visible_cube_exactly() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_cull_mode(CullMode::Back);
+        let back_culled = renderer.update_and_render(0.0, InputSnapshot::default());
+        let visible_color = renderer.color_buffer().to_vec();
+        let visible_depth = renderer.depth_buffer().to_vec();
+
+        renderer.set_cull_mode(CullMode::None);
+        let double_sided = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(renderer.color_buffer(), visible_color);
+        assert_eq!(renderer.depth_buffer(), visible_depth);
+        assert_eq!(back_culled.depth_failed_samples, 0);
+        assert!(double_sided.depth_failed_samples > 0);
+        assert_eq!(
+            double_sided.depth_passed_samples,
+            double_sided.shaded_samples
+        );
+        assert_eq!(double_sided.invalid_depth_samples, 0);
+    }
+
+    #[test]
     fn facing_debug_colors_both_orientations_without_changing_geometry_counts() {
         let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
         renderer.set_cull_mode(CullMode::None);
@@ -2077,7 +2662,7 @@ mod tests {
             ),
             (facing.submitted_triangles, facing.culled_triangles)
         );
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x06f6_b714);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x833d_8997);
     }
 
     #[test]
@@ -2104,8 +2689,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::Back,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::Back, WindingDebugMode::VertexColor),
                 &empty,
                 &mut clipper,
                 &empty_scene.clip_vertices,
@@ -2127,8 +2711,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::Back,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::Back, WindingDebugMode::VertexColor),
                 &degenerate,
                 &mut clipper,
                 &degenerate_scene.clip_vertices,
@@ -2149,8 +2732,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::None,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::None, WindingDebugMode::VertexColor),
                 &degenerate,
                 &mut clipper,
                 invalid_vertices.as_slice(),
@@ -2168,8 +2750,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::None,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::None, WindingDebugMode::VertexColor),
                 &fixture_mesh,
                 &mut clipper,
                 &fixture_vertices[..2],
@@ -2184,8 +2765,7 @@ mod tests {
         submit_triangle(
             &mut target,
             true,
-            CullMode::None,
-            WindingDebugMode::VertexColor,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
             [
                 fixture_vertices[0],
                 fixture_vertices[1],
@@ -2227,8 +2807,7 @@ mod tests {
         submit_triangle(
             &mut target,
             false,
-            CullMode::None,
-            WindingDebugMode::VertexColor,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
             generated,
             [
                 viewport_point(0.0, 0.0),
@@ -2270,8 +2849,7 @@ mod tests {
             submit_triangle(
                 &mut target,
                 false,
-                CullMode::None,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::None, WindingDebugMode::VertexColor),
                 generated,
                 invalid_positions,
                 &mut report,
@@ -2292,8 +2870,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::None,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::None, WindingDebugMode::VertexColor),
                 &fixture_mesh,
                 &mut clipper,
                 &fixture_vertices,
@@ -2312,8 +2889,7 @@ mod tests {
             draw_mesh(
                 &mut target,
                 true,
-                CullMode::None,
-                WindingDebugMode::VertexColor,
+                raster_options(CullMode::None, WindingDebugMode::VertexColor),
                 &fixture_mesh,
                 &mut clipper,
                 &fixture_vertices,

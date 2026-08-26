@@ -30,6 +30,9 @@ function rendererStats(renderer) {
     maxClipPolygonVertices: renderer.stats_max_clip_polygon_vertices(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
     shadedSamples: renderer.stats_shaded_samples(),
+    depthPassedSamples: renderer.stats_depth_passed_samples(),
+    depthFailedSamples: renderer.stats_depth_failed_samples(),
+    invalidDepthSamples: renderer.stats_invalid_depth_samples(),
     maxBarycentricSumError: renderer.stats_max_barycentric_sum_error(),
     debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
@@ -68,6 +71,9 @@ async function bootstrap() {
   const clipDebugCheckbox = document.querySelector("#clip-debug");
   const coverageDebugCheckbox = document.querySelector("#coverage-debug");
   const interpolationDebugCheckbox = document.querySelector("#interpolation-debug");
+  const depthDebugCheckbox = document.querySelector("#depth-debug");
+  const depthOrderReversedCheckbox = document.querySelector("#depth-order-reversed");
+  const depthDebugModeSelect = document.querySelector("#depth-debug-mode");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -98,6 +104,8 @@ async function bootstrap() {
       "S=256 incremental edge · pixel center · top-left (Rust)";
     document.querySelector("#interpolation-algorithm").textContent =
       "edge / area barycentric · affine color (Rust)";
+    document.querySelector("#depth-algorithm").textContent =
+      "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
@@ -164,6 +172,7 @@ async function bootstrap() {
     if (enabled) {
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
     }
   };
 
@@ -173,6 +182,7 @@ async function bootstrap() {
     if (enabled) {
       clipDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
     }
   };
 
@@ -182,7 +192,28 @@ async function bootstrap() {
     if (enabled) {
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
     }
+  };
+
+  const setDepthDebugEnabled = (enabled) => {
+    renderer.set_depth_debug_enabled(enabled);
+    depthDebugCheckbox.checked = enabled;
+    if (enabled) {
+      clipDebugCheckbox.checked = false;
+      coverageDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
+    }
+  };
+
+  const setDepthOrderReversed = (reversed) => {
+    renderer.set_depth_order_reversed(reversed);
+    depthOrderReversedCheckbox.checked = reversed;
+  };
+
+  const setDepthDebugMode = (mode) => {
+    renderer.set_depth_debug_mode(mode);
+    depthDebugModeSelect.value = String(mode);
   };
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
@@ -193,6 +224,9 @@ async function bootstrap() {
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
   setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
+  setDepthDebugEnabled(depthDebugCheckbox.checked);
+  setDepthOrderReversed(depthOrderReversedCheckbox.checked);
+  setDepthDebugMode(Number(depthDebugModeSelect.value));
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -216,6 +250,18 @@ async function bootstrap() {
   });
   interpolationDebugCheckbox.addEventListener("change", () => {
     setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  depthDebugCheckbox.addEventListener("change", () => {
+    setDepthDebugEnabled(depthDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  depthOrderReversedCheckbox.addEventListener("change", () => {
+    setDepthOrderReversed(depthOrderReversedCheckbox.checked);
+    renderFrame(0);
+  });
+  depthDebugModeSelect.addEventListener("change", () => {
+    setDepthDebugMode(Number(depthDebugModeSelect.value));
     renderFrame(0);
   });
 
@@ -271,6 +317,9 @@ async function bootstrap() {
     clipDebugEnabled: clipDebugCheckbox.checked,
     coverageDebugEnabled: coverageDebugCheckbox.checked,
     interpolationDebugEnabled: interpolationDebugCheckbox.checked,
+    depthDebugEnabled: depthDebugCheckbox.checked,
+    depthOrderReversed: depthOrderReversedCheckbox.checked,
+    depthDebugMode: Number(depthDebugModeSelect.value),
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -299,6 +348,9 @@ async function bootstrap() {
         setClipDebugEnabled,
         setCoverageDebugEnabled,
         setInterpolationDebugEnabled,
+        setDepthDebugEnabled,
+        setDepthOrderReversed,
+        setDepthDebugMode,
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },

@@ -34,6 +34,9 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#clip-debug").checked = ${JSON.stringify(initialControls.clipDebugEnabled ?? false)};
           document.querySelector("#coverage-debug").checked = ${JSON.stringify(initialControls.coverageDebugEnabled ?? false)};
           document.querySelector("#interpolation-debug").checked = ${JSON.stringify(initialControls.interpolationDebugEnabled ?? false)};
+          document.querySelector("#depth-debug").checked = ${JSON.stringify(initialControls.depthDebugEnabled ?? false)};
+          document.querySelector("#depth-order-reversed").checked = ${JSON.stringify(initialControls.depthOrderReversed ?? false)};
+          document.querySelector("#depth-debug-mode").value = ${JSON.stringify(String(initialControls.depthDebugMode ?? 0))};
         </script>`;
         await route.fulfill({
           response,
@@ -121,6 +124,9 @@ test("@smoke smoke_boot: Wasm RGBA8가 Canvas 2D에 표시된다", async ({ page
     invalidValues: 0,
   });
   expect(initial.stats.maxBarycentricSumError).toBeLessThanOrEqual(2 * Math.fround(2 ** -23));
+  expect(initial.stats.depthPassedSamples).toBe(initial.stats.shadedSamples);
+  expect(initial.stats.depthFailedSamples).toBe(0);
+  expect(initial.stats.invalidDepthSamples).toBe(0);
   expect(initial.stats.debugPixels).toBeGreaterThan(0);
 
   const afterAdvance = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
@@ -261,9 +267,9 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 단색 coverage와 wireframe�
     degenerateTriangles: 0,
     invalidTriangles: 0,
     rasterizedTriangles: 12,
-    shadedSamples: 45916,
+    shadedSamples: 27680,
   });
-  expect(initial.pixelHash).toBe("11e3e993");
+  expect(initial.pixelHash).toBe("03b51a08");
   const projectionColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     const expected = [
@@ -395,7 +401,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "clip → fan → divide/viewport → edge/top-left → barycentric/affine color · 선택 정점 흰색(X-ray)",
+    "clip → fan → divide/viewport → edge/top-left → barycentric → affine z_ndc → strict depth < → color · 선택 정점 흰색(X-ray)",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -428,10 +434,10 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     degenerateTriangles: 0,
     invalidTriangles: 0,
     rasterizedTriangles: 12,
-    shadedSamples: 45916,
+    shadedSamples: 27680,
   });
-  expect(doubleSided.snapshot.pixelHash).toBe("11e3e993");
-  expect(doubleSided.differingPixels).toBe(18418);
+  expect(doubleSided.snapshot.pixelHash).toBe("03b51a08");
+  expect(doubleSided.differingPixels).toBe(1283);
   expect(doubleSided.maxChannelDifference).toBe(215);
 
   await page.locator("#winding-debug").check();
@@ -456,9 +462,9 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     submittedTriangles: 12,
     culledTriangles: 0,
     rasterizedTriangles: 12,
-    shadedSamples: 45916,
+    shadedSamples: 27680,
   });
-  expect(facing.facingColorCounts).toEqual([4786, 18414]);
+  expect(facing.facingColorCounts).toEqual([21920, 1280]);
 
   await page.locator("#cull-mode").selectOption("2");
   const frontCulled = await page.evaluate(() => window.__softRasterizer.snapshot());
@@ -561,7 +567,7 @@ test("triangle_pipeline: homogeneous clipping을 divide 전에 적용한다", as
     generatedTriangles: 12,
     maxClipPolygonVertices: 3,
   });
-  expect(cube.pixelHash).toBe("11e3e993");
+  expect(cube.pixelHash).toBe("03b51a08");
   expect(cube.pixelHash).not.toBe(clipped.pixelHash);
 
   await page.locator("#clip-debug").check();
@@ -807,6 +813,169 @@ test("triangle_pipeline: barycentric 좌표로 R/G/B 정점 색을 affine 보간
   });
   expect(browserLog.errors).toEqual([]);
   recordEvidence(testInfo, barycentric, 0, browserLog, screenshotPath, { sampleColors });
+});
+
+test("triangle_pipeline: strict depth가 제출 순서와 무관한 가려짐과 debug view를 만든다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "triangle_pipeline" },
+    { type: "steps", description: "24" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    windingDebugMode: 0,
+    depthDebugEnabled: true,
+    depthOrderReversed: false,
+    depthDebugMode: 0,
+  });
+  const nearFirst = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(false);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(nearFirst).toMatchObject({
+    depthDebugEnabled: true,
+    depthOrderReversed: false,
+    depthDebugMode: 0,
+  });
+  expect(nearFirst.stats).toMatchObject({
+    inputVertices: 6,
+    inputTriangles: 2,
+    transformedVertices: 6,
+    submittedTriangles: 2,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+    fullyClippedTriangles: 0,
+    clipInvalidTriangles: 0,
+    generatedTriangles: 2,
+    maxClipPolygonVertices: 3,
+    rasterizedTriangles: 2,
+    invalidDepthSamples: 0,
+    debugPixels: 0,
+    invalidValues: 0,
+  });
+
+  const farFirst = await page.evaluate(() => {
+    window.__softRasterizer.setDepthOrderReversed(true);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(farFirst.depthOrderReversed).toBe(true);
+  expect(farFirst.pixelHash).toBe(nearFirst.pixelHash);
+  expect(farFirst.stats.depthFailedSamples).toBe(0);
+  expect(farFirst.stats.depthPassedSamples).toBeGreaterThan(
+    nearFirst.stats.depthPassedSamples,
+  );
+
+  const canvasSamples = async () =>
+    page.locator("#framebuffer").evaluate((canvas) => {
+      const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      const pixel = (x, y) =>
+        Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
+      return {
+        overlapNear: pixel(450, 211),
+        farOnly: pixel(720, 211),
+        nearOnly: pixel(225, 169),
+        infinityBackground: pixel(0, 0),
+      };
+    });
+  const baseSamples = await canvasSamples();
+
+  const grayscale = await page.evaluate(() => {
+    window.__softRasterizer.setDepthDebugMode(1);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  const grayscaleSamples = await canvasSamples();
+  const heatmap = await page.evaluate(() => {
+    window.__softRasterizer.setDepthDebugMode(2);
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  const heatmapSamples = await canvasSamples();
+  for (const debugSnapshot of [grayscale, heatmap]) {
+    expect(debugSnapshot.stats).toMatchObject({
+      submittedTriangles: farFirst.stats.submittedTriangles,
+      rasterizedTriangles: farFirst.stats.rasterizedTriangles,
+      shadedSamples: farFirst.stats.shadedSamples,
+      depthPassedSamples: farFirst.stats.depthPassedSamples,
+      depthFailedSamples: farFirst.stats.depthFailedSamples,
+      invalidDepthSamples: 0,
+    });
+  }
+
+  expect({
+    nearFirstDepth: [
+      nearFirst.stats.depthPassedSamples,
+      nearFirst.stats.depthFailedSamples,
+      nearFirst.stats.shadedSamples,
+    ],
+    farFirstDepth: [
+      farFirst.stats.depthPassedSamples,
+      farFirst.stats.depthFailedSamples,
+      farFirst.stats.shadedSamples,
+    ],
+    hashes: [nearFirst.pixelHash, grayscale.pixelHash, heatmap.pixelHash],
+    baseSamples,
+    grayscaleSamples,
+    heatmapSamples,
+  }).toEqual({
+    nearFirstDepth: [151992, 26736, 151992],
+    farFirstDepth: [178728, 0, 178728],
+    hashes: ["4dea536c", "b687761d", "0d9a6422"],
+    baseSamples: {
+      overlapNear: [255, 51, 38, 255],
+      farOnly: [38, 89, 255, 255],
+      nearOnly: [255, 51, 38, 255],
+      infinityBackground: [0, 0, 220, 255],
+    },
+    grayscaleSamples: {
+      overlapNear: [64, 64, 64, 255],
+      farOnly: [191, 191, 191, 255],
+      nearOnly: [64, 64, 64, 255],
+      infinityBackground: [12, 18, 28, 255],
+    },
+    heatmapSamples: {
+      overlapNear: [0, 128, 128, 255],
+      farOnly: [128, 128, 0, 255],
+      nearOnly: [0, 128, 128, 255],
+      infinityBackground: [12, 18, 28, 255],
+    },
+  });
+
+  await page.locator("#depth-debug-mode").selectOption("1");
+  const restoredGrayscale = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restoredGrayscale.depthDebugMode).toBe(1);
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "depth overlap fixture · identity M/V/P vertex stage · viewport aspect 1.778",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "near/far overlap triangle mesh · vertices 6 · indices 6 · triangles 2 · material 0 · far-first submission",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "strict < · clear +infinity · debug grayscale",
+  );
+  await expect(page.locator("#depth-algorithm")).toHaveText(
+    "affine z_ndc · strict < · +infinity clear (Rust)",
+  );
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter13-depth-grayscale.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter13-depth-grayscale", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restoredGrayscale, 0, browserLog, screenshotPath, {
+    orderIndependentColorHashes: [nearFirst.pixelHash, farFirst.pixelHash],
+    baseSamples,
+    grayscaleSamples,
+    heatmapSamples,
+  });
 });
 
 test("wasm_boundary: 프레임 호출과 단계 시간이 해상도에 비례하지 않는다", async ({
