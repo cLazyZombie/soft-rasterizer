@@ -1,7 +1,7 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 22장까지 homogeneous clipping 뒤 scalar mesh pipeline, linear texture sampling,
-//! Blinn-Phong 조명, OBJ와 opaque/mask/blend queue를 조립한다.
+//! 23장까지 homogeneous clipping 뒤 scalar mesh pipeline, linear texture/mipmap sampling,
+//! Blinn-Phong 조명, OBJ, alpha queue와 2x SSAA resolve를 조립한다.
 
 pub mod camera;
 pub mod camera_control;
@@ -103,6 +103,29 @@ impl AlphaMode {
 pub enum BlendColorSpace {
     Linear,
     EncodedWrongWay,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum QualityMode {
+    #[default]
+    NoAa,
+    Ssaa2x,
+}
+
+impl QualityMode {
+    pub const fn render_scale(self) -> usize {
+        match self {
+            Self::NoAa => 1,
+            Self::Ssaa2x => 2,
+        }
+    }
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NoAa => "no AA",
+            Self::Ssaa2x => "2x SSAA",
+        }
+    }
 }
 
 /// Straight-alpha source-over를 linear RGB에서 계산한다. 교육용 framebuffer는
@@ -217,6 +240,45 @@ impl RenderTarget {
             pixel.copy_from_slice(&color.rgba());
         }
         self.depth.fill(f32::INFINITY);
+    }
+
+    pub fn resolve_ssaa_2x_from(&mut self, source: &Self) -> bool {
+        if source.width != self.width.saturating_mul(2)
+            || source.height != self.height.saturating_mul(2)
+        {
+            return false;
+        }
+        for y in 0..self.height {
+            for x in 0..self.width {
+                let mut linear = Vec4::ZERO;
+                let mut resolved_depth = f32::INFINITY;
+                for offset_y in 0..2 {
+                    for offset_x in 0..2 {
+                        let source_index = (2 * y + offset_y) * source.width + 2 * x + offset_x;
+                        let byte_index = 4 * source_index;
+                        linear = linear
+                            + srgb_decode_rgba(Vec4::new(
+                                f32::from(source.color[byte_index]) / 255.0,
+                                f32::from(source.color[byte_index + 1]) / 255.0,
+                                f32::from(source.color[byte_index + 2]) / 255.0,
+                                1.0,
+                            ));
+                        resolved_depth = resolved_depth.min(source.depth[source_index]);
+                    }
+                }
+                let encoded = srgb_encode_rgba(linear / 4.0);
+                let destination_index = y * self.width + x;
+                let byte_index = 4 * destination_index;
+                self.color[byte_index..byte_index + 4].copy_from_slice(&[
+                    normalized_channel_to_u8(encoded.x),
+                    normalized_channel_to_u8(encoded.y),
+                    normalized_channel_to_u8(encoded.z),
+                    255,
+                ]);
+                self.depth[destination_index] = resolved_depth;
+            }
+        }
+        true
     }
 
     fn pixel_index(&self, point: ScreenPoint) -> Option<usize> {
@@ -497,6 +559,12 @@ pub struct FrameStats {
     pub active_texture_id: u32,
     pub texture_samples: u32,
     pub lighting_samples: u32,
+    pub render_scale: u32,
+    pub resolved_pixels: u32,
+    pub mip_samples: u32,
+    pub min_mip_level: u32,
+    pub max_mip_level: u32,
+    pub invalid_lod_samples: u32,
 }
 
 impl FrameStats {
@@ -526,6 +594,10 @@ impl FrameStats {
                 == self
                     .depth_written_samples
                     .saturating_add(self.blended_samples)
+            && self.mip_samples <= self.interpolated_inv_w_samples
+            && self.invalid_lod_samples <= self.mip_samples
+            && ((self.mip_samples == 0 && self.min_mip_level == 0 && self.max_mip_level == 0)
+                || (self.mip_samples > 0 && self.min_mip_level <= self.max_mip_level))
     }
 }
 
@@ -633,6 +705,7 @@ pub struct TextureAssetStatus {
     pub active_texture_id: TextureId,
     pub active_width: usize,
     pub active_height: usize,
+    pub mip_levels: usize,
     pub successful_uploads: u32,
     pub failed_uploads: u32,
 }
@@ -1043,6 +1116,10 @@ fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mu
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
+    supersample_target: Option<RenderTarget>,
+    quality_mode: QualityMode,
+    mipmap_enabled: bool,
+    mip_debug_enabled: bool,
     stats: FrameStats,
     framebuffer_generation: u32,
     debug_lines_enabled: bool,
@@ -1176,6 +1253,10 @@ impl Renderer {
         let transparency_cutout_texture = transparency_cutout_texture();
         let mut renderer = Self {
             target,
+            supersample_target: None,
+            quality_mode: QualityMode::NoAa,
+            mipmap_enabled: false,
+            mip_debug_enabled: false,
             stats: FrameStats::default(),
             framebuffer_generation: 0,
             debug_lines_enabled: false,
@@ -1237,6 +1318,8 @@ impl Renderer {
             camera_world: renderer.mesh_scene.camera_world,
             sort_transparent: renderer.transparent_sort_enabled,
             blend_color_space: renderer.blend_color_space,
+            mipmap_enabled: renderer.mipmap_enabled,
+            mip_debug_enabled: renderer.mip_debug_enabled,
         };
         draw_frame(
             &mut renderer.target,
@@ -1259,6 +1342,17 @@ impl Renderer {
             return Ok(());
         }
         let mut replacement = RenderTarget::new(width, height)?;
+        let scale = self.quality_mode.render_scale();
+        let render_width = width
+            .checked_mul(scale)
+            .ok_or(RenderTargetError::DimensionOverflow)?;
+        let render_height = height
+            .checked_mul(scale)
+            .ok_or(RenderTargetError::DimensionOverflow)?;
+        let mut replacement_supersample = match self.quality_mode {
+            QualityMode::NoAa => None,
+            QualityMode::Ssaa2x => Some(RenderTarget::new(render_width, render_height)?),
+        };
         let camera_pose = self.camera_controller.pose();
         let mut replacement_scene = MeshScene::with_capacity(&self.mesh);
         replacement_scene.rebuild_cube_with_camera(
@@ -1266,25 +1360,43 @@ impl Renderer {
             self.draw_item.model,
             camera_pose.eye,
             camera_pose.target,
-            width,
-            height,
+            render_width,
+            render_height,
         );
         let replacement_clip_debug_scene =
-            MeshScene::new_identity_debug(&self.clip_debug_mesh, width, height);
+            MeshScene::new_identity_debug(&self.clip_debug_mesh, render_width, render_height);
         let replacement_coverage_debug_scene =
-            MeshScene::new_identity_debug(&self.coverage_debug_mesh, width, height);
-        let replacement_interpolation_debug_scene =
-            MeshScene::new_identity_debug(&self.interpolation_debug_mesh, width, height);
-        let replacement_perspective_debug_scene =
-            MeshScene::new_perspective_debug(&self.perspective_debug_mesh, width, height);
-        let replacement_depth_debug_scene =
-            MeshScene::new_identity_debug(&self.depth_debug_near_first_mesh, width, height);
-        let replacement_transparency_opaque_scene =
-            MeshScene::new_identity_debug(&self.transparency_opaque_mesh, width, height);
-        let replacement_transparency_cutout_scene =
-            MeshScene::new_identity_debug(&self.transparency_cutout_mesh, width, height);
-        let replacement_transparency_blend_scene =
-            MeshScene::new_identity_debug(&self.transparency_blend_mesh, width, height);
+            MeshScene::new_identity_debug(&self.coverage_debug_mesh, render_width, render_height);
+        let replacement_interpolation_debug_scene = MeshScene::new_identity_debug(
+            &self.interpolation_debug_mesh,
+            render_width,
+            render_height,
+        );
+        let replacement_perspective_debug_scene = MeshScene::new_perspective_debug(
+            &self.perspective_debug_mesh,
+            render_width,
+            render_height,
+        );
+        let replacement_depth_debug_scene = MeshScene::new_identity_debug(
+            &self.depth_debug_near_first_mesh,
+            render_width,
+            render_height,
+        );
+        let replacement_transparency_opaque_scene = MeshScene::new_identity_debug(
+            &self.transparency_opaque_mesh,
+            render_width,
+            render_height,
+        );
+        let replacement_transparency_cutout_scene = MeshScene::new_identity_debug(
+            &self.transparency_cutout_mesh,
+            render_width,
+            render_height,
+        );
+        let replacement_transparency_blend_scene = MeshScene::new_identity_debug(
+            &self.transparency_blend_mesh,
+            render_width,
+            render_height,
+        );
         let (mesh, clip_vertices, selected_vertex_index) = match self.active_scene() {
             ActiveScene::Cube => (
                 &self.mesh,
@@ -1366,16 +1478,19 @@ impl Renderer {
             },
             sort_transparent: self.transparent_sort_enabled,
             blend_color_space: self.blend_color_space,
+            mipmap_enabled: self.mipmap_enabled,
+            mip_debug_enabled: self.mip_debug_enabled,
         };
+        let render_target = replacement_supersample.as_mut().unwrap_or(&mut replacement);
         if self.texture_debug_enabled {
             let texture = self
                 .textures
                 .get(self.active_texture_id)
                 .expect("active texture ID는 저장소에 존재해야 한다");
-            replacement.render_texture_nearest(texture);
+            render_target.render_texture_nearest(texture);
         } else if self.transparency_debug_enabled {
             draw_transparency_fixture(
-                &mut replacement,
+                render_target,
                 TransparencyFixture {
                     opaque_mesh: &self.transparency_opaque_mesh,
                     opaque_vertices: &replacement_transparency_opaque_scene.clip_vertices,
@@ -1393,7 +1508,7 @@ impl Renderer {
             );
         } else {
             draw_frame(
-                &mut replacement,
+                render_target,
                 draw_options,
                 mesh,
                 &mut self.clipper,
@@ -1402,7 +1517,11 @@ impl Renderer {
                 selected_vertex_index,
             );
         }
+        if let Some(source) = replacement_supersample.as_ref() {
+            assert!(replacement.resolve_ssaa_2x_from(source));
+        }
         self.target = replacement;
+        self.supersample_target = replacement_supersample;
         self.mesh_scene = replacement_scene;
         self.clip_debug_scene = replacement_clip_debug_scene;
         self.coverage_debug_scene = replacement_coverage_debug_scene;
@@ -1430,6 +1549,12 @@ impl Renderer {
         } else {
             rotation_y
         };
+        let (render_width, render_height) = self
+            .supersample_target
+            .as_ref()
+            .map_or((self.target.width(), self.target.height()), |target| {
+                (target.width(), target.height())
+            });
         if !self.texture_debug_enabled {
             match self.active_scene() {
                 ActiveScene::Cube => self.mesh_scene.rebuild_cube_with_camera(
@@ -1437,51 +1562,51 @@ impl Renderer {
                     self.draw_item.model,
                     camera_pose.eye,
                     camera_pose.target,
-                    self.target.width(),
-                    self.target.height(),
+                    render_width,
+                    render_height,
                 ),
                 ActiveScene::Clipping => self.clip_debug_scene.rebuild_identity_debug(
                     &self.clip_debug_mesh,
-                    self.target.width(),
-                    self.target.height(),
+                    render_width,
+                    render_height,
                 ),
                 ActiveScene::Coverage => self.coverage_debug_scene.rebuild_identity_debug(
                     &self.coverage_debug_mesh,
-                    self.target.width(),
-                    self.target.height(),
+                    render_width,
+                    render_height,
                 ),
                 ActiveScene::Interpolation => {
                     self.interpolation_debug_scene.rebuild_identity_debug(
                         &self.interpolation_debug_mesh,
-                        self.target.width(),
-                        self.target.height(),
+                        render_width,
+                        render_height,
                     )
                 }
                 ActiveScene::Perspective => self.perspective_debug_scene.rebuild_perspective_debug(
                     &self.perspective_debug_mesh,
-                    self.target.width(),
-                    self.target.height(),
+                    render_width,
+                    render_height,
                 ),
                 ActiveScene::Depth => self.depth_debug_scene.rebuild_identity_debug(
                     &self.depth_debug_near_first_mesh,
-                    self.target.width(),
-                    self.target.height(),
+                    render_width,
+                    render_height,
                 ),
                 ActiveScene::Transparency => {
                     self.transparency_opaque_scene.rebuild_identity_debug(
                         &self.transparency_opaque_mesh,
-                        self.target.width(),
-                        self.target.height(),
+                        render_width,
+                        render_height,
                     );
                     self.transparency_cutout_scene.rebuild_identity_debug(
                         &self.transparency_cutout_mesh,
-                        self.target.width(),
-                        self.target.height(),
+                        render_width,
+                        render_height,
                     );
                     self.transparency_blend_scene.rebuild_identity_debug(
                         &self.transparency_blend_mesh,
-                        self.target.width(),
-                        self.target.height(),
+                        render_width,
+                        render_height,
                     );
                 }
             }
@@ -1527,6 +1652,8 @@ impl Renderer {
                 0,
             ),
         };
+        let active_scene = self.active_scene();
+        let render_target = self.supersample_target.as_mut().unwrap_or(&mut self.target);
         let (draw_report, texture_debug_pixels) = if self.texture_debug_enabled {
             let texture = self
                 .textures
@@ -1534,14 +1661,14 @@ impl Renderer {
                 .expect("active texture ID는 저장소에 존재해야 한다");
             (
                 FrameDrawReport::default(),
-                self.target.render_texture_nearest(texture),
+                render_target.render_texture_nearest(texture),
             )
         } else if self.transparency_debug_enabled {
             let material = *material_for_id(&self.materials, self.draw_item.material_id)
                 .expect("DrawItem material ID는 저장소에 존재해야 한다");
             (
                 draw_transparency_fixture(
-                    &mut self.target,
+                    render_target,
                     TransparencyFixture {
                         opaque_mesh: &self.transparency_opaque_mesh,
                         opaque_vertices: &self.transparency_opaque_scene.clip_vertices,
@@ -1562,7 +1689,7 @@ impl Renderer {
         } else {
             let cube_material = *material_for_id(&self.materials, self.draw_item.material_id)
                 .expect("DrawItem material ID는 저장소에 존재해야 한다");
-            let material = if matches!(self.active_scene(), ActiveScene::Cube) {
+            let material = if matches!(active_scene, ActiveScene::Cube) {
                 cube_material
             } else {
                 Material {
@@ -1570,7 +1697,7 @@ impl Renderer {
                     ..Material::default()
                 }
             };
-            let sampled_texture = if matches!(self.active_scene(), ActiveScene::Cube) {
+            let sampled_texture = if matches!(active_scene, ActiveScene::Cube) {
                 material.base_color_texture.map(|texture_id| {
                     (
                         self.textures
@@ -1584,7 +1711,7 @@ impl Renderer {
             };
             (
                 draw_frame(
-                    &mut self.target,
+                    render_target,
                     FrameDrawOptions {
                         debug_lines_enabled: self.debug_lines_enabled,
                         pipeline_state: self.pipeline_state,
@@ -1595,6 +1722,8 @@ impl Renderer {
                         camera_world: scene.camera_world,
                         sort_transparent: self.transparent_sort_enabled,
                         blend_color_space: self.blend_color_space,
+                        mipmap_enabled: self.mipmap_enabled,
+                        mip_debug_enabled: self.mip_debug_enabled,
                     },
                     mesh,
                     &mut self.clipper,
@@ -1605,6 +1734,9 @@ impl Renderer {
                 0,
             )
         };
+        if let Some(source) = self.supersample_target.as_ref() {
+            assert!(self.target.resolve_ssaa_2x_from(source));
+        }
         let active_vertex_count = if self.texture_debug_enabled {
             0
         } else if self.transparency_debug_enabled {
@@ -1683,6 +1815,17 @@ impl Renderer {
             active_texture_id: self.active_texture_id.0,
             texture_samples: draw_report.texture_samples,
             lighting_samples: draw_report.lighting_samples,
+            render_scale: self.quality_mode.render_scale() as u32,
+            resolved_pixels: if self.quality_mode == QualityMode::Ssaa2x {
+                u32::try_from(self.target.width() * self.target.height())
+                    .expect("논리 target pixel 수는 u32 안에 들어가야 한다")
+            } else {
+                0
+            },
+            mip_samples: draw_report.mip_samples,
+            min_mip_level: draw_report.min_mip_level,
+            max_mip_level: draw_report.max_mip_level,
+            invalid_lod_samples: draw_report.invalid_lod_samples,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
@@ -1693,7 +1836,11 @@ impl Renderer {
     }
 
     pub fn clear(&mut self, rgb: [u8; 3]) {
-        self.target.clear_color(Color::rgb(rgb[0], rgb[1], rgb[2]));
+        let color = Color::rgb(rgb[0], rgb[1], rgb[2]);
+        self.target.clear_color(color);
+        if let Some(target) = self.supersample_target.as_mut() {
+            target.clear_color(color);
+        }
     }
 
     pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
@@ -1747,6 +1894,7 @@ impl Renderer {
             self.interpolation_debug_enabled = false;
             self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1758,6 +1906,7 @@ impl Renderer {
             self.interpolation_debug_enabled = false;
             self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1769,6 +1918,7 @@ impl Renderer {
             self.coverage_debug_enabled = false;
             self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1780,6 +1930,7 @@ impl Renderer {
             self.coverage_debug_enabled = false;
             self.interpolation_debug_enabled = false;
             self.depth_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1795,6 +1946,7 @@ impl Renderer {
             self.coverage_debug_enabled = false;
             self.interpolation_debug_enabled = false;
             self.perspective_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1818,6 +1970,7 @@ impl Renderer {
         self.texture_debug_enabled = enabled;
         if enabled {
             self.transparency_debug_enabled = false;
+            self.mip_debug_enabled = false;
         }
     }
 
@@ -1830,6 +1983,7 @@ impl Renderer {
             self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
             self.texture_debug_enabled = false;
+            self.mip_debug_enabled = false;
             self.pipeline_state.debug_mode = PipelineDebugMode::Solid;
         }
     }
@@ -1886,6 +2040,9 @@ impl Renderer {
         let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다");
         material.base_color_texture = enabled.then_some(self.active_texture_id);
+        if !enabled {
+            self.mip_debug_enabled = false;
+        }
     }
 
     pub fn texture_sampling_enabled(&self) -> bool {
@@ -2038,6 +2195,7 @@ impl Renderer {
             active_texture_id: self.active_texture_id,
             active_width: active.width(),
             active_height: active.height(),
+            mip_levels: active.mip_level_count(),
             successful_uploads: self.texture_upload_successes,
             failed_uploads: self.texture_upload_failures,
         }
@@ -2070,14 +2228,15 @@ impl Renderer {
         };
         let camera_controller = CameraController::default();
         let camera_pose = camera_controller.pose();
+        let (render_width, render_height) = self.render_dimensions();
         let mut mesh_scene = MeshScene::with_capacity(&mesh);
         mesh_scene.rebuild_cube_with_camera(
             &mesh,
             model,
             camera_pose.eye,
             camera_pose.target,
-            self.width(),
-            self.height(),
+            render_width,
+            render_height,
         );
 
         self.mesh = mesh;
@@ -2115,12 +2274,85 @@ impl Renderer {
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.draw_item.model.rotation_radians.y = rotation_y_radians;
+        let (render_width, render_height) = self.render_dimensions();
         self.mesh_scene.rebuild_cube(
             &self.mesh,
             self.draw_item.model,
-            self.target.width(),
-            self.target.height(),
+            render_width,
+            render_height,
         );
+    }
+
+    fn render_dimensions(&self) -> (usize, usize) {
+        self.supersample_target
+            .as_ref()
+            .map_or((self.target.width(), self.target.height()), |target| {
+                (target.width(), target.height())
+            })
+    }
+
+    pub fn set_quality_mode(&mut self, mode: QualityMode) -> Result<(), RenderTargetError> {
+        if mode == self.quality_mode {
+            return Ok(());
+        }
+        let supersample_target = match mode {
+            QualityMode::NoAa => None,
+            QualityMode::Ssaa2x => {
+                let width = self
+                    .target
+                    .width()
+                    .checked_mul(2)
+                    .ok_or(RenderTargetError::DimensionOverflow)?;
+                let height = self
+                    .target
+                    .height()
+                    .checked_mul(2)
+                    .ok_or(RenderTargetError::DimensionOverflow)?;
+                Some(RenderTarget::new(width, height)?)
+            }
+        };
+        self.supersample_target = supersample_target;
+        self.quality_mode = mode;
+        self.update_and_render(0.0, InputSnapshot::default());
+        Ok(())
+    }
+
+    pub const fn quality_mode(&self) -> QualityMode {
+        self.quality_mode
+    }
+
+    pub fn render_dimensions_public(&self) -> (usize, usize) {
+        self.render_dimensions()
+    }
+
+    pub fn set_mipmap_enabled(&mut self, enabled: bool) {
+        self.mipmap_enabled = enabled;
+        if !enabled {
+            self.mip_debug_enabled = false;
+        }
+    }
+
+    pub const fn mipmap_enabled(&self) -> bool {
+        self.mipmap_enabled
+    }
+
+    pub fn set_mip_debug_enabled(&mut self, enabled: bool) {
+        self.mip_debug_enabled = enabled;
+        if enabled {
+            self.mipmap_enabled = true;
+            self.texture_debug_enabled = false;
+            self.transparency_debug_enabled = false;
+            self.clip_debug_enabled = false;
+            self.coverage_debug_enabled = false;
+            self.interpolation_debug_enabled = false;
+            self.perspective_debug_enabled = false;
+            self.depth_debug_enabled = false;
+            self.set_texture_sampling_enabled(true);
+        }
+    }
+
+    pub const fn mip_debug_enabled(&self) -> bool {
+        self.mip_debug_enabled
     }
 
     pub const fn width(&self) -> usize {
@@ -2491,6 +2723,10 @@ struct FrameDrawReport {
     invalid_values: u32,
     texture_samples: u32,
     lighting_samples: u32,
+    mip_samples: u32,
+    min_mip_level: u32,
+    max_mip_level: u32,
+    invalid_lod_samples: u32,
 }
 
 impl FrameDrawReport {
@@ -2565,6 +2801,19 @@ impl FrameDrawReport {
         self.invalid_values = self.invalid_values.saturating_add(other.invalid_values);
         self.texture_samples = self.texture_samples.saturating_add(other.texture_samples);
         self.lighting_samples = self.lighting_samples.saturating_add(other.lighting_samples);
+        if other.mip_samples > 0 {
+            if self.mip_samples == 0 {
+                self.min_mip_level = other.min_mip_level;
+                self.max_mip_level = other.max_mip_level;
+            } else {
+                self.min_mip_level = self.min_mip_level.min(other.min_mip_level);
+                self.max_mip_level = self.max_mip_level.max(other.max_mip_level);
+            }
+        }
+        self.mip_samples = self.mip_samples.saturating_add(other.mip_samples);
+        self.invalid_lod_samples = self
+            .invalid_lod_samples
+            .saturating_add(other.invalid_lod_samples);
     }
 }
 
@@ -2579,6 +2828,8 @@ struct FrameDrawOptions<'a> {
     camera_world: Vec3,
     sort_transparent: bool,
     blend_color_space: BlendColorSpace,
+    mipmap_enabled: bool,
+    mip_debug_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2611,6 +2862,8 @@ struct RasterDrawOptions<'a> {
     camera_world: Vec3,
     sort_transparent: bool,
     blend_color_space: BlendColorSpace,
+    mipmap_enabled: bool,
+    mip_debug_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -2632,6 +2885,8 @@ impl<'a> FrameDrawOptions<'a> {
             camera_world: self.camera_world,
             sort_transparent: self.sort_transparent,
             blend_color_space: self.blend_color_space,
+            mipmap_enabled: self.mipmap_enabled,
+            mip_debug_enabled: self.mip_debug_enabled,
         }
     }
 }
@@ -2836,6 +3091,8 @@ fn draw_transparency_fixture(
                 camera_world: Vec3::ZERO,
                 sort_transparent,
                 blend_color_space,
+                mipmap_enabled: false,
+                mip_debug_enabled: false,
             },
             mesh,
             clipper,
@@ -3116,6 +3373,10 @@ fn submit_triangle(
     let mut alpha_discarded_samples = 0_u32;
     let mut depth_written_samples = 0_u32;
     let mut blended_samples = 0_u32;
+    let mut mip_samples = 0_u32;
+    let mut min_mip_level = 0_u32;
+    let mut max_mip_level = 0_u32;
+    let mut invalid_lod_samples = 0_u32;
     let mut sample_counter_overflow = false;
     setup.rasterize(|sample| {
         increment_sample_counter(&mut covered_samples, &mut sample_counter_overflow);
@@ -3166,6 +3427,46 @@ fn submit_triangle(
             &mut interpolated_inv_w_samples,
             &mut sample_counter_overflow,
         );
+        let mip_selection = if options.mipmap_enabled {
+            options.sampled_texture.map(|(texture, _)| {
+                let (d_uv_dx, d_uv_dy) = observe_lod_value(
+                    setup.uv_derivatives(
+                        sample.edge_values,
+                        ordered_screen_vertices,
+                        options.pipeline_state.attribute_interpolation_mode,
+                    ),
+                    &mut invalid_lod_samples,
+                    &mut sample_counter_overflow,
+                )
+                .unwrap_or((Vec2::ZERO, Vec2::ZERO));
+                let lod = observe_lod_value(
+                    mip_lod_from_uv_derivatives(
+                        d_uv_dx,
+                        d_uv_dy,
+                        texture.width(),
+                        texture.height(),
+                    ),
+                    &mut invalid_lod_samples,
+                    &mut sample_counter_overflow,
+                )
+                .unwrap_or(0.0);
+                let level = texture
+                    .nearest_mip_level(lod)
+                    .expect("검증된 finite LOD는 nearest mip level을 가져야 한다")
+                    as u32;
+                if mip_samples == 0 {
+                    min_mip_level = level;
+                    max_mip_level = level;
+                } else {
+                    min_mip_level = min_mip_level.min(level);
+                    max_mip_level = max_mip_level.max(level);
+                }
+                increment_sample_counter(&mut mip_samples, &mut sample_counter_overflow);
+                (lod, level)
+            })
+        } else {
+            None
+        };
         let shading_normal = flat_normal.unwrap_or_else(|| fragment.normal());
         let alpha_mode = options.material.alpha_mode;
         let policy_albedo = if alpha_mode == AlphaMode::Opaque {
@@ -3174,10 +3475,14 @@ fn submit_triangle(
             if options.sampled_texture.is_some() {
                 increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
             }
-            Some(fragment_albedo_linear(fragment, options))
+            Some(fragment_albedo_linear(
+                fragment,
+                options,
+                mip_selection.map(|selection| selection.0),
+            ))
         };
         let mut solid_source_linear = None;
-        let fill_color = match options.pipeline_state.debug_mode {
+        let mut fill_color = match options.pipeline_state.debug_mode {
             PipelineDebugMode::Solid if options.uv_checker_enabled => {
                 uv_checker_color(fragment.uv())
             }
@@ -3191,7 +3496,11 @@ fn submit_triangle(
                             &mut sample_counter_overflow,
                         );
                     }
-                    fragment_albedo_linear(fragment, options)
+                    fragment_albedo_linear(
+                        fragment,
+                        options,
+                        mip_selection.map(|selection| selection.0),
+                    )
                 };
                 if options.material.shader_mode != ShaderMode::Unlit {
                     increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
@@ -3218,7 +3527,11 @@ fn submit_triangle(
                             &mut sample_counter_overflow,
                         );
                     }
-                    fragment_albedo_linear(fragment, options)
+                    fragment_albedo_linear(
+                        fragment,
+                        options,
+                        mip_selection.map(|selection| selection.0),
+                    )
                 };
                 increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
                 let terms = lighting_terms_linear(LightingInput {
@@ -3258,9 +3571,18 @@ fn submit_triangle(
                 ))
             }
             PipelineDebugMode::ColorSpaceComparison => {
-                let correct =
-                    policy_albedo.unwrap_or_else(|| fragment_albedo_linear(fragment, options));
-                let wrong = fragment_albedo_encoded_wrong_way(fragment, options);
+                let correct = policy_albedo.unwrap_or_else(|| {
+                    fragment_albedo_linear(
+                        fragment,
+                        options,
+                        mip_selection.map(|selection| selection.0),
+                    )
+                });
+                let wrong = fragment_albedo_encoded_wrong_way(
+                    fragment,
+                    options,
+                    mip_selection.map(|selection| selection.0),
+                );
                 if policy_albedo.is_none() && options.sampled_texture.is_some() {
                     increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
                 }
@@ -3284,6 +3606,10 @@ fn submit_triangle(
             }
         };
         let source_alpha = policy_albedo.map_or(1.0, |albedo| albedo.w);
+        if options.mip_debug_enabled {
+            fill_color = mip_debug_color(mip_selection.map_or(0, |selection| selection.1));
+            solid_source_linear = Some(display_color_linear(fill_color, source_alpha));
+        }
         if alpha_mode == AlphaMode::Mask && source_alpha < options.material.alpha_cutoff {
             increment_sample_counter(&mut alpha_discarded_samples, &mut sample_counter_overflow);
             return;
@@ -3384,6 +3710,25 @@ fn submit_triangle(
         lighting_samples,
         &mut report.sample_counter_overflow,
     );
+    if mip_samples > 0 {
+        if report.mip_samples == 0 {
+            report.min_mip_level = min_mip_level;
+            report.max_mip_level = max_mip_level;
+        } else {
+            report.min_mip_level = report.min_mip_level.min(min_mip_level);
+            report.max_mip_level = report.max_mip_level.max(max_mip_level);
+        }
+    }
+    add_sample_counter(
+        &mut report.mip_samples,
+        mip_samples,
+        &mut report.sample_counter_overflow,
+    );
+    add_sample_counter(
+        &mut report.invalid_lod_samples,
+        invalid_lod_samples,
+        &mut report.sample_counter_overflow,
+    );
     report.invalid_values = report.invalid_values.saturating_add(invalid_values);
     if !draw_enabled {
         return;
@@ -3436,6 +3781,17 @@ fn add_sample_counter(counter: &mut u32, amount: u32, overflow: &mut bool) {
     }
 }
 
+fn observe_lod_value<T>(
+    value: Option<T>,
+    invalid_samples: &mut u32,
+    overflow: &mut bool,
+) -> Option<T> {
+    if value.is_none() {
+        increment_sample_counter(invalid_samples, overflow);
+    }
+    value
+}
+
 fn wireframe_fragment_color(barycentric: raster::BarycentricCoordinates) -> Color {
     let edge_distance = barycentric.components().into_iter().fold(1.0_f32, f32::min);
     if edge_distance <= 0.025 {
@@ -3461,6 +3817,40 @@ fn triangle_id_color(triangle_id: u32) -> Color {
         Color::rgb(255, 112, 67),
     ];
     PALETTE[triangle_id as usize % PALETTE.len()]
+}
+
+fn mip_debug_color(level: u32) -> Color {
+    const PALETTE: [Color; 8] = [
+        Color::rgb(235, 64, 52),
+        Color::rgb(255, 159, 28),
+        Color::rgb(255, 214, 10),
+        Color::rgb(48, 209, 88),
+        Color::rgb(50, 173, 230),
+        Color::rgb(10, 132, 255),
+        Color::rgb(94, 92, 230),
+        Color::rgb(191, 90, 242),
+    ];
+    PALETTE[level as usize % PALETTE.len()]
+}
+
+fn mip_lod_from_uv_derivatives(
+    d_uv_dx: Vec2,
+    d_uv_dy: Vec2,
+    texture_width: usize,
+    texture_height: usize,
+) -> Option<f32> {
+    let rho_x = Vec2::new(
+        d_uv_dx.x * texture_width as f32,
+        d_uv_dx.y * texture_height as f32,
+    )
+    .length();
+    let rho_y = Vec2::new(
+        d_uv_dy.x * texture_width as f32,
+        d_uv_dy.y * texture_height as f32,
+    )
+    .length();
+    let lod = rho_x.max(rho_y).max(f32::EPSILON).log2().max(0.0);
+    lod.is_finite().then_some(lod)
 }
 
 fn uv_checker_color(uv: Vec2) -> Color {
@@ -3490,13 +3880,22 @@ fn modulate_color(first: Vec4, second: Vec4) -> Vec4 {
     )
 }
 
-fn fragment_albedo_linear(fragment: FragmentInput, options: RasterDrawOptions<'_>) -> Vec4 {
+fn fragment_albedo_linear(
+    fragment: FragmentInput,
+    options: RasterDrawOptions<'_>,
+    mip_lod: Option<f32>,
+) -> Vec4 {
     let texture = options
         .sampled_texture
         .map(|(texture, sampler)| {
-            sampler
-                .sample(texture, fragment.uv())
-                .expect("FragmentInput은 유한한 UV를 보장해야 한다")
+            if let Some(lod) = mip_lod {
+                sampler
+                    .sample_mip(texture, fragment.uv(), lod)
+                    .map(|sample| sample.0)
+            } else {
+                sampler.sample(texture, fragment.uv())
+            }
+            .expect("FragmentInput과 계산된 LOD는 유한해야 한다")
         })
         .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
     modulate_color(
@@ -3508,13 +3907,19 @@ fn fragment_albedo_linear(fragment: FragmentInput, options: RasterDrawOptions<'_
 fn fragment_albedo_encoded_wrong_way(
     fragment: FragmentInput,
     options: RasterDrawOptions<'_>,
+    mip_lod: Option<f32>,
 ) -> Vec4 {
     let texture = options
         .sampled_texture
         .map(|(texture, sampler)| {
-            sampler
-                .sample_encoded(texture, fragment.uv())
-                .expect("FragmentInput은 유한한 UV를 보장해야 한다")
+            if let Some(lod) = mip_lod {
+                sampler
+                    .sample_mip_encoded(texture, fragment.uv(), lod)
+                    .map(|sample| sample.0)
+            } else {
+                sampler.sample_encoded(texture, fragment.uv())
+            }
+            .expect("FragmentInput과 계산된 LOD는 유한해야 한다")
         })
         .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
     modulate_color(
@@ -3762,6 +4167,8 @@ mod tests {
                 camera_world: Vec3::ZERO,
                 sort_transparent: true,
                 blend_color_space: BlendColorSpace::Linear,
+                mipmap_enabled: false,
+                mip_debug_enabled: false,
             },
             &mesh,
             &mut clipper,
@@ -3796,6 +4203,8 @@ mod tests {
             camera_world: Vec3::ZERO,
             sort_transparent: true,
             blend_color_space: BlendColorSpace::Linear,
+            mipmap_enabled: false,
+            mip_debug_enabled: false,
         }
     }
 
@@ -5679,6 +6088,10 @@ mod tests {
             invalid_depth_samples: 3,
             interpolated_inv_w_samples: 75,
             invalid_interpolation_samples: 2,
+            mip_samples: 50,
+            min_mip_level: 1,
+            max_mip_level: 4,
+            invalid_lod_samples: 2,
             ..FrameStats::default()
         };
         assert!(valid.pipeline_relations_hold());
@@ -5709,6 +6122,23 @@ mod tests {
             },
             FrameStats {
                 blended_samples: 1,
+                ..valid
+            },
+            FrameStats {
+                mip_samples: 76,
+                ..valid
+            },
+            FrameStats {
+                invalid_lod_samples: 51,
+                ..valid
+            },
+            FrameStats {
+                mip_samples: 0,
+                ..valid
+            },
+            FrameStats {
+                min_mip_level: 5,
+                max_mip_level: 4,
                 ..valid
             },
             FrameStats {
@@ -6093,6 +6523,7 @@ mod tests {
                 active_texture_id: TextureId(0),
                 active_width: 2,
                 active_height: 2,
+                mip_levels: 2,
                 successful_uploads: 0,
                 failed_uploads: 0,
             }
@@ -6272,6 +6703,8 @@ mod tests {
                     camera_world: Vec3::ZERO,
                     sort_transparent: true,
                     blend_color_space: BlendColorSpace::Linear,
+                    mipmap_enabled: false,
+                    mip_debug_enabled: false,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -6894,6 +7327,8 @@ mod tests {
                     camera_world: Vec3::ZERO,
                     sort_transparent: true,
                     blend_color_space: BlendColorSpace::Linear,
+                    mipmap_enabled: false,
+                    mip_debug_enabled: false,
                 },
                 &mask_mesh,
                 &mut TriangleClipper::default(),
@@ -6926,6 +7361,8 @@ mod tests {
                     camera_world: Vec3::ZERO,
                     sort_transparent: true,
                     blend_color_space: BlendColorSpace::Linear,
+                    mipmap_enabled: false,
+                    mip_debug_enabled: false,
                 },
                 &blend_mesh,
                 &mut TriangleClipper::default(),
@@ -6940,5 +7377,222 @@ mod tests {
                 blend.covered_samples
             );
         }
+    }
+
+    #[test]
+    fn chapter_twenty_three_ssaa_resolve_averages_linear_color_and_preserves_solid_regions() {
+        let mut source = RenderTarget::new(4, 2).unwrap();
+        source.clear_color(Color::rgb(37, 149, 221));
+        let mut destination = RenderTarget::new(2, 1).unwrap();
+        assert!(destination.resolve_ssaa_2x_from(&source));
+        assert_eq!(destination.color(), &[37, 149, 221, 255, 37, 149, 221, 255]);
+
+        source.put_pixel(ScreenPoint::new(0, 0), Color::rgb(0, 0, 0));
+        source.put_pixel(ScreenPoint::new(1, 0), Color::rgb(255, 255, 255));
+        source.put_pixel(ScreenPoint::new(0, 1), Color::rgb(0, 0, 0));
+        source.put_pixel(ScreenPoint::new(1, 1), Color::rgb(255, 255, 255));
+        source.depth[0] = 0.8;
+        source.depth[1] = 0.2;
+        assert!(destination.resolve_ssaa_2x_from(&source));
+        assert_eq!(&destination.color()[..4], &[188, 188, 188, 255]);
+        assert_eq!(destination.depth()[0], 0.2);
+        assert!(!destination.resolve_ssaa_2x_from(&RenderTarget::new(3, 2).unwrap()));
+    }
+
+    #[test]
+    fn chapter_twenty_three_quality_mode_keeps_public_framebuffer_logical_and_costs_four_samples() {
+        let mut renderer = Renderer::new(48, 32).unwrap();
+        let no_aa = renderer.update_and_render(0.0, InputSnapshot::default());
+        let public_len = renderer.color_buffer().len();
+        renderer.set_quality_mode(QualityMode::Ssaa2x).unwrap();
+        renderer.set_quality_mode(QualityMode::Ssaa2x).unwrap();
+        renderer.clear([7, 11, 13]);
+        let ssaa = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(renderer.quality_mode(), QualityMode::Ssaa2x);
+        assert_eq!(renderer.render_dimensions_public(), (96, 64));
+        assert_eq!(renderer.color_buffer().len(), public_len);
+        assert_eq!(ssaa.render_scale, 2);
+        assert_eq!(ssaa.resolved_pixels, 48 * 32);
+        assert!(ssaa.shaded_samples >= no_aa.shaded_samples.saturating_mul(3));
+        renderer.set_quality_mode(QualityMode::NoAa).unwrap();
+        assert_eq!(renderer.render_dimensions_public(), (48, 32));
+        assert_eq!(renderer.stats().render_scale, 1);
+        assert_eq!(QualityMode::NoAa.label(), "no AA");
+        assert_eq!(QualityMode::Ssaa2x.label(), "2x SSAA");
+
+        let logical_pixels = MAX_PIXEL_COUNT / 4 + 1;
+        let mut maximum = Renderer::new(logical_pixels, 1).unwrap();
+        assert_eq!(
+            maximum.set_quality_mode(QualityMode::Ssaa2x),
+            Err(RenderTargetError::PixelLimitExceeded {
+                requested: logical_pixels * 4,
+                maximum: MAX_PIXEL_COUNT,
+            })
+        );
+        assert_eq!(maximum.quality_mode(), QualityMode::NoAa);
+    }
+
+    #[test]
+    fn chapter_twenty_three_perspective_lod_increases_as_the_rendered_quad_shrinks() {
+        let texture =
+            Texture::from_rgba8(256, 256, &vec![180; 256 * 256 * 4], TextureColorSpace::Srgb)
+                .unwrap();
+        let sampler = SamplerState::default();
+        let render = |extent| {
+            let mesh = perspective_debug_fixture(false);
+            let scene = MeshScene::new_perspective_debug(&mesh, extent, extent);
+            let mut target = RenderTarget::new(extent, extent).unwrap();
+            draw_mesh(
+                &mut target,
+                false,
+                RasterDrawOptions {
+                    pipeline_state: PipelineState {
+                        debug_mode: PipelineDebugMode::ColorSpaceComparison,
+                        ..PipelineState::default()
+                    },
+                    uv_checker_enabled: false,
+                    sampled_texture: Some((&texture, sampler)),
+                    material: Material::default(),
+                    linear_material: LinearMaterial::from_srgb(Material::default()),
+                    light: DirectionalLight::default(),
+                    camera_world: Vec3::ZERO,
+                    sort_transparent: true,
+                    blend_color_space: BlendColorSpace::Linear,
+                    mipmap_enabled: true,
+                    mip_debug_enabled: true,
+                },
+                &mesh,
+                &mut TriangleClipper::default(),
+                &scene.clip_vertices,
+            )
+        };
+        let near = render(128);
+        let far = render(32);
+        assert!(near.mip_samples > 0);
+        assert_eq!(near.invalid_lod_samples, 0);
+        assert!(far.min_mip_level >= near.min_mip_level);
+        assert!(far.max_mip_level > near.max_mip_level);
+
+        assert_eq!(
+            mip_lod_from_uv_derivatives(Vec2::new(f32::MAX, 0.0), Vec2::ZERO, usize::MAX, 1,),
+            None
+        );
+    }
+
+    #[test]
+    fn chapter_twenty_three_frame_report_absorbs_mip_ranges() {
+        let mut combined = FrameDrawReport::default();
+        combined.absorb(FrameDrawReport {
+            mip_samples: 3,
+            min_mip_level: 2,
+            max_mip_level: 4,
+            invalid_lod_samples: 1,
+            ..FrameDrawReport::default()
+        });
+        assert_eq!((combined.min_mip_level, combined.max_mip_level), (2, 4));
+        combined.absorb(FrameDrawReport {
+            mip_samples: 5,
+            min_mip_level: 1,
+            max_mip_level: 6,
+            invalid_lod_samples: 2,
+            ..FrameDrawReport::default()
+        });
+        assert_eq!(combined.mip_samples, 8);
+        assert_eq!((combined.min_mip_level, combined.max_mip_level), (1, 6));
+        assert_eq!(combined.invalid_lod_samples, 3);
+        let mut invalid_samples = 0;
+        let mut overflow = false;
+        assert_eq!(
+            observe_lod_value(Some(7_u32), &mut invalid_samples, &mut overflow),
+            Some(7)
+        );
+        assert_eq!(
+            observe_lod_value::<u32>(None, &mut invalid_samples, &mut overflow),
+            None
+        );
+        assert_eq!(invalid_samples, 1);
+        assert!(!overflow);
+    }
+
+    #[test]
+    fn chapter_twenty_three_mip_debug_overrides_all_shader_views_and_blend_source() {
+        let texture =
+            Texture::from_rgba8(256, 256, &vec![190; 256 * 256 * 4], TextureColorSpace::Srgb)
+                .unwrap();
+        let mesh = perspective_debug_fixture(false);
+        let scene = MeshScene::new_perspective_debug(&mesh, 32, 32);
+        let render = |debug_mode, alpha_mode, mip_debug_enabled| {
+            let material = Material {
+                base_color: Vec4::new(1.0, 1.0, 1.0, 0.5),
+                alpha_mode,
+                ..Material::default()
+            };
+            let mut target = RenderTarget::new(32, 32).unwrap();
+            target.clear_color(Color::rgb(0, 0, 0));
+            let report = draw_mesh(
+                &mut target,
+                false,
+                RasterDrawOptions {
+                    pipeline_state: PipelineState {
+                        debug_mode,
+                        ..PipelineState::default()
+                    },
+                    uv_checker_enabled: false,
+                    sampled_texture: Some((&texture, SamplerState::default())),
+                    material,
+                    linear_material: LinearMaterial::from_srgb(material),
+                    light: DirectionalLight::default(),
+                    camera_world: Vec3::ZERO,
+                    sort_transparent: true,
+                    blend_color_space: BlendColorSpace::Linear,
+                    mipmap_enabled: true,
+                    mip_debug_enabled,
+                },
+                &mesh,
+                &mut TriangleClipper::default(),
+                &scene.clip_vertices,
+            );
+            (target.color().to_vec(), report)
+        };
+        let (solid, solid_report) = render(PipelineDebugMode::Solid, AlphaMode::Opaque, true);
+        let (normal, normal_report) = render(PipelineDebugMode::Normal, AlphaMode::Opaque, true);
+        assert_eq!(solid, normal);
+        assert_eq!(solid_report.covered_samples, normal_report.covered_samples);
+        let (blend_debug, blend_report) =
+            render(PipelineDebugMode::Diffuse, AlphaMode::Blend, true);
+        let (blend_plain, _) = render(PipelineDebugMode::Diffuse, AlphaMode::Blend, false);
+        assert_ne!(blend_debug, blend_plain);
+        assert!(blend_report.blended_samples > 0);
+        assert!(blend_report.mip_samples > 0);
+    }
+
+    #[test]
+    fn chapter_twenty_three_mip_debug_exclusivity_is_symmetric() {
+        let mut renderer = Renderer::new(16, 16).unwrap();
+        renderer.set_mip_debug_enabled(true);
+        assert!(renderer.texture_sampling_enabled());
+        renderer.set_clip_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_coverage_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_interpolation_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_perspective_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_depth_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_transparency_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_texture_debug_enabled(true);
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_mip_debug_enabled(true);
+        renderer.set_texture_sampling_enabled(false);
+        assert!(!renderer.mip_debug_enabled());
     }
 }

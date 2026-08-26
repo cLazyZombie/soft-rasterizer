@@ -6,9 +6,23 @@ export function validateDecodedTextureSize(width, height) {
     throw new RangeError("디코딩된 texture 크기는 양의 정수여야 합니다.");
   }
   const pixelCount = width * height;
-  if (!Number.isSafeInteger(pixelCount) || pixelCount > MAX_TEXTURE_PIXELS) {
+  let mipTexelCount = 0;
+  let mipWidth = width;
+  let mipHeight = height;
+  while (true) {
+    mipTexelCount += mipWidth * mipHeight;
+    if (!Number.isSafeInteger(mipTexelCount)) {
+      break;
+    }
+    if (mipWidth === 1 && mipHeight === 1) {
+      break;
+    }
+    mipWidth = Math.ceil(mipWidth / 2);
+    mipHeight = Math.ceil(mipHeight / 2);
+  }
+  if (!Number.isSafeInteger(pixelCount) || mipTexelCount > MAX_TEXTURE_PIXELS) {
     throw new RangeError(
-      `디코딩된 texture texel 수 ${pixelCount}이 최대 ${MAX_TEXTURE_PIXELS}을 넘었습니다.`,
+      `디코딩된 texture mip texel 수 ${mipTexelCount}이 최대 ${MAX_TEXTURE_PIXELS}을 넘었습니다.`,
     );
   }
   return pixelCount;

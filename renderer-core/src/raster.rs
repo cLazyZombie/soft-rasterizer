@@ -390,6 +390,30 @@ impl ScreenVertex {
     fn color(self) -> Vec4 {
         self.color
     }
+
+    fn evaluate_uv(
+        barycentric: BarycentricCoordinates,
+        vertices: [Self; 3],
+        mode: AttributeInterpolationMode,
+    ) -> Option<Vec2> {
+        let interpolated_inv_w = barycentric.interpolate_f32(vertices.map(Self::inv_w));
+        if !interpolated_inv_w.is_finite() || interpolated_inv_w <= PERSPECTIVE_DIVISOR_EPSILON {
+            return None;
+        }
+        let inv_w = vertices.map(Self::inv_w);
+        let equal_w = inv_w[0] == inv_w[1] && inv_w[1] == inv_w[2];
+        let uv = match (mode, equal_w) {
+            (AttributeInterpolationMode::Affine, _)
+            | (AttributeInterpolationMode::PerspectiveCorrect, true) => {
+                barycentric.interpolate_vec2(vertices.map(Self::uv))
+            }
+            (AttributeInterpolationMode::PerspectiveCorrect, false) => {
+                barycentric.interpolate_vec2(vertices.map(|vertex| vertex.uv_over_w))
+                    / interpolated_inv_w
+            }
+        };
+        vec2_is_finite(uv).then_some(uv)
+    }
 }
 
 /// coverage 뒤 한 번에 복원한 fragment 속성이다.
@@ -650,6 +674,29 @@ impl TriangleSetup {
             .into_iter()
             .zip(self.edges)
             .all(|(value, edge)| value > 0 || (value == 0 && edge.inclusive))
+    }
+
+    pub(crate) fn uv_derivatives(
+        &self,
+        edge_values: [i64; 3],
+        vertices: [ScreenVertex; 3],
+        mode: AttributeInterpolationMode,
+    ) -> Option<(Vec2, Vec2)> {
+        let offset = |steps: [i64; 3]| {
+            let values = [
+                edge_values[0].checked_add(steps[0])?,
+                edge_values[1].checked_add(steps[1])?,
+                edge_values[2].checked_add(steps[2])?,
+            ];
+            Some(BarycentricCoordinates::from_inv_area(values, self.inv_area))
+        };
+        let current = BarycentricCoordinates::from_inv_area(edge_values, self.inv_area);
+        let at_x = offset(self.edges.map(|edge| edge.step_x))?;
+        let at_y = offset(self.edges.map(|edge| edge.step_y))?;
+        let uv = ScreenVertex::evaluate_uv(current, vertices, mode)?;
+        let uv_x = ScreenVertex::evaluate_uv(at_x, vertices, mode)?;
+        let uv_y = ScreenVertex::evaluate_uv(at_y, vertices, mode)?;
+        Some((uv_x - uv, uv_y - uv))
     }
 
     pub fn rasterize(&self, mut visit: impl FnMut(CoveredSample)) -> u32 {
@@ -1125,6 +1172,93 @@ mod tests {
                     valid.color,
                 ),
                 point(0.0, 0.0),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn chapter_twenty_three_uv_derivatives_cover_affine_and_invalid_rational_inputs() {
+        let setup = TriangleSetup::new(front_triangle(), 8, 8).unwrap();
+        let sample = direct_samples(&setup)[0];
+        let mut vertices = [
+            screen_vertex(
+                1.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(0.0, 0.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+            screen_vertex(
+                1.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(1.0, 0.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+            screen_vertex(
+                1.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(0.0, 1.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+        ];
+        let (d_uv_dx, d_uv_dy) = setup
+            .uv_derivatives(
+                sample.edge_values,
+                vertices,
+                AttributeInterpolationMode::Affine,
+            )
+            .unwrap();
+        assert!(vec2_is_finite(d_uv_dx));
+        assert!(vec2_is_finite(d_uv_dy));
+
+        let varying_w = [
+            screen_vertex(
+                1.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(0.0, 0.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+            screen_vertex(
+                2.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(1.0, 0.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+            screen_vertex(
+                4.0,
+                Vec3::ZERO,
+                Vec3::Z,
+                Vec2::new(0.0, 1.0),
+                Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ),
+        ];
+        let (perspective_dx, perspective_dy) = setup
+            .uv_derivatives(
+                sample.edge_values,
+                varying_w,
+                AttributeInterpolationMode::PerspectiveCorrect,
+            )
+            .unwrap();
+        assert!((perspective_dx.x - 0.195_804_21).abs() <= 1.0e-6);
+        assert!((perspective_dx.y - 0.009_324_01).abs() <= 1.0e-6);
+        assert!((perspective_dy.x - 0.034_188_04).abs() <= 1.0e-6);
+        assert!((perspective_dy.y - 0.170_940_18).abs() <= 1.0e-6);
+        assert_ne!(perspective_dx, d_uv_dx);
+        assert_ne!(perspective_dy, d_uv_dy);
+
+        for vertex in &mut vertices {
+            vertex.inv_w = 0.0;
+        }
+        assert_eq!(
+            setup.uv_derivatives(
+                sample.edge_values,
+                vertices,
+                AttributeInterpolationMode::PerspectiveCorrect,
             ),
             None
         );

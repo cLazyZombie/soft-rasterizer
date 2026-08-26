@@ -54,6 +54,12 @@ function rendererStats(renderer) {
     activeTextureId: renderer.stats_active_texture_id(),
     textureSamples: renderer.stats_texture_samples(),
     lightingSamples: renderer.stats_lighting_samples(),
+    renderScale: renderer.stats_render_scale(),
+    resolvedPixels: renderer.stats_resolved_pixels(),
+    mipSamples: renderer.stats_mip_samples(),
+    minMipLevel: renderer.stats_min_mip_level(),
+    maxMipLevel: renderer.stats_max_mip_level(),
+    invalidLodSamples: renderer.stats_invalid_lod_samples(),
   };
 }
 
@@ -116,6 +122,11 @@ async function bootstrap() {
   const transparencyDebugCheckbox = document.querySelector("#transparency-debug");
   const transparentSortCheckbox = document.querySelector("#transparent-sort");
   const blendColorSpaceSelect = document.querySelector("#blend-color-space");
+  const qualityModeSelect = document.querySelector("#quality-mode");
+  const mipmapEnabledCheckbox = document.querySelector("#mipmap-enabled");
+  const mipDebugCheckbox = document.querySelector("#mip-debug");
+  const initialMipmapEnabled = mipmapEnabledCheckbox.checked;
+  const initialMipDebugEnabled = mipDebugCheckbox.checked;
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -136,7 +147,7 @@ async function bootstrap() {
   let lastFrameMetrics = null;
   let lastInputSnapshot = new Float64Array(8);
   let coordinateDebugText = "좌표 계산 대기 중";
-  let textureStatusText = "fallback checkerboard · 2 × 2 · texture 0";
+  let textureStatusText = "fallback checkerboard · 2 × 2 · 2 mip levels · texture 0";
   let textureDecodeGeneration = 0;
   let meshStatusText = "내장 cube · mesh 0 · 24 vertices · 12 triangles";
   let meshLoadGeneration = 0;
@@ -176,6 +187,13 @@ async function bootstrap() {
       `${blendColorSpaceSelect.options[blendColorSpaceSelect.selectedIndex].text} · ` +
       `${renderer.stats_alpha_discarded_samples()} discarded · ${renderer.stats_depth_written_samples()} depth writes · ` +
       `${renderer.stats_blended_samples()} blended`;
+    document.querySelector("#quality-status").textContent =
+      `${qualityModeSelect.options[qualityModeSelect.selectedIndex].text} · ` +
+      `render ${renderer.render_width()} × ${renderer.render_height()} · ` +
+      `${renderer.stats_shaded_samples()} shaded · ${renderer.stats_resolved_pixels()} resolved · ` +
+      `${renderer.texture_mip_levels()} mip levels · ` +
+      `${mipmapEnabledCheckbox.checked ? `${renderer.stats_min_mip_level()}..${renderer.stats_max_mip_level()} selected` : "base level only"} · ` +
+      `${renderer.stats_invalid_lod_samples()} invalid LOD`;
     document.querySelector("#camera-status").textContent =
       `${cameraModeSelect.options[cameraModeSelect.selectedIndex].text} · ` +
       `eye (${renderer.camera_eye_x().toFixed(3)}, ${renderer.camera_eye_y().toFixed(3)}, ${renderer.camera_eye_z().toFixed(3)}) · ` +
@@ -259,8 +277,15 @@ async function bootstrap() {
     setPipelineDebugMode(mode === 1 ? 6 : mode === 2 ? 3 : 0);
   };
 
+  const syncMipControls = () => {
+    mipmapEnabledCheckbox.checked = renderer.mipmap_enabled();
+    mipDebugCheckbox.checked = renderer.mip_debug_enabled();
+    textureSamplingCheckbox.checked = renderer.texture_sampling_enabled();
+  };
+
   const setClipDebugEnabled = (enabled) => {
     renderer.set_clip_debug_enabled(enabled);
+    syncMipControls();
     clipDebugCheckbox.checked = enabled;
     if (enabled) {
       transparencyDebugCheckbox.checked = false;
@@ -273,6 +298,7 @@ async function bootstrap() {
 
   const setCoverageDebugEnabled = (enabled) => {
     renderer.set_coverage_debug_enabled(enabled);
+    syncMipControls();
     coverageDebugCheckbox.checked = enabled;
     if (enabled) {
       transparencyDebugCheckbox.checked = false;
@@ -285,6 +311,7 @@ async function bootstrap() {
 
   const setInterpolationDebugEnabled = (enabled) => {
     renderer.set_interpolation_debug_enabled(enabled);
+    syncMipControls();
     interpolationDebugCheckbox.checked = enabled;
     if (enabled) {
       transparencyDebugCheckbox.checked = false;
@@ -297,6 +324,7 @@ async function bootstrap() {
 
   const setPerspectiveDebugEnabled = (enabled) => {
     renderer.set_perspective_debug_enabled(enabled);
+    syncMipControls();
     perspectiveDebugCheckbox.checked = enabled;
     if (enabled) {
       transparencyDebugCheckbox.checked = false;
@@ -314,6 +342,7 @@ async function bootstrap() {
 
   const setDepthDebugEnabled = (enabled) => {
     renderer.set_depth_debug_enabled(enabled);
+    syncMipControls();
     depthDebugCheckbox.checked = enabled;
     if (enabled) {
       transparencyDebugCheckbox.checked = false;
@@ -341,6 +370,7 @@ async function bootstrap() {
       renderer.set_texture_sampling_enabled(false);
       textureSamplingCheckbox.checked = false;
     }
+    syncMipControls();
   };
 
   const setTextureSamplingEnabled = (enabled) => {
@@ -350,6 +380,7 @@ async function bootstrap() {
       renderer.set_texture_debug_enabled(false);
       textureDebugCheckbox.checked = false;
     }
+    syncMipControls();
   };
 
   const setSamplerState = (filter, addressU, addressV) => {
@@ -437,6 +468,7 @@ async function bootstrap() {
       textureDebugCheckbox.checked = false;
       setPipelineDebugMode(0);
     }
+    syncMipControls();
   };
 
   const setTransparentSortEnabled = (enabled) => {
@@ -447,6 +479,30 @@ async function bootstrap() {
   const setBlendColorSpace = (mode) => {
     renderer.set_blend_color_space(mode);
     blendColorSpaceSelect.value = String(mode);
+  };
+
+  const setQualityMode = (mode) => {
+    renderer.set_quality_mode(mode);
+    qualityModeSelect.value = String(renderer.quality_mode());
+  };
+
+  const setMipmapEnabled = (enabled) => {
+    renderer.set_mipmap_enabled(enabled);
+    syncMipControls();
+  };
+
+  const setMipDebugEnabled = (enabled) => {
+    renderer.set_mip_debug_enabled(enabled);
+    syncMipControls();
+    if (enabled) {
+      textureDebugCheckbox.checked = false;
+      transparencyDebugCheckbox.checked = false;
+      clipDebugCheckbox.checked = false;
+      coverageDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
+    }
   };
 
   const setDirectionalLight = (x, y, z, intensity) => {
@@ -467,7 +523,7 @@ async function bootstrap() {
   const uploadTextureRgba = (width, height, pixels) => {
     try {
       const id = renderer.upload_texture_rgba(width, height, pixels);
-      textureStatusText = `업로드 완료 · ${width} × ${height} · texture ${id} · Rust 소유 복사`;
+      textureStatusText = `업로드 완료 · ${width} × ${height} · ${renderer.texture_mip_levels()} mip levels · texture ${id} · Rust 소유 복사`;
       errorOutput.textContent = "";
       setTextureDebugEnabled(true);
       renderFrame(0);
@@ -542,6 +598,14 @@ async function bootstrap() {
   setTransparentSortEnabled(transparentSortCheckbox.checked);
   setBlendColorSpace(Number(blendColorSpaceSelect.value));
   setTransparencyDebugEnabled(transparencyDebugCheckbox.checked);
+  try {
+    setQualityMode(Number(qualityModeSelect.value));
+  } catch (error) {
+    errorOutput.textContent = error instanceof Error ? error.message : String(error);
+    qualityModeSelect.value = String(renderer.quality_mode());
+  }
+  setMipmapEnabled(initialMipmapEnabled);
+  setMipDebugEnabled(initialMipDebugEnabled);
   try {
     setMaterialSpecular(
       ...parseSrgbHex(specularColorInput.value),
@@ -689,6 +753,24 @@ async function bootstrap() {
     setBlendColorSpace(Number(blendColorSpaceSelect.value));
     renderFrame(0);
   });
+  qualityModeSelect.addEventListener("change", () => {
+    try {
+      setQualityMode(Number(qualityModeSelect.value));
+      errorOutput.textContent = "";
+    } catch (error) {
+      errorOutput.textContent = error instanceof Error ? error.message : String(error);
+      qualityModeSelect.value = String(renderer.quality_mode());
+    }
+    renderFrame(0);
+  });
+  mipmapEnabledCheckbox.addEventListener("change", () => {
+    setMipmapEnabled(mipmapEnabledCheckbox.checked);
+    renderFrame(0);
+  });
+  mipDebugCheckbox.addEventListener("change", () => {
+    setMipDebugEnabled(mipDebugCheckbox.checked);
+    renderFrame(0);
+  });
   normalModeSelect.addEventListener("change", () => {
     setNormalMode(Number(normalModeSelect.value));
     renderFrame(0);
@@ -818,6 +900,7 @@ async function bootstrap() {
     framebufferLength: renderer.framebuffer_len(),
     framebufferMiB: framebufferMiB(currentSize),
     framebufferGeneration: renderer.framebuffer_generation(),
+    renderSize: [renderer.render_width(), renderer.render_height()],
     typedArrayViewRebuilds: presenter.viewRebuilds,
     updateAndRenderCalls: updateCalls,
     lastFrameMetrics,
@@ -878,6 +961,12 @@ async function bootstrap() {
       sortEnabled: renderer.transparent_sort_enabled(),
       blendColorSpace: renderer.blend_color_space(),
     },
+    quality: {
+      mode: renderer.quality_mode(),
+      mipmapEnabled: renderer.mipmap_enabled(),
+      mipDebugEnabled: renderer.mip_debug_enabled(),
+      mipLevels: renderer.texture_mip_levels(),
+    },
     materialSpecular: {
       color: [
         renderer.material_specular_red(),
@@ -898,6 +987,7 @@ async function bootstrap() {
       activeId: renderer.active_texture_id(),
       width: renderer.active_texture_width(),
       height: renderer.active_texture_height(),
+      mipLevels: renderer.texture_mip_levels(),
       successes: renderer.texture_upload_successes(),
       failures: renderer.texture_upload_failures(),
       text: textureStatusText,
@@ -1014,6 +1104,28 @@ async function bootstrap() {
         },
         setBlendColorSpace(mode) {
           setBlendColorSpace(mode);
+          renderFrame(0);
+          return snapshot();
+        },
+        setQualityMode(mode) {
+          try {
+            setQualityMode(mode);
+            renderFrame(0);
+            return { error: null, snapshot: snapshot() };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              snapshot: snapshot(),
+            };
+          }
+        },
+        setMipmapEnabled(enabled) {
+          setMipmapEnabled(enabled);
+          renderFrame(0);
+          return snapshot();
+        },
+        setMipDebugEnabled(enabled) {
+          setMipDebugEnabled(enabled);
           renderFrame(0);
           return snapshot();
         },

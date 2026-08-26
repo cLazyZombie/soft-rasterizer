@@ -1,7 +1,8 @@
 //! `renderer-core`를 브라우저가 프레임 단위로 호출할 수 있게 하는 얇은 어댑터.
 
 use renderer_core::{
-    BlendColorSpace, CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
+    BlendColorSpace, CoordinateDebugSnapshot, FrameStats, InputSnapshot, QualityMode,
+    Renderer as CoreRenderer,
     camera_control::CameraMode,
     math::{Vec2, Vec3, Vec4},
     raster::{
@@ -379,6 +380,26 @@ impl Renderer {
         self.core.texture_debug_enabled()
     }
 
+    pub fn texture_mip_levels(&self) -> u32 {
+        self.core.texture_asset_status().mip_levels as u32
+    }
+
+    pub fn set_mipmap_enabled(&mut self, enabled: bool) {
+        self.core.set_mipmap_enabled(enabled);
+    }
+
+    pub fn mipmap_enabled(&self) -> bool {
+        self.core.mipmap_enabled()
+    }
+
+    pub fn set_mip_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_mip_debug_enabled(enabled);
+    }
+
+    pub fn mip_debug_enabled(&self) -> bool {
+        self.core.mip_debug_enabled()
+    }
+
     pub fn set_texture_sampling_enabled(&mut self, enabled: bool) {
         self.core.set_texture_sampling_enabled(enabled);
     }
@@ -633,6 +654,32 @@ impl Renderer {
         self.core.height() as u32
     }
 
+    pub fn set_quality_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => QualityMode::NoAa,
+            1 => QualityMode::Ssaa2x,
+            _ => return Err(format!("알 수 없는 quality mode입니다: {mode}")),
+        };
+        self.core
+            .set_quality_mode(mode)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn quality_mode(&self) -> u32 {
+        match self.core.quality_mode() {
+            QualityMode::NoAa => 0,
+            QualityMode::Ssaa2x => 1,
+        }
+    }
+
+    pub fn render_width(&self) -> u32 {
+        self.core.render_dimensions_public().0 as u32
+    }
+
+    pub fn render_height(&self) -> u32 {
+        self.core.render_dimensions_public().1 as u32
+    }
+
     pub fn framebuffer_ptr(&self) -> *const u8 {
         self.core.color_buffer().as_ptr()
     }
@@ -796,6 +843,30 @@ impl Renderer {
     pub fn stats_lighting_samples(&self) -> u32 {
         self.stats().lighting_samples
     }
+
+    pub fn stats_render_scale(&self) -> u32 {
+        self.stats().render_scale
+    }
+
+    pub fn stats_resolved_pixels(&self) -> u32 {
+        self.stats().resolved_pixels
+    }
+
+    pub fn stats_mip_samples(&self) -> u32 {
+        self.stats().mip_samples
+    }
+
+    pub fn stats_min_mip_level(&self) -> u32 {
+        self.stats().min_mip_level
+    }
+
+    pub fn stats_max_mip_level(&self) -> u32 {
+        self.stats().max_mip_level
+    }
+
+    pub fn stats_invalid_lod_samples(&self) -> u32 {
+        self.stats().invalid_lod_samples
+    }
 }
 
 const fn invalid_interpolation_samples(stats: FrameStats) -> u32 {
@@ -935,6 +1006,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · covered {} · shaded samples {} · counter overflow {} · S=256 pixel center/top-left\n\
+         quality stats render scale {} · resolved {} · mip samples {} · level {}..{} · invalid LOD {}\n\
          interpolation stats max |lambda sum - 1| {:.9} · mode {}\n\
          inv_w stats samples {} · invalid {} · q range [{:.6}, {:.6}]\n\
          depth stats passed {} · failed {} · invalid {} · strict < · clear +infinity · debug {}\n\
@@ -966,6 +1038,12 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.covered_samples,
         snapshot.frame_stats.shaded_samples,
         snapshot.frame_stats.sample_counter_overflow,
+        snapshot.frame_stats.render_scale,
+        snapshot.frame_stats.resolved_pixels,
+        snapshot.frame_stats.mip_samples,
+        snapshot.frame_stats.min_mip_level,
+        snapshot.frame_stats.max_mip_level,
+        snapshot.frame_stats.invalid_lod_samples,
         snapshot.frame_stats.max_barycentric_sum_error,
         snapshot.attribute_interpolation_mode.label(),
         snapshot.frame_stats.interpolated_inv_w_samples,
@@ -1801,5 +1879,59 @@ mod tests {
         );
         renderer.set_transparency_debug_enabled(false);
         assert!(!renderer.transparency_debug_enabled());
+    }
+
+    #[test]
+    fn adapter_maps_chapter_twenty_three_quality_mipmap_and_stats() {
+        let mut renderer = Renderer::new(32, 24).unwrap();
+        assert_eq!(renderer.quality_mode(), 0);
+        assert_eq!(
+            (renderer.render_width(), renderer.render_height()),
+            (32, 24)
+        );
+        renderer.set_quality_mode(1).unwrap();
+        assert_eq!(renderer.quality_mode(), 1);
+        assert_eq!(
+            (renderer.render_width(), renderer.render_height()),
+            (64, 48)
+        );
+        assert_eq!(renderer.stats_render_scale(), 2);
+        assert_eq!(renderer.stats_resolved_pixels(), 32 * 24);
+        assert_eq!(renderer.framebuffer_len(), 32 * 24 * 4);
+        assert!(
+            renderer
+                .set_quality_mode(2)
+                .unwrap_err()
+                .contains("quality mode")
+        );
+        assert_eq!(renderer.quality_mode(), 1);
+        assert!(renderer.resize(16, 20));
+        assert_eq!(
+            (renderer.render_width(), renderer.render_height()),
+            (32, 40)
+        );
+
+        renderer
+            .upload_texture_rgba(4, 4, &[128; 4 * 4 * 4])
+            .unwrap();
+        assert_eq!(renderer.texture_mip_levels(), 3);
+        renderer.set_texture_sampling_enabled(true);
+        renderer.set_mipmap_enabled(true);
+        assert!(renderer.mipmap_enabled());
+        renderer.set_mip_debug_enabled(true);
+        assert!(renderer.mip_debug_enabled());
+        assert!(renderer.mipmap_enabled());
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.stats_mip_samples() > 0);
+        assert!(renderer.stats_min_mip_level() <= renderer.stats_max_mip_level());
+        assert_eq!(renderer.stats_invalid_lod_samples(), 0);
+        renderer.set_mipmap_enabled(false);
+        assert!(!renderer.mipmap_enabled());
+        assert!(!renderer.mip_debug_enabled());
+        renderer.set_quality_mode(0).unwrap();
+        assert_eq!(
+            (renderer.render_width(), renderer.render_height()),
+            (16, 20)
+        );
     }
 }

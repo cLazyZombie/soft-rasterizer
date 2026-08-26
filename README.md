@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 22장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import와 투명도 queue를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 framebuffer만 표시합니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 23장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA와 mipmap을 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -97,6 +97,14 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - texture와 material은 straight alpha다. source-over는 destination RGBA8을 linear RGB로 decode해 합성한 뒤 sRGB로 encode하며 framebuffer alpha는 255를 유지한다.
 - debug fixture는 cutout checker와 서로 교차하는 두 반투명 quad를 함께 표시한다. primitive 평균 깊이 정렬은 교차 geometry의 fragment 순서를 완전히 해결하지 못하며 OIT는 이 장의 범위가 아니다.
 - `FrameStats`는 alpha discard, depth write, blended sample을 분리한다. UI의 encoded-sRGB wrong-way 비교는 같은 coverage/depth와 올바른 linear 경로의 수치·화면 차이를 고정한다.
+
+## 23장 Antialiasing과 Mipmap 기준선
+
+- `NoAa`는 논리 해상도를 그대로 렌더하고 `Ssaa2x`는 Rust 내부에서 가로·세로 2배인 4배 sample target을 사용한다. 공개 Wasm framebuffer 크기와 Canvas/CSS 크기는 논리 해상도로 유지한다.
+- 2x2 SSAA sample은 저장된 sRGB RGB를 linear로 decode해 평균하고 최종 RGBA8 쓰기 직전에 다시 encode한다. resolve 깊이는 네 sample의 최솟값이며 출력 alpha는 255다.
+- texture upload는 base부터 ceil-half인 `max(1, (width+1)/2) × max(1, (height+1)/2)`를 반복해 1x1까지 mip chain을 Rust가 소유한다. 홀수 extent의 마지막 행/열을 보존하고 base-color RGB는 linear에서 평균한다. base와 모든 mip level의 합이 texture당 최대 texel 수를 넘기 전에 거부한다.
+- LOD는 현재 fragment와 screen x/y 한 픽셀 이웃에서 같은 perspective rational UV 식을 평가해 구한다. `rho`의 log2를 유효 mip 범위에 clamp하고 필수 범위인 nearest mip만 선택한다.
+- mip debug는 선택 level을 색으로 표시한다. `FrameStats`는 render scale/resolved pixel, mip sample, 최소·최대 level과 invalid LOD를 별도로 보고한다. MSAA와 trilinear는 후속 확장 범위다.
 
 ## 교재
 

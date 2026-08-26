@@ -63,6 +63,9 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#transparency-debug").checked = ${JSON.stringify(initialControls.transparencyDebugEnabled ?? false)};
           document.querySelector("#transparent-sort").checked = ${JSON.stringify(initialControls.transparentSortEnabled ?? true)};
           document.querySelector("#blend-color-space").value = ${JSON.stringify(String(initialControls.blendColorSpace ?? 0))};
+          document.querySelector("#quality-mode").value = ${JSON.stringify(String(initialControls.qualityMode ?? 0))};
+          document.querySelector("#mipmap-enabled").checked = ${JSON.stringify(initialControls.mipmapEnabled ?? false)};
+          document.querySelector("#mip-debug").checked = ${JSON.stringify(initialControls.mipDebugEnabled ?? false)};
         </script>`;
         await route.fulfill({
           response,
@@ -2072,6 +2075,7 @@ test("input_camera_fast_release: rAF 사이에 끝난 drag delta를 한 번 적�
   await openReadyPage(page);
   const canvas = page.locator("#framebuffer");
   const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  await canvas.scrollIntoViewIfNeeded();
   const bounds = await canvas.boundingBox();
   expect(bounds).not.toBeNull();
   await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
@@ -2130,6 +2134,7 @@ test("input_camera: DOM collector를 거쳐 Orbit/Fly와 focus 해제를 검증�
   expect(invalidInput.snapshot.camera).toEqual(initial.camera);
   expect(invalidInput.snapshot.pixelHash).toBe(initial.pixelHash);
 
+  await canvas.scrollIntoViewIfNeeded();
   const bounds = await canvas.boundingBox();
   expect(bounds).not.toBeNull();
   await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
@@ -2689,5 +2694,159 @@ test("transparency: cutout depth와 sorted linear blend를 Rust framebuffer에�
     encodedWrongWayHash: wrongSpace.pixelHash,
     intersectingGeometryLimitation:
       "primitive 평균 view +Z 정렬은 교차하는 두 quad의 모든 fragment 순서를 해결하지 못한다",
+  });
+});
+
+test("antialiasing_mipmap: 2x SSAA linear resolve와 perspective nearest mip를 비교한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "antialiasing_mipmap" },
+    { type: "steps", description: "45" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    windingDebugMode: 0,
+    qualityMode: 1,
+    mipmapEnabled: true,
+    mipDebugEnabled: true,
+  });
+  const restoredBoot = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restoredBoot.internalSize).toEqual([960, 540]);
+  expect(restoredBoot.renderSize).toEqual([1920, 1080]);
+  expect(restoredBoot.framebufferLength).toBe(960 * 540 * 4);
+  expect(restoredBoot.quality).toEqual({
+    mode: 1,
+    mipmapEnabled: true,
+    mipDebugEnabled: true,
+    mipLevels: 2,
+  });
+  expect(restoredBoot.textureSamplingEnabled).toBe(true);
+  await expect(page.locator("#quality-mode")).toHaveValue("1");
+  await expect(page.locator("#mipmap-enabled")).toBeChecked();
+  await expect(page.locator("#mip-debug")).toBeChecked();
+  await expect(page.locator("#texture-sampling")).toBeChecked();
+  expect(restoredBoot.pixelHash).toBe("eb133363");
+
+  await page.locator("#quality-mode").selectOption("0");
+  await page.locator("#mip-debug").uncheck();
+  await page.locator("#mipmap-enabled").uncheck();
+  const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(initial.quality).toEqual({
+    mode: 0,
+    mipmapEnabled: false,
+    mipDebugEnabled: false,
+    mipLevels: 2,
+  });
+  expect(initial.renderSize).toEqual(initial.internalSize);
+  const oversizedMip = await page.evaluate(() =>
+    window.__softRasterizer.validateDecodedTextureSize(4096, 4096),
+  );
+  expect(oversizedMip.pixelCount).toBeNull();
+  expect(oversizedMip.error).toContain("mip texel");
+
+  const uploaded = await page.evaluate(() => {
+    const extent = 512;
+    const pixels = new Uint8Array(extent * extent * 4);
+    for (let y = 0; y < extent; y += 1) {
+      for (let x = 0; x < extent; x += 1) {
+        const value = (x + y) % 2 === 0 ? 245 : 12;
+        const index = 4 * (y * extent + x);
+        pixels[index] = value;
+        pixels[index + 1] = value;
+        pixels[index + 2] = value;
+        pixels[index + 3] = 255;
+      }
+    }
+    return window.__softRasterizer.uploadTextureRgba(extent, extent, pixels);
+  });
+  expect(uploaded.error).toBeNull();
+  expect(uploaded.snapshot.textureStatus.mipLevels).toBe(10);
+  await page.locator("#texture-sampling").check();
+  await page.evaluate(() => window.__softRasterizer.setModelRotationY(0.72));
+  const noAa = await page.evaluate(() => window.__softRasterizer.snapshot());
+
+  await page.locator("#quality-mode").selectOption("1");
+  const ssaa = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(ssaa.quality.mode).toBe(1);
+  expect(ssaa.renderSize).toEqual([1920, 1080]);
+  expect(ssaa.framebufferLength).toBe(noAa.framebufferLength);
+  expect(ssaa.stats.renderScale).toBe(2);
+  expect(ssaa.stats.resolvedPixels).toBe(960 * 540);
+  expect(ssaa.stats.shadedSamples).toBeGreaterThan(noAa.stats.shadedSamples * 3);
+  expect(ssaa.pixelHash).not.toBe(noAa.pixelHash);
+  expect(noAa.pixelHash).toBe("b28f8f60");
+  expect(ssaa.pixelHash).toBe("716b8058");
+
+  await page.locator("#mipmap-enabled").check();
+  const mip = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(mip.quality.mipmapEnabled).toBe(true);
+  expect(mip.stats.mipSamples).toBeGreaterThan(0);
+  expect(mip.stats.maxMipLevel).toBeGreaterThan(0);
+  expect(mip.stats.invalidLodSamples).toBe(0);
+  expect(mip.pixelHash).not.toBe(ssaa.pixelHash);
+  expect(mip.pixelHash).toBe("49b2f480");
+
+  await page.locator("#mip-debug").check();
+  const debug = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(debug.quality).toMatchObject({
+    mode: 1,
+    mipmapEnabled: true,
+    mipDebugEnabled: true,
+    mipLevels: 10,
+  });
+  expect(debug.stats.minMipLevel).toBeLessThanOrEqual(debug.stats.maxMipLevel);
+  expect(debug.pixelHash).toBe("cb576630");
+  await expect(page.locator("#quality-status")).toContainText("2x SSAA");
+  await expect(page.locator("#quality-status")).toContainText("10 mip levels");
+
+  await page.locator("#clip-debug").check();
+  await expect(page.locator("#mip-debug")).not.toBeChecked();
+  expect(
+    await page.evaluate(() => window.__softRasterizer.snapshot().quality.mipDebugEnabled),
+  ).toBe(false);
+  await page.locator("#clip-debug").uncheck();
+  await page.locator("#mip-debug").check();
+  await page.locator("#texture-sampling").uncheck();
+  await expect(page.locator("#mip-debug")).not.toBeChecked();
+  await page.locator("#texture-sampling").check();
+  await page.locator("#mip-debug").check();
+  const resynchronized = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(resynchronized.pixelHash).toBe(debug.pixelHash);
+  expect(resynchronized.quality.mipDebugEnabled).toBe(true);
+
+  const invalid = await page.evaluate(() => window.__softRasterizer.setQualityMode(9));
+  expect(invalid.error).toContain("quality mode");
+  expect(invalid.snapshot.quality.mode).toBe(1);
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter23-antialiasing-mipmap.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter23-antialiasing-mipmap", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+
+  await page.locator("#quality-mode").selectOption("0");
+  await page.locator("#mip-debug").uncheck();
+  await page.locator("#mipmap-enabled").uncheck();
+  const restored = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restored.renderSize).toEqual(restored.internalSize);
+  expect(restored.stats.renderScale).toBe(1);
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, resynchronized, 0, browserLog, screenshotPath, {
+    noAaHash: noAa.pixelHash,
+    ssaaHash: ssaa.pixelHash,
+    mipHash: mip.pixelHash,
+    mipDebugHash: debug.pixelHash,
+    shadedSamples: {
+      noAa: noAa.stats.shadedSamples,
+      ssaa: ssaa.stats.shadedSamples,
+    },
   });
 });

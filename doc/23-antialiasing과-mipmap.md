@@ -15,7 +15,7 @@ texture가 축소될 때 한 화면 픽셀이 많은 texel을 덮는다. base le
 - <strong>2x SSAA</strong>는 가로/세로 2배, 총 4배 픽셀을 렌더하고 2x2를 평균한다. 간단하지만 변환 이후 모든 fragment 비용이 4배에 가깝다.
 - <strong>4x MSAA</strong>는 픽셀 안 네 sample마다 coverage/depth를 저장하고 색을 resolve한다. 교육용 reference는 sample별 shading을 해도 되지만 비용은 SSAA와 비슷하다.
 - <strong>rotated-grid sample 예</strong>: (0.375,0.125), (0.875,0.375), (0.125,0.625), (0.625,0.875). fixed-point edge 식에 각 offset을 넣는다.
-- <strong>mip chain</strong>은 W,H에서 max(1,W/2), max(1,H/2)를 반복해 1x1까지 만든다. sRGB base color는 texel을 linear로 decode해 2x2 평균 후 저장/encode한다.
+- <strong>mip chain</strong>은 W,H에서 max(1,(W+1)/2), max(1,(H+1)/2)의 ceil-half를 반복해 1x1까지 만든다. 이 규약은 홀수 크기의 마지막 행/열을 다음 level에 보존한다. sRGB base color는 texel을 linear로 decode해 존재하는 source texel만 2x2 평균 후 저장/encode한다.
 - <strong>LOD</strong>는 화면 x/y로 한 픽셀 움직였을 때 UV가 texture에서 얼마나 변하는지로 추정한다.
 
 ## 핵심 식과 불변조건

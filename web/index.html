@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 22장</title>
+    <title>소프트웨어 래스터라이저 · 23장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>22장 · 투명도와 렌더 순서</h1>
+        <h1>23장 · Antialiasing과 Mipmap</h1>
       </div>
-      <p>Rust가 Opaque → Cutout → Transparent queue, depth write 분리와 linear source-over를 처리합니다.</p>
+      <p>Rust가 2x SSAA의 linear resolve와 perspective UV footprint 기반 nearest mip 선택을 처리합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="camera-mode">
           Camera
@@ -287,10 +287,25 @@
             <option value="1">sRGB encoded wrong-way</option>
           </select>
         </label>
+        <label for="quality-mode">
+          Quality
+          <select id="quality-mode">
+            <option value="0" selected>No AA</option>
+            <option value="1">2x SSAA (4x samples)</option>
+          </select>
+        </label>
+        <label for="mipmap-enabled">
+          <input id="mipmap-enabled" type="checkbox" />
+          Nearest mip
+        </label>
+        <label for="mip-debug">
+          <input id="mip-debug" type="checkbox" />
+          Mip level debug
+        </label>
       </div>
       <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
       <p class="space-legend">
-        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over
+        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -330,6 +345,8 @@
         <dd id="lighting-sample-stats">초기화 중</dd>
         <dt>Transparency</dt>
         <dd id="transparency-status">초기화 중</dd>
+        <dt>Quality / Mipmap</dt>
+        <dd id="quality-status">초기화 중</dd>
         <dt>Camera input</dt>
         <dd id="camera-status">초기화 중</dd>
         <dt>프레임</dt>

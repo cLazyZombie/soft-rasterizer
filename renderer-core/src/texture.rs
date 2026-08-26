@@ -4,11 +4,11 @@ use std::error::Error;
 use std::fmt::{Display, Formatter};
 
 use crate::{
-    color::srgb_decode_rgba,
+    color::{srgb_decode_rgba, srgb_encode_rgba},
     math::{Vec2, Vec3, Vec4},
 };
 
-/// 한 texture가 소유할 수 있는 최대 texel 수다.
+/// base와 모든 mip level을 합쳐 한 texture가 소유할 수 있는 최대 texel 수다.
 pub const MAX_TEXTURE_PIXEL_COUNT: usize = 16_777_216;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -158,45 +158,86 @@ impl SamplerState {
         self.sample_with_decode(texture, uv, false)
     }
 
+    pub fn sample_mip(self, texture: &Texture, uv: Vec2, lod: f32) -> Option<(Vec4, usize)> {
+        let level = texture.nearest_mip_level(lod)?;
+        self.sample_level_with_decode(texture, uv, level, true)
+            .map(|sample| (sample, level))
+    }
+
+    pub fn sample_mip_encoded(
+        self,
+        texture: &Texture,
+        uv: Vec2,
+        lod: f32,
+    ) -> Option<(Vec4, usize)> {
+        let level = texture.nearest_mip_level(lod)?;
+        self.sample_level_with_decode(texture, uv, level, false)
+            .map(|sample| (sample, level))
+    }
+
     fn sample_with_decode(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
+        self.sample_level_with_decode(texture, uv, 0, decode)
+    }
+
+    fn sample_level_with_decode(
+        self,
+        texture: &Texture,
+        uv: Vec2,
+        level: usize,
+        decode: bool,
+    ) -> Option<Vec4> {
         if !uv.x.is_finite() || !uv.y.is_finite() {
             return None;
         }
         match self.filter {
-            FilterMode::Nearest => self.sample_nearest(texture, uv, decode),
-            FilterMode::Bilinear => self.sample_bilinear(texture, uv, decode),
+            FilterMode::Nearest => self.sample_nearest(texture, uv, level, decode),
+            FilterMode::Bilinear => self.sample_bilinear(texture, uv, level, decode),
         }
     }
 
-    fn sample_nearest(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
+    fn sample_nearest(
+        self,
+        texture: &Texture,
+        uv: Vec2,
+        level: usize,
+        decode: bool,
+    ) -> Option<Vec4> {
+        let mip = texture.level(level)?;
         let u = address_normalized(uv.x, self.address_u);
         let v = address_normalized(uv.y, self.address_v);
-        let x = ((u * texture.width as f32).floor() as usize).min(texture.width - 1);
-        let y = ((v * texture.height as f32).floor() as usize).min(texture.height - 1);
-        texture.fetch_for_sampling(x, y, decode)
+        let x = ((u * mip.width as f32).floor() as usize).min(mip.width - 1);
+        let y = ((v * mip.height as f32).floor() as usize).min(mip.height - 1);
+        texture.fetch_level_for_sampling(level, x, y, decode)
     }
 
-    fn sample_bilinear(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
+    fn sample_bilinear(
+        self,
+        texture: &Texture,
+        uv: Vec2,
+        level: usize,
+        decode: bool,
+    ) -> Option<Vec4> {
+        let mip = texture.level(level)?;
         let u = address_normalized(uv.x, self.address_u);
         let v = address_normalized(uv.y, self.address_v);
-        let x = u * texture.width as f32 - 0.5;
-        let y = v * texture.height as f32 - 0.5;
+        let x = u * mip.width as f32 - 0.5;
+        let y = v * mip.height as f32 - 0.5;
         let x0 = x.floor() as i64;
         let y0 = y.floor() as i64;
         let fraction_x = x - x.floor();
         let fraction_y = y - y.floor();
-        let x0_index = address_texel(x0, texture.width, self.address_u);
-        let x1_index = address_texel(x0 + 1, texture.width, self.address_u);
-        let y0_index = address_texel(y0, texture.height, self.address_v);
-        let y1_index = address_texel(y0 + 1, texture.height, self.address_v);
+        let x0_index = address_texel(x0, mip.width, self.address_u);
+        let x1_index = address_texel(x0 + 1, mip.width, self.address_u);
+        let y0_index = address_texel(y0, mip.height, self.address_v);
+        let y1_index = address_texel(y0 + 1, mip.height, self.address_v);
         let top = lerp_vec4(
-            texture.fetch_for_sampling(x0_index, y0_index, decode)?,
-            texture.fetch_for_sampling(x1_index, y0_index, decode)?,
+            texture.fetch_level_for_sampling(level, x0_index, y0_index, decode)?,
+            texture.fetch_level_for_sampling(level, x1_index, y0_index, decode)?,
             fraction_x,
         );
         let bottom = lerp_vec4(
-            texture.fetch_for_sampling(x0_index, y1_index, decode)?,
-            texture.fetch_for_sampling(x1_index, y1_index, decode)?,
+            texture.fetch_level_for_sampling(level, x0_index, y1_index, decode)?,
+            texture.fetch_level_for_sampling(level, x1_index, y1_index, decode)?,
             fraction_x,
         );
         Some(lerp_vec4(top, bottom, fraction_y))
@@ -240,10 +281,15 @@ impl Display for TextureError {
 impl Error for TextureError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct Texture {
+struct MipLevel {
     width: usize,
     height: usize,
     pixels: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Texture {
+    levels: Vec<MipLevel>,
     color_space: TextureColorSpace,
 }
 
@@ -261,24 +307,74 @@ impl Texture {
                 actual: pixels.len(),
             });
         }
-        Ok(Self {
-            width,
-            height,
-            pixels: pixels.to_vec(),
+        let mut texture = Self {
+            levels: vec![MipLevel {
+                width,
+                height,
+                pixels: pixels.to_vec(),
+            }],
             color_space,
-        })
+        };
+        texture.generate_mip_chain();
+        Ok(texture)
     }
 
-    pub const fn width(&self) -> usize {
-        self.width
+    fn generate_mip_chain(&mut self) {
+        while self
+            .levels
+            .last()
+            .is_some_and(|level| level.width > 1 || level.height > 1)
+        {
+            let source = self.levels.last().expect("mip chain에는 base level이 있다");
+            let width = source.width.div_ceil(2);
+            let height = source.height.div_ceil(2);
+            let mut pixels = vec![0; width * height * 4];
+            for y in 0..height {
+                for x in 0..width {
+                    let mut sum = Vec4::ZERO;
+                    let mut count = 0.0_f32;
+                    for source_y in (2 * y)..=(2 * y + 1).min(source.height - 1) {
+                        for source_x in (2 * x)..=(2 * x + 1).min(source.width - 1) {
+                            let rgba = texel_from_level(source, source_x, source_y)
+                                .expect("mip source 좌표는 level 내부여야 한다");
+                            let encoded = rgba8_to_vec4(rgba);
+                            sum = sum
+                                + if self.color_space == TextureColorSpace::Srgb {
+                                    srgb_decode_rgba(encoded)
+                                } else {
+                                    encoded
+                                };
+                            count += 1.0;
+                        }
+                    }
+                    let averaged = sum / count;
+                    let stored = if self.color_space == TextureColorSpace::Srgb {
+                        srgb_encode_rgba(averaged)
+                    } else {
+                        averaged
+                    };
+                    let byte_index = 4 * (y * width + x);
+                    pixels[byte_index..byte_index + 4].copy_from_slice(&vec4_to_rgba8(stored));
+                }
+            }
+            self.levels.push(MipLevel {
+                width,
+                height,
+                pixels,
+            });
+        }
     }
 
-    pub const fn height(&self) -> usize {
-        self.height
+    pub fn width(&self) -> usize {
+        self.levels[0].width
+    }
+
+    pub fn height(&self) -> usize {
+        self.levels[0].height
     }
 
     pub fn pixels(&self) -> &[u8] {
-        &self.pixels
+        &self.levels[0].pixels
     }
 
     pub const fn color_space(&self) -> TextureColorSpace {
@@ -286,11 +382,26 @@ impl Texture {
     }
 
     pub fn texel_rgba8(&self, x: usize, y: usize) -> Option<[u8; 4]> {
-        if x >= self.width || y >= self.height {
+        texel_from_level(&self.levels[0], x, y)
+    }
+
+    pub fn mip_level_count(&self) -> usize {
+        self.levels.len()
+    }
+
+    pub fn mip_dimensions(&self, level: usize) -> Option<(usize, usize)> {
+        self.level(level).map(|mip| (mip.width, mip.height))
+    }
+
+    pub fn mip_texel_rgba8(&self, level: usize, x: usize, y: usize) -> Option<[u8; 4]> {
+        texel_from_level(self.level(level)?, x, y)
+    }
+
+    pub fn nearest_mip_level(&self, lod: f32) -> Option<usize> {
+        if !lod.is_finite() {
             return None;
         }
-        let byte_index = 4 * (y * self.width + x);
-        Some(self.pixels[byte_index..byte_index + 4].try_into().unwrap())
+        Some((lod.max(0.0).round() as usize).min(self.levels.len() - 1))
     }
 
     pub fn fetch(&self, x: usize, y: usize) -> Option<Vec4> {
@@ -302,13 +413,22 @@ impl Texture {
     }
 
     fn fetch_for_sampling(&self, x: usize, y: usize, decode: bool) -> Option<Vec4> {
-        self.texel_rgba8(x, y).map(|rgba| {
-            let encoded = Vec4::new(
-                f32::from(rgba[0]) / 255.0,
-                f32::from(rgba[1]) / 255.0,
-                f32::from(rgba[2]) / 255.0,
-                f32::from(rgba[3]) / 255.0,
-            );
+        self.fetch_level_for_sampling(0, x, y, decode)
+    }
+
+    fn level(&self, level: usize) -> Option<&MipLevel> {
+        self.levels.get(level)
+    }
+
+    fn fetch_level_for_sampling(
+        &self,
+        level: usize,
+        x: usize,
+        y: usize,
+        decode: bool,
+    ) -> Option<Vec4> {
+        self.mip_texel_rgba8(level, x, y).map(|rgba| {
+            let encoded = rgba8_to_vec4(rgba);
             if decode && self.color_space == TextureColorSpace::Srgb {
                 srgb_decode_rgba(encoded)
             } else {
@@ -316,6 +436,33 @@ impl Texture {
             }
         })
     }
+}
+
+fn texel_from_level(level: &MipLevel, x: usize, y: usize) -> Option<[u8; 4]> {
+    if x >= level.width || y >= level.height {
+        return None;
+    }
+    let byte_index = 4 * (y * level.width + x);
+    Some(level.pixels[byte_index..byte_index + 4].try_into().unwrap())
+}
+
+fn rgba8_to_vec4(rgba: [u8; 4]) -> Vec4 {
+    Vec4::new(
+        f32::from(rgba[0]) / 255.0,
+        f32::from(rgba[1]) / 255.0,
+        f32::from(rgba[2]) / 255.0,
+        f32::from(rgba[3]) / 255.0,
+    )
+}
+
+fn vec4_to_rgba8(value: Vec4) -> [u8; 4] {
+    [value.x, value.y, value.z, value.w].map(|channel| {
+        if channel.is_finite() {
+            (channel.clamp(0.0, 1.0) * 255.0).round() as u8
+        } else {
+            0
+        }
+    })
 }
 
 #[derive(Debug)]
@@ -390,9 +537,34 @@ fn checked_texture_byte_len(width: usize, height: usize) -> Result<usize, Textur
             maximum: MAX_TEXTURE_PIXEL_COUNT,
         });
     }
+    let mip_texel_count = checked_mip_texel_count(width, height)?;
+    if mip_texel_count > MAX_TEXTURE_PIXEL_COUNT {
+        return Err(TextureError::PixelLimitExceeded {
+            requested: mip_texel_count,
+            maximum: MAX_TEXTURE_PIXEL_COUNT,
+        });
+    }
     pixel_count
         .checked_mul(4)
         .ok_or(TextureError::DimensionOverflow)
+}
+
+fn checked_mip_texel_count(mut width: usize, mut height: usize) -> Result<usize, TextureError> {
+    let mut total = 0_usize;
+    loop {
+        total = total
+            .checked_add(
+                width
+                    .checked_mul(height)
+                    .ok_or(TextureError::DimensionOverflow)?,
+            )
+            .ok_or(TextureError::DimensionOverflow)?;
+        if width == 1 && height == 1 {
+            return Ok(total);
+        }
+        width = width.div_ceil(2);
+        height = height.div_ceil(2);
+    }
 }
 
 fn texture_id_for_len(texture_count: usize) -> Result<TextureId, TextureError> {
@@ -462,6 +634,13 @@ mod tests {
             Texture::from_rgba8(MAX_TEXTURE_PIXEL_COUNT + 1, 1, &[], TextureColorSpace::Srgb),
             Err(TextureError::PixelLimitExceeded {
                 requested: MAX_TEXTURE_PIXEL_COUNT + 1,
+                maximum: MAX_TEXTURE_PIXEL_COUNT,
+            })
+        );
+        assert_eq!(
+            Texture::from_rgba8(4096, 4096, &[], TextureColorSpace::Srgb),
+            Err(TextureError::PixelLimitExceeded {
+                requested: 22_369_621,
                 maximum: MAX_TEXTURE_PIXEL_COUNT,
             })
         );
@@ -735,5 +914,86 @@ mod tests {
         assert_eq!(material.normal_mode, NormalMode::Smooth);
         assert_eq!(material.specular_color, Vec3::new(1.0, 1.0, 1.0));
         assert_eq!(material.shininess, 32.0);
+    }
+
+    #[test]
+    fn chapter_twenty_three_mip_chain_reaches_one_by_one_and_handles_odd_extents() {
+        let texture = Texture::from_rgba8(4, 4, &[64; 64], TextureColorSpace::Linear).unwrap();
+        assert_eq!(texture.mip_level_count(), 3);
+        assert_eq!(texture.mip_dimensions(0), Some((4, 4)));
+        assert_eq!(texture.mip_dimensions(1), Some((2, 2)));
+        assert_eq!(texture.mip_dimensions(2), Some((1, 1)));
+        assert_eq!(texture.mip_dimensions(3), None);
+        assert_eq!(texture.mip_texel_rgba8(2, 0, 0), Some([64; 4]));
+        assert_eq!(texture.mip_texel_rgba8(2, 1, 0), None);
+
+        let mut odd_pixels = [0; 3 * 5 * 4];
+        odd_pixels[4 * (4 * 3 + 2)..][..4].copy_from_slice(&[255; 4]);
+        let odd = Texture::from_rgba8(3, 5, &odd_pixels, TextureColorSpace::Linear).unwrap();
+        assert_eq!(odd.mip_level_count(), 4);
+        assert_eq!(odd.mip_dimensions(1), Some((2, 3)));
+        assert_eq!(odd.mip_dimensions(2), Some((1, 2)));
+        assert_eq!(odd.mip_dimensions(3), Some((1, 1)));
+        assert_eq!(odd.mip_texel_rgba8(1, 1, 2), Some([255; 4]));
+        assert_ne!(odd.mip_texel_rgba8(3, 0, 0), Some([0; 4]));
+    }
+
+    #[test]
+    fn chapter_twenty_three_srgb_mip_downsample_averages_linear_rgb_and_alpha() {
+        let texture = Texture::from_rgba8(
+            2,
+            2,
+            &[
+                0, 0, 0, 0, 255, 255, 255, 64, 0, 0, 0, 128, 255, 255, 255, 255,
+            ],
+            TextureColorSpace::Srgb,
+        )
+        .unwrap();
+        assert_eq!(texture.mip_level_count(), 2);
+        assert_eq!(texture.mip_texel_rgba8(1, 0, 0), Some([188, 188, 188, 112]));
+        let linear = texture.fetch_level_for_sampling(1, 0, 0, true).unwrap();
+        assert!((linear.x - 0.5).abs() < 0.005);
+        assert!((linear.w - 112.0 / 255.0).abs() <= f32::EPSILON);
+    }
+
+    #[test]
+    fn chapter_twenty_three_nearest_mip_sampling_clamps_lod_and_rejects_invalid_values() {
+        let mut pixels = vec![0_u8; 4 * 4 * 4];
+        for pixel in pixels.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[80, 120, 160, 255]);
+        }
+        let texture = Texture::from_rgba8(4, 4, &pixels, TextureColorSpace::Linear).unwrap();
+        let sampler = SamplerState::default();
+        assert_eq!(
+            sampler
+                .sample_mip(&texture, Vec2::new(0.2, 0.7), 0.49)
+                .unwrap()
+                .1,
+            0
+        );
+        assert_eq!(
+            sampler
+                .sample_mip(&texture, Vec2::new(0.2, 0.7), 0.5)
+                .unwrap()
+                .1,
+            1
+        );
+        assert_eq!(
+            sampler
+                .sample_mip(&texture, Vec2::new(0.2, 0.7), 99.0)
+                .unwrap()
+                .1,
+            2
+        );
+        assert!(sampler.sample_mip(&texture, Vec2::ZERO, f32::NAN).is_none());
+        assert!(
+            sampler
+                .sample_mip_encoded(&texture, Vec2::new(f32::INFINITY, 0.0), 0.0)
+                .is_none()
+        );
+        assert_eq!(
+            vec4_to_rgba8(Vec4::new(f32::NAN, f32::INFINITY, -f32::INFINITY, 0.5,)),
+            [0, 0, 0, 128]
+        );
     }
 }
