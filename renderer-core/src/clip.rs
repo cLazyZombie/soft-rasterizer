@@ -195,6 +195,7 @@ fn vertex_is_finite(vertex: ClipVertex) -> bool {
     let color = vertex.color;
     [clip.x, clip.y, clip.z, clip.w]
         .into_iter()
+        .chain([vertex.view_depth])
         .chain([world.x, world.y, world.z])
         .chain([normal.x, normal.y, normal.z])
         .chain([uv.x, uv.y])
@@ -210,6 +211,7 @@ mod tests {
     fn vertex(clip: Vec4, value: f32) -> ClipVertex {
         ClipVertex {
             clip_pos: ClipPosition(clip),
+            view_depth: value + 0.5,
             world_pos: Vec3::new(value, value + 1.0, value + 2.0),
             normal_world: Vec3::new(value + 3.0, value + 4.0, value + 5.0),
             uv: Vec2::new(value + 6.0, value + 7.0),

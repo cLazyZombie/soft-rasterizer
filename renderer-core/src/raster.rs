@@ -819,6 +819,7 @@ mod tests {
     ) -> ClipVertex {
         ClipVertex {
             clip_pos: crate::transform::ClipPosition(Vec4::new(0.0, 0.0, clip_w * 0.5, clip_w)),
+            view_depth: clip_w,
             world_pos,
             normal_world,
             uv,

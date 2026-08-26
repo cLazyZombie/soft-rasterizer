@@ -1,14 +1,15 @@
 //! `renderer-core`를 브라우저가 프레임 단위로 호출할 수 있게 하는 얇은 어댑터.
 
 use renderer_core::{
-    CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
+    BlendColorSpace, CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
     camera_control::CameraMode,
     math::{Vec2, Vec3, Vec4},
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
     texture::{
-        AddressMode, FilterMode, NormalMode, SamplerState, ShaderMode, TextureColorSpace, TextureId,
+        AddressMode, AlphaMode, FilterMode, NormalMode, SamplerState, ShaderMode,
+        TextureColorSpace, TextureId,
     },
     transform::CoordinateSpace,
 };
@@ -503,6 +504,68 @@ impl Renderer {
         }
     }
 
+    pub fn set_alpha_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => AlphaMode::Opaque,
+            1 => AlphaMode::Mask,
+            2 => AlphaMode::Blend,
+            _ => return Err(format!("알 수 없는 alpha mode입니다: {mode}")),
+        };
+        self.core.set_alpha_mode(mode);
+        Ok(())
+    }
+
+    pub fn alpha_mode(&self) -> u32 {
+        match self.core.alpha_mode() {
+            AlphaMode::Opaque => 0,
+            AlphaMode::Mask => 1,
+            AlphaMode::Blend => 2,
+        }
+    }
+
+    pub fn set_alpha_cutoff(&mut self, cutoff: f32) -> Result<(), String> {
+        self.core
+            .set_alpha_cutoff(cutoff)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn alpha_cutoff(&self) -> f32 {
+        self.core.alpha_cutoff()
+    }
+
+    pub fn set_transparency_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_transparency_debug_enabled(enabled);
+    }
+
+    pub fn transparency_debug_enabled(&self) -> bool {
+        self.core.transparency_debug_enabled()
+    }
+
+    pub fn set_transparent_sort_enabled(&mut self, enabled: bool) {
+        self.core.set_transparent_sort_enabled(enabled);
+    }
+
+    pub fn transparent_sort_enabled(&self) -> bool {
+        self.core.transparent_sort_enabled()
+    }
+
+    pub fn set_blend_color_space(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => BlendColorSpace::Linear,
+            1 => BlendColorSpace::EncodedWrongWay,
+            _ => return Err(format!("알 수 없는 blend color space입니다: {mode}")),
+        };
+        self.core.set_blend_color_space(mode);
+        Ok(())
+    }
+
+    pub fn blend_color_space(&self) -> u32 {
+        match self.core.blend_color_space() {
+            BlendColorSpace::Linear => 0,
+            BlendColorSpace::EncodedWrongWay => 1,
+        }
+    }
+
     pub fn set_directional_light(
         &mut self,
         surface_to_light_x: f32,
@@ -666,6 +729,18 @@ impl Renderer {
         self.stats().invalid_depth_samples
     }
 
+    pub fn stats_alpha_discarded_samples(&self) -> u32 {
+        self.stats().alpha_discarded_samples
+    }
+
+    pub fn stats_depth_written_samples(&self) -> u32 {
+        self.stats().depth_written_samples
+    }
+
+    pub fn stats_blended_samples(&self) -> u32 {
+        self.stats().blended_samples
+    }
+
     pub fn stats_max_barycentric_sum_error(&self) -> f32 {
         self.stats().max_barycentric_sum_error
     }
@@ -767,7 +842,12 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         },
     );
     let attributes = snapshot.selected_attributes;
-    let pipeline = if snapshot.depth_debug_enabled {
+    let pipeline = if snapshot.transparency_debug_enabled {
+        format!(
+            "opaque → cutout → transparent queue · identity M/V/P · viewport aspect {:.3}",
+            snapshot.aspect
+        )
+    } else if snapshot.depth_debug_enabled {
         format!(
             "depth overlap fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
             snapshot.aspect
@@ -801,7 +881,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             snapshot.aspect
         )
     };
-    let scene_name = if snapshot.depth_debug_enabled {
+    let scene_name = if snapshot.transparency_debug_enabled {
+        "intersecting transparent quad mesh"
+    } else if snapshot.depth_debug_enabled {
         "near/far overlap triangle mesh"
     } else if snapshot.perspective_debug_enabled {
         "tilted procedural checker quad mesh"
@@ -814,7 +896,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
     } else {
         "indexed mesh"
     };
-    let scene_suffix = if snapshot.depth_debug_enabled {
+    let scene_suffix = if snapshot.transparency_debug_enabled {
+        " · primitive view +Z sort limitation fixture"
+    } else if snapshot.depth_debug_enabled {
         if snapshot.depth_order_reversed {
             " · far-first submission"
         } else {
@@ -847,7 +931,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         "{}\n\
          {}\n\
          winding screen y-down orient2d > 0 front · cull {} · debug {}\n\
-         pipeline state debug {} · strict depth test/write · material {}\n\
+         pipeline state debug {} · strict depth test/write · material {} · alpha policy별 depth write\n\
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · covered {} · shaded samples {} · counter overflow {} · S=256 pixel center/top-left\n\
@@ -1659,5 +1743,63 @@ mod tests {
         assert_eq!(renderer.active_mesh_id(), 1);
         assert_eq!(renderer.mesh_upload_successes(), 1);
         assert_eq!(renderer.mesh_upload_failures(), 1);
+    }
+
+    #[test]
+    fn adapter_maps_chapter_twenty_two_alpha_queue_and_blend_stats() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert_eq!(renderer.alpha_mode(), 0);
+        renderer.set_alpha_mode(1).unwrap();
+        assert_eq!(renderer.alpha_mode(), 1);
+        renderer.set_alpha_mode(2).unwrap();
+        assert_eq!(renderer.alpha_mode(), 2);
+        renderer.set_alpha_mode(0).unwrap();
+        assert_eq!(renderer.alpha_mode(), 0);
+        assert!(
+            renderer
+                .set_alpha_mode(3)
+                .unwrap_err()
+                .contains("alpha mode")
+        );
+
+        renderer.set_alpha_cutoff(0.25).unwrap();
+        assert_eq!(renderer.alpha_cutoff(), 0.25);
+        assert!(
+            renderer
+                .set_alpha_cutoff(f32::NAN)
+                .unwrap_err()
+                .contains("0..1")
+        );
+        assert_eq!(renderer.alpha_cutoff(), 0.25);
+
+        renderer.set_transparency_debug_enabled(true);
+        assert!(renderer.transparency_debug_enabled());
+        assert!(renderer.transparent_sort_enabled());
+        assert_eq!(renderer.blend_color_space(), 0);
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.stats_alpha_discarded_samples() > 0);
+        assert!(renderer.stats_depth_written_samples() > 0);
+        assert!(renderer.stats_blended_samples() > 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("intersecting transparent quad mesh")
+        );
+        assert!(renderer.resize(32, 48));
+
+        renderer.set_transparent_sort_enabled(false);
+        assert!(!renderer.transparent_sort_enabled());
+        renderer.set_blend_color_space(1).unwrap();
+        assert_eq!(renderer.blend_color_space(), 1);
+        renderer.set_blend_color_space(0).unwrap();
+        assert_eq!(renderer.blend_color_space(), 0);
+        assert!(
+            renderer
+                .set_blend_color_space(2)
+                .unwrap_err()
+                .contains("blend color space")
+        );
+        renderer.set_transparency_debug_enabled(false);
+        assert!(!renderer.transparency_debug_enabled());
     }
 }

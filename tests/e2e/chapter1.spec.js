@@ -58,6 +58,11 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#shader-mode").value = ${JSON.stringify(String(initialControls.shaderMode ?? 1))};
           document.querySelector("#specular-color").value = ${JSON.stringify(initialControls.specularColor ?? "#ffffff")};
           document.querySelector("#shininess").value = ${JSON.stringify(String(initialControls.shininess ?? 32))};
+          document.querySelector("#alpha-mode").value = ${JSON.stringify(String(initialControls.alphaMode ?? 0))};
+          document.querySelector("#alpha-cutoff").value = ${JSON.stringify(String(initialControls.alphaCutoff ?? 0.5))};
+          document.querySelector("#transparency-debug").checked = ${JSON.stringify(initialControls.transparencyDebugEnabled ?? false)};
+          document.querySelector("#transparent-sort").checked = ${JSON.stringify(initialControls.transparentSortEnabled ?? true)};
+          document.querySelector("#blend-color-space").value = ${JSON.stringify(String(initialControls.blendColorSpace ?? 0))};
         </script>`;
         await route.fulfill({
           response,
@@ -2575,5 +2580,114 @@ test("asset_failure: 실제 OBJ 파일을 Rust Mesh로 바꾸고 실패 시 기�
     loadedMeshStatus: loaded.meshStatus,
     latestSelectionHash: latest.afterFirst.pixelHash,
     latestSelectionMeshStatus: latest.afterFirst.meshStatus,
+  });
+});
+
+test("transparency: cutout depth와 sorted linear blend를 Rust framebuffer에서 합성한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "transparency" },
+    { type: "steps", description: "34" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    windingDebugMode: 0,
+    alphaCutoff: 2,
+  });
+  await expect(page.locator("#error")).toContainText("0..1");
+  await expect(page.locator("#alpha-cutoff")).toHaveValue("0.5");
+
+  await page.locator("#alpha-mode").selectOption("1");
+  await expect
+    .poll(async () => page.evaluate(() => window.__softRasterizer.snapshot().transparency.alphaMode))
+    .toBe(1);
+  await page.locator("#alpha-cutoff").fill("0.4");
+  await page.locator("#alpha-cutoff").dispatchEvent("change");
+  await expect(page.locator("#error")).toHaveText("");
+  await expect
+    .poll(async () =>
+      page.evaluate(() => window.__softRasterizer.snapshot().transparency.alphaCutoff),
+    )
+    .toBeCloseTo(0.4);
+
+  await page.locator("#transparency-debug").check();
+  const loadedWhileFixture = await page.evaluate(() =>
+    window.__softRasterizer.uploadObjText(
+      "v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 3 2\n",
+      "transparency-reset.obj",
+    ),
+  );
+  expect(loadedWhileFixture.error).toBeNull();
+  expect(loadedWhileFixture.snapshot.transparency.debugEnabled).toBe(false);
+  expect(loadedWhileFixture.snapshot.stats.inputTriangles).toBe(1);
+  await expect(page.locator("#transparency-debug")).not.toBeChecked();
+  await page.locator("#transparency-debug").check();
+  const sorted = await page.evaluate(() => window.__softRasterizer.snapshot());
+
+  expect(sorted.transparency).toEqual({
+    debugEnabled: true,
+    alphaMode: 1,
+    alphaCutoff: Math.fround(0.4),
+    sortEnabled: true,
+    blendColorSpace: 0,
+  });
+  expect(sorted.stats).toMatchObject({
+    inputVertices: 16,
+    inputTriangles: 8,
+    generatedTriangles: 8,
+    invalidTriangles: 0,
+    invalidDepthSamples: 0,
+    invalidInterpolationSamples: 0,
+  });
+  expect(sorted.stats.alphaDiscardedSamples).toBeGreaterThan(0);
+  expect(sorted.stats.depthWrittenSamples).toBeGreaterThan(0);
+  expect(sorted.stats.blendedSamples).toBeGreaterThan(0);
+  expect(sorted.stats.depthWrittenSamples).toBeLessThan(sorted.stats.depthPassedSamples);
+  expect(sorted.pixelHash).toBe("2fbad03f");
+  await expect(page.locator("#transparency-status")).toContainText("view +Z descending");
+  await expect(page.locator("#transparency-status")).toContainText("Linear correct");
+
+  await page.locator("#alpha-cutoff").fill("2");
+  await page.locator("#alpha-cutoff").dispatchEvent("change");
+  await expect(page.locator("#error")).toContainText("0..1");
+  await expect(page.locator("#alpha-cutoff")).toHaveValue("0.4");
+  await page.locator("#alpha-cutoff").dispatchEvent("change");
+  await expect(page.locator("#error")).toHaveText("");
+
+  await page.locator("#transparent-sort").uncheck();
+  const unsorted = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(unsorted.pixelHash).not.toBe(sorted.pixelHash);
+  expect(unsorted.stats.coveredSamples).toBe(sorted.stats.coveredSamples);
+  expect(unsorted.stats.depthWrittenSamples).toBe(sorted.stats.depthWrittenSamples);
+
+  await page.locator("#transparent-sort").check();
+  await page.locator("#blend-color-space").selectOption("1");
+  const wrongSpace = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(wrongSpace.pixelHash).not.toBe(sorted.pixelHash);
+  expect(wrongSpace.stats.coveredSamples).toBe(sorted.stats.coveredSamples);
+
+  await page.locator("#blend-color-space").selectOption("0");
+  const restored = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(restored.pixelHash).toBe(sorted.pixelHash);
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter22-transparency.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter22-transparency", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    sortedHash: sorted.pixelHash,
+    unsortedHash: unsorted.pixelHash,
+    encodedWrongWayHash: wrongSpace.pixelHash,
+    intersectingGeometryLimitation:
+      "primitive 평균 view +Z 정렬은 교차하는 두 quad의 모든 fragment 순서를 해결하지 못한다",
   });
 });

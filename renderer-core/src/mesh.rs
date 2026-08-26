@@ -197,6 +197,8 @@ impl DrawItem {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ClipVertex {
     pub clip_pos: crate::transform::ClipPosition,
+    /// 왼손 view 공간의 +Z 깊이다. transparent primitive 정렬에 사용한다.
+    pub view_depth: f32,
     pub world_pos: Vec3,
     pub normal_world: Vec3,
     pub uv: Vec2,
@@ -210,6 +212,7 @@ impl ClipVertex {
             clip_pos: crate::transform::ClipPosition(
                 self.clip_pos.0 + (rhs.clip_pos.0 - self.clip_pos.0) * t,
             ),
+            view_depth: self.view_depth + (rhs.view_depth - self.view_depth) * t,
             world_pos: self.world_pos + (rhs.world_pos - self.world_pos) * t,
             normal_world: self.normal_world + (rhs.normal_world - self.normal_world) * t,
             uv: self.uv + (rhs.uv - self.uv) * t,

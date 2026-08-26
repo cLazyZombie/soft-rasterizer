@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 21장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct 속성, texture/lighting, Orbit/Fly 입력과 외부 OBJ import를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 framebuffer만 표시합니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 22장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import와 투명도 queue를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -83,11 +83,20 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - 파일은 UTF-8 OBJ, 최대 8 MiB다. JS는 크기와 비동기 파일 읽기를 맡고 Rust가 text parsing과 Mesh 검증을 소유한다.
 - 입력 좌표 profile은 이미 내부와 같은 LH `+X` right, `+Y` up, `+Z` forward다. 다른 DCC 축을 추측해서 바꾸지 않는다.
 - `v x y z`, `vt u v`, `vn x y z`, `f`를 지원한다. `o`, `g`, `s`, `usemtl`, `mtllib`은 metadata로 무시하며 그 밖의 record는 오류다.
-- face token은 `v`, `v/vt`, `v//vn`, `v/vt/vn`과 양수 1-based/음수 상대 index를 지원한다. 최대 8정점의 planar convex face만 fan으로 삼각분할하고 오목·비평면 face는 거부한다.
+- face token은 `v`, `v/vt`, `v//vn`, `v/vt/vn`과 양수 1-based/음수 상대 index를 지원한다. 최대 8정점의 planar strict-convex face만 fan으로 삼각분할하고 오목·자기교차·비평면 face는 거부한다.
 - vertex dedup key는 position/UV/normal index tuple 전체다. OBJ의 texture V는 importer에서 내부 top-left 규약으로 한 번 뒤집는다.
 - normal이 없으면 source position 단위로 면적 가중 normal을 생성한다. smoothing group은 아직 해석하지 않으므로 누락 normal은 같은 position에서 smooth하다는 것이 baseline hard-edge 정책이다.
 - 참조된 source bounds를 이용해 geometry를 중심 기준 `[-0.75, 0.75]` 범위로 정규화하므로 아주 크거나 작은 유한 모델도 기본 카메라에 들어온다. 원본 bounds는 asset status에 남는다.
 - glTF runtime parser는 이 장의 baseline에 포함하지 않는다. 확장 경계에는 Khronos glTF 2.0의 X reflection, triangle winding swap, normal/tangent handedness와 `C*M*C` 행렬 adapter 및 수학 fixture만 둔다.
+
+## 22장 투명도 기준선
+
+- `Material::alpha_mode`는 `Opaque`, `Mask`, `Blend`로 나뉘며 각각 opaque, cutout, transparent queue로 분류한다.
+- Opaque와 threshold를 통과한 Mask fragment만 strict depth test 뒤 깊이를 쓴다. Mask discard는 texture alpha를 얻은 뒤 색·깊이를 모두 바꾸지 않는다.
+- Blend triangle은 clipping 뒤 보존한 LH view-space `+Z` 대표 깊이를 기준으로 큰 값부터 안정 정렬한다. opaque/cutout 깊이에 대해서는 test하지만 깊이를 쓰지 않는다.
+- texture와 material은 straight alpha다. source-over는 destination RGBA8을 linear RGB로 decode해 합성한 뒤 sRGB로 encode하며 framebuffer alpha는 255를 유지한다.
+- debug fixture는 cutout checker와 서로 교차하는 두 반투명 quad를 함께 표시한다. primitive 평균 깊이 정렬은 교차 geometry의 fragment 순서를 완전히 해결하지 못하며 OIT는 이 장의 범위가 아니다.
+- `FrameStats`는 alpha discard, depth write, blended sample을 분리한다. UI의 encoded-sRGB wrong-way 비교는 같은 coverage/depth와 올바른 linear 경로의 수치·화면 차이를 고정한다.
 
 ## 교재
 

@@ -37,6 +37,9 @@ function rendererStats(renderer) {
     depthPassedSamples: renderer.stats_depth_passed_samples(),
     depthFailedSamples: renderer.stats_depth_failed_samples(),
     invalidDepthSamples: renderer.stats_invalid_depth_samples(),
+    alphaDiscardedSamples: renderer.stats_alpha_discarded_samples(),
+    depthWrittenSamples: renderer.stats_depth_written_samples(),
+    blendedSamples: renderer.stats_blended_samples(),
     maxBarycentricSumError: renderer.stats_max_barycentric_sum_error(),
     interpolatedInvWSamples: renderer.stats_interpolated_inv_w_samples(),
     invalidInterpolationSamples: renderer.stats_invalid_interpolation_samples(),
@@ -108,6 +111,11 @@ async function bootstrap() {
   const lightIntensityInput = document.querySelector("#light-intensity");
   const specularColorInput = document.querySelector("#specular-color");
   const shininessInput = document.querySelector("#shininess");
+  const alphaModeSelect = document.querySelector("#alpha-mode");
+  const alphaCutoffInput = document.querySelector("#alpha-cutoff");
+  const transparencyDebugCheckbox = document.querySelector("#transparency-debug");
+  const transparentSortCheckbox = document.querySelector("#transparent-sort");
+  const blendColorSpaceSelect = document.querySelector("#blend-color-space");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -162,6 +170,12 @@ async function bootstrap() {
       `specular ${specularColorInput.value} · shininess ${renderer.material_shininess().toFixed(1)}`;
     document.querySelector("#lighting-sample-stats").textContent =
       `${renderer.stats_lighting_samples()} lighting evaluations after depth`;
+    document.querySelector("#transparency-status").textContent =
+      `${alphaModeSelect.options[alphaModeSelect.selectedIndex].text} · cutoff ${renderer.alpha_cutoff().toFixed(2)} · ` +
+      `${transparentSortCheckbox.checked ? "view +Z descending" : "source order debug"} · ` +
+      `${blendColorSpaceSelect.options[blendColorSpaceSelect.selectedIndex].text} · ` +
+      `${renderer.stats_alpha_discarded_samples()} discarded · ${renderer.stats_depth_written_samples()} depth writes · ` +
+      `${renderer.stats_blended_samples()} blended`;
     document.querySelector("#camera-status").textContent =
       `${cameraModeSelect.options[cameraModeSelect.selectedIndex].text} · ` +
       `eye (${renderer.camera_eye_x().toFixed(3)}, ${renderer.camera_eye_y().toFixed(3)}, ${renderer.camera_eye_z().toFixed(3)}) · ` +
@@ -249,6 +263,7 @@ async function bootstrap() {
     renderer.set_clip_debug_enabled(enabled);
     clipDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
       perspectiveDebugCheckbox.checked = false;
@@ -260,6 +275,7 @@ async function bootstrap() {
     renderer.set_coverage_debug_enabled(enabled);
     coverageDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       clipDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
       perspectiveDebugCheckbox.checked = false;
@@ -271,6 +287,7 @@ async function bootstrap() {
     renderer.set_interpolation_debug_enabled(enabled);
     interpolationDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
       perspectiveDebugCheckbox.checked = false;
@@ -282,6 +299,7 @@ async function bootstrap() {
     renderer.set_perspective_debug_enabled(enabled);
     perspectiveDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
@@ -298,6 +316,7 @@ async function bootstrap() {
     renderer.set_depth_debug_enabled(enabled);
     depthDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
@@ -318,6 +337,7 @@ async function bootstrap() {
     renderer.set_texture_debug_enabled(enabled);
     textureDebugCheckbox.checked = enabled;
     if (enabled) {
+      transparencyDebugCheckbox.checked = false;
       renderer.set_texture_sampling_enabled(false);
       textureSamplingCheckbox.checked = false;
     }
@@ -384,6 +404,51 @@ async function bootstrap() {
     normalModeSelect.value = String(mode);
   };
 
+  const setAlphaMode = (mode) => {
+    renderer.set_alpha_mode(mode);
+    alphaModeSelect.value = String(mode);
+  };
+
+  const formatControlValue = (value) => {
+    const expected = Math.fround(value);
+    for (let precision = 1; precision <= 9; precision += 1) {
+      const candidate = Number(value.toPrecision(precision));
+      if (Object.is(Math.fround(candidate), expected)) {
+        return String(candidate);
+      }
+    }
+    return String(value);
+  };
+
+  const setAlphaCutoff = (cutoff) => {
+    renderer.set_alpha_cutoff(cutoff);
+    alphaCutoffInput.value = formatControlValue(renderer.alpha_cutoff());
+  };
+
+  const setTransparencyDebugEnabled = (enabled) => {
+    renderer.set_transparency_debug_enabled(enabled);
+    transparencyDebugCheckbox.checked = enabled;
+    if (enabled) {
+      clipDebugCheckbox.checked = false;
+      coverageDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
+      textureDebugCheckbox.checked = false;
+      setPipelineDebugMode(0);
+    }
+  };
+
+  const setTransparentSortEnabled = (enabled) => {
+    renderer.set_transparent_sort_enabled(enabled);
+    transparentSortCheckbox.checked = enabled;
+  };
+
+  const setBlendColorSpace = (mode) => {
+    renderer.set_blend_color_space(mode);
+    blendColorSpaceSelect.value = String(mode);
+  };
+
   const setDirectionalLight = (x, y, z, intensity) => {
     renderer.set_directional_light(x, y, z, intensity);
     lightXInput.value = String(x);
@@ -393,16 +458,6 @@ async function bootstrap() {
   };
 
   const restoreDirectionalLightInputs = () => {
-    const formatControlValue = (value) => {
-      const expected = Math.fround(value);
-      for (let precision = 1; precision <= 9; precision += 1) {
-        const candidate = Number(value.toPrecision(precision));
-        if (Object.is(Math.fround(candidate), expected)) {
-          return String(candidate);
-        }
-      }
-      return String(value);
-    };
     lightXInput.value = formatControlValue(renderer.light_surface_to_light_x());
     lightYInput.value = formatControlValue(renderer.light_surface_to_light_y());
     lightZInput.value = formatControlValue(renderer.light_surface_to_light_z());
@@ -434,6 +489,7 @@ async function bootstrap() {
     perspectiveDebugCheckbox.checked = false;
     depthDebugCheckbox.checked = false;
     textureDebugCheckbox.checked = false;
+    transparencyDebugCheckbox.checked = false;
   };
 
   const uploadObjBytes = (bytes, label = "OBJ") => {
@@ -476,6 +532,16 @@ async function bootstrap() {
   setTextureSamplingEnabled(textureSamplingCheckbox.checked);
   setLightingEnabled(lightingEnabledCheckbox.checked);
   setNormalMode(Number(normalModeSelect.value));
+  setAlphaMode(Number(alphaModeSelect.value));
+  try {
+    setAlphaCutoff(Number(alphaCutoffInput.value));
+  } catch (error) {
+    errorOutput.textContent = error instanceof Error ? error.message : String(error);
+    alphaCutoffInput.value = formatControlValue(renderer.alpha_cutoff());
+  }
+  setTransparentSortEnabled(transparentSortCheckbox.checked);
+  setBlendColorSpace(Number(blendColorSpaceSelect.value));
+  setTransparencyDebugEnabled(transparencyDebugCheckbox.checked);
   try {
     setMaterialSpecular(
       ...parseSrgbHex(specularColorInput.value),
@@ -597,6 +663,32 @@ async function bootstrap() {
       }
     });
   }
+  alphaModeSelect.addEventListener("change", () => {
+    setAlphaMode(Number(alphaModeSelect.value));
+    renderFrame(0);
+  });
+  alphaCutoffInput.addEventListener("change", () => {
+    try {
+      setAlphaCutoff(Number(alphaCutoffInput.value));
+      errorOutput.textContent = "";
+    } catch (error) {
+      errorOutput.textContent = error instanceof Error ? error.message : String(error);
+      alphaCutoffInput.value = formatControlValue(renderer.alpha_cutoff());
+    }
+    renderFrame(0);
+  });
+  transparencyDebugCheckbox.addEventListener("change", () => {
+    setTransparencyDebugEnabled(transparencyDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  transparentSortCheckbox.addEventListener("change", () => {
+    setTransparentSortEnabled(transparentSortCheckbox.checked);
+    renderFrame(0);
+  });
+  blendColorSpaceSelect.addEventListener("change", () => {
+    setBlendColorSpace(Number(blendColorSpaceSelect.value));
+    renderFrame(0);
+  });
   normalModeSelect.addEventListener("change", () => {
     setNormalMode(Number(normalModeSelect.value));
     renderFrame(0);
@@ -779,6 +871,13 @@ async function bootstrap() {
     lightingEnabled: lightingEnabledCheckbox.checked,
     shaderMode: renderer.shader_mode(),
     normalMode: renderer.normal_mode(),
+    transparency: {
+      debugEnabled: renderer.transparency_debug_enabled(),
+      alphaMode: renderer.alpha_mode(),
+      alphaCutoff: renderer.alpha_cutoff(),
+      sortEnabled: renderer.transparent_sort_enabled(),
+      blendColorSpace: renderer.blend_color_space(),
+    },
     materialSpecular: {
       color: [
         renderer.material_specular_red(),
@@ -886,6 +985,38 @@ async function bootstrap() {
         setLightingEnabled,
         setShaderMode,
         setNormalMode,
+        setAlphaMode(mode) {
+          setAlphaMode(mode);
+          renderFrame(0);
+          return snapshot();
+        },
+        setAlphaCutoff(cutoff) {
+          try {
+            setAlphaCutoff(cutoff);
+            renderFrame(0);
+            return { error: null, snapshot: snapshot() };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              snapshot: snapshot(),
+            };
+          }
+        },
+        setTransparencyDebugEnabled(enabled) {
+          setTransparencyDebugEnabled(enabled);
+          renderFrame(0);
+          return snapshot();
+        },
+        setTransparentSortEnabled(enabled) {
+          setTransparentSortEnabled(enabled);
+          renderFrame(0);
+          return snapshot();
+        },
+        setBlendColorSpace(mode) {
+          setBlendColorSpace(mode);
+          renderFrame(0);
+          return snapshot();
+        },
         setMaterialSpecular(red, green, blue, shininess) {
           setMaterialSpecular(red, green, blue, shininess);
           renderFrame(0);
@@ -1056,7 +1187,6 @@ async function bootstrap() {
   };
 
   requestAnimationFrame(onAnimationFrame);
-  errorOutput.textContent = "";
 }
 
 bootstrap().catch((error) => {

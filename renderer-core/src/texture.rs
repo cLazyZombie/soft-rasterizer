@@ -80,6 +80,24 @@ pub enum ShaderMode {
     BlinnPhong,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AlphaMode {
+    #[default]
+    Opaque,
+    Mask,
+    Blend,
+}
+
+impl AlphaMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Opaque => "opaque",
+            Self::Mask => "mask",
+            Self::Blend => "blend",
+        }
+    }
+}
+
 impl ShaderMode {
     pub const fn label(self) -> &'static str {
         match self {
@@ -109,6 +127,8 @@ pub struct Material {
     pub normal_mode: NormalMode,
     pub specular_color: Vec3,
     pub shininess: f32,
+    pub alpha_mode: AlphaMode,
+    pub alpha_cutoff: f32,
 }
 
 impl Default for Material {
@@ -122,6 +142,8 @@ impl Default for Material {
             normal_mode: NormalMode::Smooth,
             specular_color: Vec3::new(1.0, 1.0, 1.0),
             shininess: 32.0,
+            alpha_mode: AlphaMode::Opaque,
+            alpha_cutoff: 0.5,
         }
     }
 }
@@ -705,6 +727,11 @@ mod tests {
         assert_eq!(ShaderMode::Lambert.label(), "Lambert");
         assert_eq!(ShaderMode::BlinnPhong.label(), "Blinn-Phong");
         assert_eq!(material.shader_mode, ShaderMode::Unlit);
+        assert_eq!(material.alpha_mode, AlphaMode::Opaque);
+        assert_eq!(material.alpha_cutoff, 0.5);
+        assert_eq!(AlphaMode::Opaque.label(), "opaque");
+        assert_eq!(AlphaMode::Mask.label(), "mask");
+        assert_eq!(AlphaMode::Blend.label(), "blend");
         assert_eq!(material.normal_mode, NormalMode::Smooth);
         assert_eq!(material.specular_color, Vec3::new(1.0, 1.0, 1.0));
         assert_eq!(material.shininess, 32.0);
