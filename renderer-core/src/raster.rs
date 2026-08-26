@@ -1,7 +1,11 @@
 //! 9장의 screen-space winding/culling, 11장의 fixed-point coverage,
-//! 12장의 barycentric/affine color와 13장의 depth debug 계약.
+//! 12장의 barycentric/affine color, 13장의 depth와 14장의 perspective-correct 보간 계약.
 
-use crate::{camera::ViewportPosition, math::Vec4};
+use crate::{
+    camera::ViewportPosition,
+    math::{Vec2, Vec3, Vec4},
+    mesh::ClipVertex,
+};
 
 /// Wireframe 단계의 조기 분류에만 쓰는 float 면적 기준이다.
 ///
@@ -9,6 +13,7 @@ use crate::{camera::ViewportPosition, math::Vec4};
 pub const WIREFRAME_AREA_EPSILON: f32 = 1.0e-5;
 pub const SUBPIXEL_BITS: u32 = 8;
 pub const SUBPIXEL_SCALE: i64 = 1_i64 << SUBPIXEL_BITS;
+pub const PERSPECTIVE_DIVISOR_EPSILON: f32 = 1.0e-8;
 const SUBPIXEL_HALF: i64 = SUBPIXEL_SCALE / 2;
 const I64_UPPER_EXCLUSIVE: f64 = 9_223_372_036_854_775_808.0;
 
@@ -48,6 +53,22 @@ pub enum DepthDebugMode {
     Off,
     Grayscale,
     Heatmap,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AttributeInterpolationMode {
+    Affine,
+    #[default]
+    PerspectiveCorrect,
+}
+
+impl AttributeInterpolationMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Affine => "affine comparison",
+            Self::PerspectiveCorrect => "perspective-correct",
+        }
+    }
 }
 
 impl DepthDebugMode {
@@ -239,6 +260,14 @@ impl BarycentricCoordinates {
         values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
     }
 
+    pub fn interpolate_vec3(self, values: [Vec3; 3]) -> Vec3 {
+        values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
+    }
+
+    pub fn interpolate_vec2(self, values: [Vec2; 3]) -> Vec2 {
+        values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
+    }
+
     pub fn interpolate_f32(self, values: [f32; 3]) -> f32 {
         values[0] * self.lambda0 + values[1] * self.lambda1 + values[2] * self.lambda2
     }
@@ -248,31 +277,142 @@ impl BarycentricCoordinates {
     }
 }
 
-/// 12장 fragment 단계가 소유하는 affine 값이다.
-///
-/// UV, world position과 normal은 14장의 perspective-correct 경로 전까지 의도적으로
-/// 포함하지 않는다.
+/// clipping이 끝난 정점의 screen 위치, affine 비교용 원본 속성과 perspective 값을 고정한다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScreenVertex {
+    pub position: ViewportPosition,
+    inv_w: f32,
+    world_position: Vec3,
+    normal: Vec3,
+    uv: Vec2,
+    color: Vec4,
+    world_position_over_w: Vec3,
+    normal_over_w: Vec3,
+    uv_over_w: Vec2,
+    color_over_w: Vec4,
+}
+
+impl ScreenVertex {
+    pub fn from_clip_vertex(vertex: ClipVertex, position: ViewportPosition) -> Option<Self> {
+        let clip_w = vertex.clip_pos.0.w;
+        if !clip_w.is_finite()
+            || clip_w <= 0.0
+            || !viewport_is_finite(position)
+            || !clip_attributes_are_finite(vertex)
+        {
+            return None;
+        }
+        let inv_w = clip_w.recip();
+        let screen = Self {
+            position,
+            inv_w,
+            world_position: vertex.world_pos,
+            normal: vertex.normal_world,
+            uv: vertex.uv,
+            color: vertex.color,
+            world_position_over_w: vertex.world_pos * inv_w,
+            normal_over_w: vertex.normal_world * inv_w,
+            uv_over_w: vertex.uv * inv_w,
+            color_over_w: vertex.color * inv_w,
+        };
+        screen.values_are_finite().then_some(screen)
+    }
+
+    pub const fn inv_w(self) -> f32 {
+        self.inv_w
+    }
+
+    fn values_are_finite(self) -> bool {
+        viewport_is_finite(self.position)
+            && self.inv_w.is_finite()
+            && vec3_is_finite(self.world_position_over_w)
+            && vec3_is_finite(self.normal_over_w)
+            && vec2_is_finite(self.uv_over_w)
+            && vec4_is_finite(self.color_over_w)
+            && vec3_is_finite(self.world_position)
+            && vec3_is_finite(self.normal)
+            && vec2_is_finite(self.uv)
+            && vec4_is_finite(self.color)
+    }
+
+    fn world_position(self) -> Vec3 {
+        self.world_position
+    }
+
+    fn normal(self) -> Vec3 {
+        self.normal
+    }
+
+    fn uv(self) -> Vec2 {
+        self.uv
+    }
+
+    fn color(self) -> Vec4 {
+        self.color
+    }
+}
+
+/// coverage 뒤 한 번에 복원한 fragment 속성이다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FragmentInput {
     barycentric: BarycentricCoordinates,
-    affine_color: Vec4,
+    interpolated_inv_w: f32,
+    world_position: Vec3,
+    normal: Vec3,
+    uv: Vec2,
+    color: Vec4,
 }
 
 impl FragmentInput {
-    pub fn from_affine_color(
+    pub fn from_screen_vertices(
         barycentric: BarycentricCoordinates,
-        vertex_colors: [Vec4; 3],
+        vertices: [ScreenVertex; 3],
+        mode: AttributeInterpolationMode,
     ) -> Option<Self> {
-        if !vertex_colors.into_iter().all(vec4_is_finite) {
+        if !vertices.into_iter().all(ScreenVertex::values_are_finite) {
             return None;
         }
-        let affine_color = barycentric.interpolate_vec4(vertex_colors);
-        if !vec4_is_finite(affine_color) {
+        let interpolated_inv_w = barycentric.interpolate_f32(vertices.map(ScreenVertex::inv_w));
+        if !interpolated_inv_w.is_finite() || interpolated_inv_w <= PERSPECTIVE_DIVISOR_EPSILON {
+            return None;
+        }
+
+        let inv_w = vertices.map(ScreenVertex::inv_w);
+        let equal_w = inv_w[0] == inv_w[1] && inv_w[1] == inv_w[2];
+        let (world_position, normal, uv, color) = match (mode, equal_w) {
+            (AttributeInterpolationMode::Affine, _)
+            | (AttributeInterpolationMode::PerspectiveCorrect, true) => (
+                barycentric.interpolate_vec3(vertices.map(ScreenVertex::world_position)),
+                barycentric.interpolate_vec3(vertices.map(ScreenVertex::normal)),
+                barycentric.interpolate_vec2(vertices.map(ScreenVertex::uv)),
+                barycentric.interpolate_vec4(vertices.map(ScreenVertex::color)),
+            ),
+            (AttributeInterpolationMode::PerspectiveCorrect, false) => (
+                barycentric.interpolate_vec3(vertices.map(|vertex| vertex.world_position_over_w))
+                    / interpolated_inv_w,
+                barycentric.interpolate_vec3(vertices.map(|vertex| vertex.normal_over_w))
+                    / interpolated_inv_w,
+                barycentric.interpolate_vec2(vertices.map(|vertex| vertex.uv_over_w))
+                    / interpolated_inv_w,
+                barycentric.interpolate_vec4(vertices.map(|vertex| vertex.color_over_w))
+                    / interpolated_inv_w,
+            ),
+        };
+        let normal = normal.normalized()?;
+        if !vec3_is_finite(world_position)
+            || !vec3_is_finite(normal)
+            || !vec2_is_finite(uv)
+            || !vec4_is_finite(color)
+        {
             return None;
         }
         Some(Self {
             barycentric,
-            affine_color,
+            interpolated_inv_w,
+            world_position,
+            normal,
+            uv,
+            color,
         })
     }
 
@@ -280,9 +420,44 @@ impl FragmentInput {
         self.barycentric
     }
 
-    pub const fn affine_color(self) -> Vec4 {
-        self.affine_color
+    pub const fn interpolated_inv_w(self) -> f32 {
+        self.interpolated_inv_w
     }
+
+    pub const fn world_position(self) -> Vec3 {
+        self.world_position
+    }
+
+    pub const fn normal(self) -> Vec3 {
+        self.normal
+    }
+
+    pub const fn uv(self) -> Vec2 {
+        self.uv
+    }
+
+    pub const fn color(self) -> Vec4 {
+        self.color
+    }
+}
+
+fn viewport_is_finite(position: ViewportPosition) -> bool {
+    position.x.is_finite() && position.y.is_finite() && position.z_ndc.is_finite()
+}
+
+fn clip_attributes_are_finite(vertex: ClipVertex) -> bool {
+    vec3_is_finite(vertex.world_pos)
+        && vec3_is_finite(vertex.normal_world)
+        && vec2_is_finite(vertex.uv)
+        && vec4_is_finite(vertex.color)
+}
+
+const fn vec2_is_finite(value: Vec2) -> bool {
+    value.x.is_finite() && value.y.is_finite()
+}
+
+const fn vec3_is_finite(value: Vec3) -> bool {
+    value.x.is_finite() && value.y.is_finite() && value.z.is_finite()
 }
 
 const fn vec4_is_finite(value: Vec4) -> bool {
@@ -574,6 +749,36 @@ mod tests {
         [point(1.0, 1.0), point(5.0, 1.0), point(1.0, 4.0)]
     }
 
+    fn clip_vertex(
+        clip_w: f32,
+        world_pos: Vec3,
+        normal_world: Vec3,
+        uv: Vec2,
+        color: Vec4,
+    ) -> ClipVertex {
+        ClipVertex {
+            clip_pos: crate::transform::ClipPosition(Vec4::new(0.0, 0.0, clip_w * 0.5, clip_w)),
+            world_pos,
+            normal_world,
+            uv,
+            color,
+        }
+    }
+
+    fn screen_vertex(
+        clip_w: f32,
+        world_pos: Vec3,
+        normal_world: Vec3,
+        uv: Vec2,
+        color: Vec4,
+    ) -> ScreenVertex {
+        ScreenVertex::from_clip_vertex(
+            clip_vertex(clip_w, world_pos, normal_world, uv, color),
+            point(2.0, 3.0),
+        )
+        .unwrap()
+    }
+
     fn direct_samples(setup: &TriangleSetup) -> Vec<CoveredSample> {
         let Some(bounds) = setup.bounds() else {
             return Vec::new();
@@ -682,6 +887,18 @@ mod tests {
         assert_eq!(DepthDebugMode::Off.label(), "off");
         assert_eq!(DepthDebugMode::Grayscale.label(), "grayscale");
         assert_eq!(DepthDebugMode::Heatmap.label(), "range heatmap");
+        assert_eq!(
+            AttributeInterpolationMode::Affine.label(),
+            "affine comparison"
+        );
+        assert_eq!(
+            AttributeInterpolationMode::PerspectiveCorrect.label(),
+            "perspective-correct"
+        );
+        assert_eq!(
+            AttributeInterpolationMode::default(),
+            AttributeInterpolationMode::PerspectiveCorrect
+        );
     }
 
     #[test]
@@ -704,8 +921,10 @@ mod tests {
                 assert!((actual - expected).abs() <= f32::EPSILON);
             }
             assert!(barycentric.sum_error() <= f32::EPSILON);
-            let fragment = FragmentInput::from_affine_color(barycentric, colors).unwrap();
-            assert_eq!(fragment.affine_color(), barycentric.debug_color());
+            assert_eq!(
+                barycentric.interpolate_vec4(colors),
+                barycentric.debug_color()
+            );
             assert!(
                 (barycentric.interpolate_f32([0.0, 0.5, 1.0])
                     - (0.0 * expected[0] + 0.5 * expected[1] + expected[2]))
@@ -750,14 +969,18 @@ mod tests {
     }
 
     #[test]
-    fn fragment_input_rejects_non_finite_vertex_colors() {
-        let barycentric = BarycentricCoordinates::from_edge_values([1, 1, 1], 3).unwrap();
-        let valid = Vec4::new(0.25, 0.5, 0.75, 1.0);
+    fn affine_fragment_rejects_non_finite_or_overflowing_vertex_colors() {
         for non_finite in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
             assert_eq!(
-                FragmentInput::from_affine_color(
-                    barycentric,
-                    [valid, Vec4::new(non_finite, 0.0, 0.0, 1.0), valid],
+                ScreenVertex::from_clip_vertex(
+                    clip_vertex(
+                        1.0,
+                        Vec3::ZERO,
+                        Vec3::Z,
+                        Vec2::ZERO,
+                        Vec4::new(non_finite, 0.0, 0.0, 1.0),
+                    ),
+                    point(0.0, 0.0),
                 ),
                 None
             );
@@ -765,10 +988,201 @@ mod tests {
 
         let rounding_overflow = BarycentricCoordinates::from_edge_values([0, 1, 6], 7).unwrap();
         let largest_finite = Vec4::new(f32::MAX, f32::MAX, f32::MAX, f32::MAX);
+        let vertices = [
+            screen_vertex(1.0, Vec3::ZERO, Vec3::Z, Vec2::ZERO, largest_finite),
+            screen_vertex(1.0, Vec3::ZERO, Vec3::Z, Vec2::ZERO, largest_finite),
+            screen_vertex(1.0, Vec3::ZERO, Vec3::Z, Vec2::ZERO, largest_finite),
+        ];
         assert_eq!(
-            FragmentInput::from_affine_color(
+            FragmentInput::from_screen_vertices(
                 rounding_overflow,
-                [largest_finite, largest_finite, largest_finite],
+                vertices,
+                AttributeInterpolationMode::Affine,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn screen_vertex_is_created_after_divide_with_inv_w_and_attribute_over_w() {
+        let vertex = screen_vertex(
+            4.0,
+            Vec3::new(4.0, 8.0, 12.0),
+            Vec3::new(0.0, 0.0, -2.0),
+            Vec2::new(0.5, 0.75),
+            Vec4::new(1.0, 0.5, 0.25, 1.0),
+        );
+        assert_eq!(vertex.position, point(2.0, 3.0));
+        assert_eq!(vertex.inv_w(), 0.25);
+        assert_eq!(vertex.world_position_over_w, Vec3::new(1.0, 2.0, 3.0));
+        assert_eq!(vertex.normal_over_w, Vec3::new(0.0, 0.0, -0.5));
+        assert_eq!(vertex.uv_over_w, Vec2::new(0.125, 0.1875));
+        assert_eq!(vertex.color_over_w, Vec4::new(0.25, 0.125, 0.0625, 0.25));
+
+        let valid = clip_vertex(
+            1.0,
+            Vec3::ZERO,
+            Vec3::Z,
+            Vec2::ZERO,
+            Vec4::new(1.0, 1.0, 1.0, 1.0),
+        );
+        assert_eq!(
+            ScreenVertex::from_clip_vertex(valid, point(f32::NAN, 0.0)),
+            None
+        );
+        assert_eq!(
+            ScreenVertex::from_clip_vertex(
+                clip_vertex(0.0, Vec3::ZERO, Vec3::Z, Vec2::ZERO, valid.color),
+                point(0.0, 0.0),
+            ),
+            None
+        );
+        assert_eq!(
+            ScreenVertex::from_clip_vertex(
+                clip_vertex(
+                    f32::MIN_POSITIVE,
+                    Vec3::new(f32::MAX, 0.0, 0.0),
+                    Vec3::Z,
+                    Vec2::ZERO,
+                    valid.color,
+                ),
+                point(0.0, 0.0),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn perspective_correct_fragment_uses_one_shared_q_and_renormalizes_normal() {
+        let vertices = [
+            screen_vertex(
+                1.0,
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec3::new(1.0, 0.0, 0.0),
+                Vec2::new(0.0, 0.0),
+                Vec4::new(1.0, 0.0, 0.0, 1.0),
+            ),
+            screen_vertex(
+                2.0,
+                Vec3::new(2.0, 0.0, 2.0),
+                Vec3::new(0.0, 1.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec4::new(0.0, 1.0, 0.0, 1.0),
+            ),
+            screen_vertex(
+                4.0,
+                Vec3::new(4.0, 4.0, 4.0),
+                Vec3::new(0.0, 0.0, 1.0),
+                Vec2::new(1.0, 1.0),
+                Vec4::new(0.0, 0.0, 1.0, 1.0),
+            ),
+        ];
+        let barycentric = BarycentricCoordinates::from_edge_values([1, 1, 2], 4).unwrap();
+        let affine = FragmentInput::from_screen_vertices(
+            barycentric,
+            vertices,
+            AttributeInterpolationMode::Affine,
+        )
+        .unwrap();
+        let perspective = FragmentInput::from_screen_vertices(
+            barycentric,
+            vertices,
+            AttributeInterpolationMode::PerspectiveCorrect,
+        )
+        .unwrap();
+        assert_eq!(perspective.interpolated_inv_w(), 0.5);
+        assert_eq!(affine.uv(), Vec2::new(0.75, 0.5));
+        assert_eq!(perspective.uv(), Vec2::new(0.5, 0.25));
+        assert_eq!(perspective.world_position(), Vec3::new(1.5, 1.0, 2.0));
+        assert_eq!(perspective.color(), Vec4::new(0.5, 0.25, 0.25, 1.0));
+        assert!((perspective.normal().length() - 1.0).abs() <= f32::EPSILON);
+        assert_ne!(affine.color(), perspective.color());
+
+        for mode in [
+            AttributeInterpolationMode::Affine,
+            AttributeInterpolationMode::PerspectiveCorrect,
+        ] {
+            let at_third = FragmentInput::from_screen_vertices(
+                BarycentricCoordinates::from_edge_values([0, 0, 4], 4).unwrap(),
+                vertices,
+                mode,
+            )
+            .unwrap();
+            assert_eq!(at_third.uv(), Vec2::new(1.0, 1.0));
+            assert_eq!(at_third.world_position(), Vec3::new(4.0, 4.0, 4.0));
+            assert_eq!(at_third.color(), Vec4::new(0.0, 0.0, 1.0, 1.0));
+        }
+    }
+
+    #[test]
+    fn equal_w_modes_match_and_invalid_q_or_normal_is_rejected() {
+        let make_vertices = |clip_w, normal| {
+            [
+                screen_vertex(
+                    clip_w,
+                    Vec3::new(0.0, 0.0, 1.0),
+                    normal,
+                    Vec2::new(0.0, 0.0),
+                    Vec4::new(1.0, 0.0, 0.0, 1.0),
+                ),
+                screen_vertex(
+                    clip_w,
+                    Vec3::new(1.0, 0.0, 1.0),
+                    normal,
+                    Vec2::new(1.0, 0.0),
+                    Vec4::new(0.0, 1.0, 0.0, 1.0),
+                ),
+                screen_vertex(
+                    clip_w,
+                    Vec3::new(0.0, 1.0, 1.0),
+                    normal,
+                    Vec2::new(0.0, 1.0),
+                    Vec4::new(0.0, 0.0, 1.0, 1.0),
+                ),
+            ]
+        };
+        let barycentric = BarycentricCoordinates::from_edge_values([2, 3, 5], 10).unwrap();
+        let equal_w = make_vertices(2.0, Vec3::Z);
+        let affine = FragmentInput::from_screen_vertices(
+            barycentric,
+            equal_w,
+            AttributeInterpolationMode::Affine,
+        )
+        .unwrap();
+        let perspective = FragmentInput::from_screen_vertices(
+            barycentric,
+            equal_w,
+            AttributeInterpolationMode::PerspectiveCorrect,
+        )
+        .unwrap();
+        assert_eq!(affine.world_position(), perspective.world_position());
+        assert_eq!(affine.normal(), perspective.normal());
+        assert_eq!(affine.uv(), perspective.uv());
+        assert_eq!(affine.color(), perspective.color());
+
+        assert_eq!(
+            FragmentInput::from_screen_vertices(
+                barycentric,
+                make_vertices(1.0e9, Vec3::Z),
+                AttributeInterpolationMode::PerspectiveCorrect,
+            ),
+            None
+        );
+        assert_eq!(
+            FragmentInput::from_screen_vertices(
+                barycentric,
+                make_vertices(2.0, Vec3::ZERO),
+                AttributeInterpolationMode::PerspectiveCorrect,
+            ),
+            None
+        );
+        let mut corrupted_vertices = make_vertices(2.0, Vec3::Z);
+        corrupted_vertices[1].position.x = f32::NAN;
+        assert_eq!(
+            FragmentInput::from_screen_vertices(
+                barycentric,
+                corrupted_vertices,
+                AttributeInterpolationMode::PerspectiveCorrect,
             ),
             None
         );
@@ -803,9 +1217,7 @@ mod tests {
                 setup.rasterize(|sample| {
                     let index = sample.y * WIDTH + sample.x;
                     let barycentric = setup.barycentric(sample.edge_values).unwrap();
-                    let color = FragmentInput::from_affine_color(barycentric, colors)
-                        .unwrap()
-                        .affine_color();
+                    let color = barycentric.interpolate_vec4(colors);
                     let rgba = [
                         normalized_channel_to_u8(color.x),
                         normalized_channel_to_u8(color.y),

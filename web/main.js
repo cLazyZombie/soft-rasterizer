@@ -34,6 +34,10 @@ function rendererStats(renderer) {
     depthFailedSamples: renderer.stats_depth_failed_samples(),
     invalidDepthSamples: renderer.stats_invalid_depth_samples(),
     maxBarycentricSumError: renderer.stats_max_barycentric_sum_error(),
+    interpolatedInvWSamples: renderer.stats_interpolated_inv_w_samples(),
+    invalidInterpolationSamples: renderer.stats_invalid_interpolation_samples(),
+    minInterpolatedInvW: renderer.stats_min_interpolated_inv_w(),
+    maxInterpolatedInvW: renderer.stats_max_interpolated_inv_w(),
     debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
   };
@@ -71,6 +75,10 @@ async function bootstrap() {
   const clipDebugCheckbox = document.querySelector("#clip-debug");
   const coverageDebugCheckbox = document.querySelector("#coverage-debug");
   const interpolationDebugCheckbox = document.querySelector("#interpolation-debug");
+  const perspectiveDebugCheckbox = document.querySelector("#perspective-debug");
+  const attributeInterpolationModeSelect = document.querySelector(
+    "#attribute-interpolation-mode",
+  );
   const depthDebugCheckbox = document.querySelector("#depth-debug");
   const depthOrderReversedCheckbox = document.querySelector("#depth-order-reversed");
   const depthDebugModeSelect = document.querySelector("#depth-debug-mode");
@@ -103,7 +111,9 @@ async function bootstrap() {
     document.querySelector("#coverage-algorithm").textContent =
       "S=256 incremental edge · pixel center · top-left (Rust)";
     document.querySelector("#interpolation-algorithm").textContent =
-      "edge / area barycentric · affine color (Rust)";
+      attributeInterpolationModeSelect.value === "1"
+        ? "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)"
+        : "affine attribute 비교 경로 (Rust)";
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
@@ -172,6 +182,7 @@ async function bootstrap() {
     if (enabled) {
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
       depthDebugCheckbox.checked = false;
     }
   };
@@ -182,6 +193,7 @@ async function bootstrap() {
     if (enabled) {
       clipDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
       depthDebugCheckbox.checked = false;
     }
   };
@@ -192,8 +204,25 @@ async function bootstrap() {
     if (enabled) {
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
       depthDebugCheckbox.checked = false;
     }
+  };
+
+  const setPerspectiveDebugEnabled = (enabled) => {
+    renderer.set_perspective_debug_enabled(enabled);
+    perspectiveDebugCheckbox.checked = enabled;
+    if (enabled) {
+      clipDebugCheckbox.checked = false;
+      coverageDebugCheckbox.checked = false;
+      interpolationDebugCheckbox.checked = false;
+      depthDebugCheckbox.checked = false;
+    }
+  };
+
+  const setAttributeInterpolationMode = (mode) => {
+    renderer.set_attribute_interpolation_mode(mode);
+    attributeInterpolationModeSelect.value = String(mode);
   };
 
   const setDepthDebugEnabled = (enabled) => {
@@ -203,6 +232,7 @@ async function bootstrap() {
       clipDebugCheckbox.checked = false;
       coverageDebugCheckbox.checked = false;
       interpolationDebugCheckbox.checked = false;
+      perspectiveDebugCheckbox.checked = false;
     }
   };
 
@@ -224,6 +254,8 @@ async function bootstrap() {
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
   setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
+  setPerspectiveDebugEnabled(perspectiveDebugCheckbox.checked);
+  setAttributeInterpolationMode(Number(attributeInterpolationModeSelect.value));
   setDepthDebugEnabled(depthDebugCheckbox.checked);
   setDepthOrderReversed(depthOrderReversedCheckbox.checked);
   setDepthDebugMode(Number(depthDebugModeSelect.value));
@@ -250,6 +282,14 @@ async function bootstrap() {
   });
   interpolationDebugCheckbox.addEventListener("change", () => {
     setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  perspectiveDebugCheckbox.addEventListener("change", () => {
+    setPerspectiveDebugEnabled(perspectiveDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  attributeInterpolationModeSelect.addEventListener("change", () => {
+    setAttributeInterpolationMode(Number(attributeInterpolationModeSelect.value));
     renderFrame(0);
   });
   depthDebugCheckbox.addEventListener("change", () => {
@@ -317,6 +357,8 @@ async function bootstrap() {
     clipDebugEnabled: clipDebugCheckbox.checked,
     coverageDebugEnabled: coverageDebugCheckbox.checked,
     interpolationDebugEnabled: interpolationDebugCheckbox.checked,
+    perspectiveDebugEnabled: perspectiveDebugCheckbox.checked,
+    attributeInterpolationMode: Number(attributeInterpolationModeSelect.value),
     depthDebugEnabled: depthDebugCheckbox.checked,
     depthOrderReversed: depthOrderReversedCheckbox.checked,
     depthDebugMode: Number(depthDebugModeSelect.value),
@@ -348,6 +390,8 @@ async function bootstrap() {
         setClipDebugEnabled,
         setCoverageDebugEnabled,
         setInterpolationDebugEnabled,
+        setPerspectiveDebugEnabled,
+        setAttributeInterpolationMode,
         setDepthDebugEnabled,
         setDepthOrderReversed,
         setDepthDebugMode,

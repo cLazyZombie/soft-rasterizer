@@ -3,7 +3,7 @@
 use renderer_core::{
     CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
     math::Vec4,
-    raster::{CullMode, DepthDebugMode, WindingDebugMode},
+    raster::{AttributeInterpolationMode, CullMode, DepthDebugMode, WindingDebugMode},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -81,6 +81,24 @@ impl Renderer {
 
     pub fn set_interpolation_debug_enabled(&mut self, enabled: bool) {
         self.core.set_interpolation_debug_enabled(enabled);
+    }
+
+    pub fn set_perspective_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_perspective_debug_enabled(enabled);
+    }
+
+    pub fn set_attribute_interpolation_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => AttributeInterpolationMode::Affine,
+            1 => AttributeInterpolationMode::PerspectiveCorrect,
+            _ => {
+                return Err(format!(
+                    "알 수 없는 attribute interpolation mode입니다: {mode}"
+                ));
+            }
+        };
+        self.core.set_attribute_interpolation_mode(mode);
+        Ok(())
     }
 
     pub fn set_depth_debug_enabled(&mut self, enabled: bool) {
@@ -214,6 +232,22 @@ impl Renderer {
         self.stats().max_barycentric_sum_error
     }
 
+    pub fn stats_interpolated_inv_w_samples(&self) -> u32 {
+        self.stats().interpolated_inv_w_samples
+    }
+
+    pub fn stats_invalid_interpolation_samples(&self) -> u32 {
+        invalid_interpolation_samples(self.stats())
+    }
+
+    pub fn stats_min_interpolated_inv_w(&self) -> f32 {
+        self.stats().min_interpolated_inv_w
+    }
+
+    pub fn stats_max_interpolated_inv_w(&self) -> f32 {
+        self.stats().max_interpolated_inv_w
+    }
+
     pub fn stats_debug_pixels(&self) -> u32 {
         self.stats().debug_pixels
     }
@@ -221,6 +255,10 @@ impl Renderer {
     pub fn stats_invalid_values(&self) -> u32 {
         self.stats().invalid_values
     }
+}
+
+const fn invalid_interpolation_samples(stats: FrameStats) -> u32 {
+    stats.invalid_interpolation_samples
 }
 
 impl Renderer {
@@ -268,6 +306,11 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             "depth overlap fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
             snapshot.aspect
         )
+    } else if snapshot.perspective_debug_enabled {
+        format!(
+            "perspective UV fixture · identity M/V · LH zero-to-one P · viewport aspect {:.3}",
+            snapshot.aspect
+        )
     } else if snapshot.interpolation_debug_enabled {
         format!(
             "affine RGB fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
@@ -294,6 +337,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
     };
     let scene_name = if snapshot.depth_debug_enabled {
         "near/far overlap triangle mesh"
+    } else if snapshot.perspective_debug_enabled {
+        "tilted procedural checker quad mesh"
     } else if snapshot.interpolation_debug_enabled {
         "barycentric RGB triangle mesh"
     } else if snapshot.coverage_debug_enabled {
@@ -308,6 +353,11 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             " · far-first submission"
         } else {
             " · near-first submission"
+        }
+    } else if snapshot.perspective_debug_enabled {
+        match snapshot.attribute_interpolation_mode {
+            AttributeInterpolationMode::Affine => " · affine comparison",
+            AttributeInterpolationMode::PerspectiveCorrect => " · perspective-correct UV",
         }
     } else if snapshot.interpolation_debug_enabled {
         " · vertex colors R/G/B"
@@ -334,7 +384,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
          coverage stats rasterized {} · shaded samples {} · S=256 pixel center/top-left\n\
-         interpolation stats max |lambda sum - 1| {:.9}\n\
+         interpolation stats max |lambda sum - 1| {:.9} · mode {}\n\
+         inv_w stats samples {} · invalid {} · q range [{:.6}, {:.6}]\n\
          depth stats passed {} · failed {} · invalid {} · strict < · clear +infinity · debug {}\n\
          선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
@@ -361,6 +412,11 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.rasterized_triangles,
         snapshot.frame_stats.shaded_samples,
         snapshot.frame_stats.max_barycentric_sum_error,
+        snapshot.attribute_interpolation_mode.label(),
+        snapshot.frame_stats.interpolated_inv_w_samples,
+        snapshot.frame_stats.invalid_interpolation_samples,
+        snapshot.frame_stats.min_interpolated_inv_w,
+        snapshot.frame_stats.max_interpolated_inv_w,
         snapshot.frame_stats.depth_passed_samples,
         snapshot.frame_stats.depth_failed_samples,
         snapshot.frame_stats.invalid_depth_samples,
@@ -409,6 +465,17 @@ mod tests {
     use renderer_core::MAX_PIXEL_COUNT;
 
     #[test]
+    fn invalid_interpolation_counter_mapping_preserves_nonzero_values() {
+        assert_eq!(
+            invalid_interpolation_samples(FrameStats {
+                invalid_interpolation_samples: 7,
+                ..FrameStats::default()
+            }),
+            7
+        );
+    }
+
+    #[test]
     fn adapter_exposes_framebuffer_input_and_mesh_pipeline_stats() {
         let mut renderer = Renderer::new(3, 2).expect("adapter should be valid");
         assert_eq!((renderer.width(), renderer.height()), (3, 2));
@@ -438,6 +505,10 @@ mod tests {
         assert_eq!(renderer.stats_depth_failed_samples(), 0);
         assert_eq!(renderer.stats_invalid_depth_samples(), 0);
         assert_eq!(renderer.stats_max_barycentric_sum_error(), 0.0);
+        assert_eq!(renderer.stats_interpolated_inv_w_samples(), 0);
+        assert_eq!(renderer.stats_invalid_interpolation_samples(), 0);
+        assert_eq!(renderer.stats_min_interpolated_inv_w(), 0.0);
+        assert_eq!(renderer.stats_max_interpolated_inv_w(), 0.0);
         assert!(renderer.stats_debug_pixels() > 0);
         assert_eq!(renderer.stats_invalid_values(), 0);
     }
@@ -629,6 +700,61 @@ mod tests {
         renderer.set_clip_debug_enabled(true);
         renderer.update_and_render(0.0, 0);
         assert!(renderer.coordinate_debug_text().contains("clip debug mesh"));
+    }
+
+    #[test]
+    fn adapter_exposes_perspective_uv_fixture_modes_and_q_stats() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_perspective_debug_enabled(true);
+        renderer.set_attribute_interpolation_mode(0).unwrap();
+        renderer.update_and_render(0.0, 0);
+        let affine_text = renderer.coordinate_debug_text();
+        assert_eq!(renderer.stats_input_vertices(), 4);
+        assert_eq!(renderer.stats_input_triangles(), 2);
+        assert_eq!(renderer.stats_submitted_triangles(), 2);
+        assert_eq!(renderer.stats_invalid_interpolation_samples(), 0);
+        assert_eq!(
+            renderer.stats_interpolated_inv_w_samples(),
+            renderer.stats_shaded_samples()
+        );
+        assert!(renderer.stats_min_interpolated_inv_w() > 0.2);
+        assert!(renderer.stats_max_interpolated_inv_w() < 0.5);
+        assert!(affine_text.contains(
+            "perspective UV fixture · identity M/V · LH zero-to-one P · viewport aspect 1.000"
+        ));
+        assert!(affine_text.contains(
+            "tilted procedural checker quad mesh · vertices 4 · indices 6 · triangles 2 · material 0 · affine comparison"
+        ));
+        assert!(affine_text.contains("mode affine comparison"));
+        assert!(affine_text.contains("inv_w stats samples"));
+
+        renderer.set_attribute_interpolation_mode(1).unwrap();
+        renderer.update_and_render(0.0, 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("perspective-correct UV")
+        );
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("mode perspective-correct")
+        );
+        assert!(
+            renderer
+                .set_attribute_interpolation_mode(2)
+                .unwrap_err()
+                .contains("attribute interpolation mode")
+        );
+
+        renderer.set_interpolation_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("affine RGB fixture")
+        );
     }
 
     #[test]

@@ -69,7 +69,7 @@ P rows:
 - 정상 clip/viewport 출력과 최대 `16,777,216` 픽셀 계약에서는 각 edge 교차항이 최대 `width*height*S^2 = 1,099,511,627,776`이므로 i64 범위에 안전하다. 독립 setup API의 더 넓은 좌표는 i128로 area, edge step과 clamp된 bbox 네 모서리를 preflight하고 i64 범위를 벗어나면 명시적 오류로 거부한다.
 - bbox는 양자화 정점의 보수적인 정수 범위를 화면에 clamp한다. 첫 픽셀 중심에서 edge 세 개를 한 번 계산하고 x에는 `-dy*S`, y에는 `dx*S`를 더한다. coverage를 통과해 색을 기록한 sample 수는 `shaded_samples`, setup을 통과한 삼각형 수는 `rasterized_triangles`로 관찰한다.
 - coverage가 만든 `e0,e1,e2`는 각각 v0,v1,v2 반대 edge이며, `lambda_i=e_i/area`로 재사용한다. triangle setup은 `inv_area`를 한 번만 만들고 각 sample에서는 곱셈으로 barycentric 좌표를 복원한다. 공개 barycentric 생성자는 `0<=e_i<=area`와 `e0+e1+e2==area`를 검증한다.
-- 12장의 정점 색은 screen-space affine 보간이며 `FragmentInput`은 barycentric과 affine color만 소유한다. UV/world position/normal의 perspective-correct 보간은 14장까지 만들지 않는다. `max_barycentric_sum_error`로 프레임의 최대 `|lambda0+lambda1+lambda2-1|`를 관찰하고, non-finite fragment 입력/결과는 색을 쓰지 않은 채 `invalid_values`에 기록한다.
+- 12장의 정점 색 affine 경로는 비교 모드로 보존한다. 14장부터 clipping과 divide/viewport가 끝난 `ScreenVertex`가 `inv_w`와 world position/normal/UV/color의 `attribute_over_w`를 소유하며, `FragmentInput`은 한 분모 `q=Σ(lambda_i/w_i)`로 모든 일반 속성을 perspective-correct 복원한다. normal은 복원 뒤 재정규화하고 `q<=1e-8`, non-finite 속성 또는 정규화 실패 fragment는 색/깊이를 쓰지 않은 채 `invalid_interpolation_samples`와 `invalid_values`에 기록한다. `max_barycentric_sum_error`, 성공 sample 수와 q 최소/최대도 작은 `FrameStats`로 관찰한다.
 - 13장의 `z_ndc`도 같은 barycentric으로 screen-space affine 보간하지만 일반 정점 속성처럼 다시 perspective 보정하지 않는다. strict depth의 동일값 tie는 먼저 통과한 sample을 보존한다. near/far overlap fixture는 triangle 제출 순서를 뒤집어도 최종 RGBA와 depth가 exact match해야 한다.
 
 ## 카메라 입력

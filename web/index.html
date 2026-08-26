@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 13장</title>
+    <title>소프트웨어 래스터라이저 · 14장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>13장 · 깊이 버퍼와 가려짐</h1>
+        <h1>14장 · Perspective-correct 보간</h1>
       </div>
-      <p>affine z_ndc와 strict less 깊이 검사로 삼각형 제출 순서와 무관한 가려짐을 만듭니다.</p>
+      <p>clipping 뒤 만든 1/w와 attribute/w로 기울어진 UV를 복원하고 affine 결과와 비교합니다.</p>
       <div class="controls" role="group" aria-label="Culling, clipping, interpolation과 depth debug 설정">
         <label for="cull-mode">
           Culling
@@ -151,6 +151,17 @@
           <input id="interpolation-debug" type="checkbox" />
           R/G/B affine triangle fixture
         </label>
+        <label for="perspective-debug">
+          <input id="perspective-debug" type="checkbox" />
+          기울어진 UV checker quad fixture
+        </label>
+        <label for="attribute-interpolation-mode">
+          Attribute interpolation
+          <select id="attribute-interpolation-mode">
+            <option value="0">Affine 비교</option>
+            <option value="1" selected>Perspective-correct</option>
+          </select>
+        </label>
         <label for="depth-debug">
           <input id="depth-debug" type="checkbox" />
           Near/Far overlap fixture
@@ -170,7 +181,7 @@
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
-        clip → fan → divide/viewport → edge/top-left → barycentric → affine z_ndc → strict depth &lt; → color · 선택 정점 흰색(X-ray)
+        clip → fan → divide/viewport + 1/w · edge/top-left → barycentric → affine z_ndc → strict depth &lt; → attribute/w ÷ Σ(λ/w) · 선택 정점 흰색(X-ray)
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">

@@ -33,7 +33,7 @@ normal = normalize(normal_over_w_interpolated / inv_w_interpolated)
 1. clip을 마친 각 ScreenVertex에 inv_w와 모든 perspective 속성의 attr_over_w를 준비한다.
 1. coverage 픽셀에서 λ로 inv_w를 보간해 q를 얻는다. q가 0에 가깝거나 유한하지 않으면 fragment를 거부하고 통계를 올린다.
 1. UV, normal, world position, 선택적으로 vertex color의 over_w 값을 λ로 보간하고 q로 나눈다.
-1. normal은 복원 뒤 normalize_or_none을 호출한다. 실패하면 geometric normal이나 debug 색을 쓰는 명시적 정책을 둔다.
+1. normal은 복원 뒤 normalize를 호출한다. 길이가 0이거나 non-finite라 실패하면 fragment를 거부하고 오류 통계에 기록한다.
 1. affine/perspective 비교 모드를 남겨 이후 texture와 lighting 오류를 빠르게 구분한다.
 
 ```text
@@ -52,6 +52,14 @@ fragment.z_ndc = affine_depth(l0,l1,l2)
 ## JS-Wasm 경계
 
 JS는 affine/perspective 비교 toggle만 바꾼다. inv_w와 attr_over_w는 내부 중간값이므로 JS API에 노출하지 않는다. debug overlay에는 q의 최소/최대와 invalid 수만 작은 통계로 전달한다.
+
+## 현재 구현
+
+- `ScreenVertex::from_clip_vertex`는 여섯 평면 clipping과 perspective divide/viewport가 끝난 정점에서만 `inv_w`, `world_position_over_w`, `normal_over_w`, `uv_over_w`, `color_over_w`를 만든다. affine 비교의 bit-stable 입력을 위해 같은 immutable 정점 안에 원본 속성도 보존한다.
+- `FragmentInput::from_screen_vertices`가 한 번 계산한 `q=Σ(λ/w)`를 모든 일반 속성 복원에 공유한다. `q`가 유한하지 않거나 `1e-8` 이하면 색과 깊이를 기록하지 않고 `invalid_interpolation_samples`와 `invalid_values`를 올린다.
+- 기본 모드는 perspective-correct이고 affine은 교재 비교 모드로 유지한다. 두 모드는 같은 coverage와 screen-affine `z_ndc` 깊이를 사용한다.
+- 기울어진 4정점/2삼각형 fixture는 복원된 UV로 Rust 안에서 8×8 procedural checker를 그린다. 실제 이미지 입력과 sampler는 16~17장 범위라 이번 장에는 추가하지 않는다.
+- `FrameStats`는 복원에 성공한 sample 수, invalid 수와 프레임의 최소/최대 `q`만 공개한다. UV나 fragment 배열은 Wasm 경계를 넘기지 않는다.
 
 ## 코딩 에이전트 작업 명세
 

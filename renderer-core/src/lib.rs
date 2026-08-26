@@ -1,7 +1,7 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 13장까지 homogeneous clipping 뒤 fixed-point coverage, affine color와 z_ndc 보간,
-//! strict depth test로 mesh를 그린다.
+//! 14장까지 homogeneous clipping 뒤 fixed-point coverage, strict depth test와
+//! perspective-correct fragment 속성 복원으로 mesh를 그린다.
 
 pub mod camera;
 pub mod clip;
@@ -17,11 +17,12 @@ use camera::{
     NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
 };
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
-use math::{Mat4, Vec3, Vec4};
+use math::{Mat4, Vec2, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
-    CullMode, DepthDebugMode, FaceOrientation, FragmentInput, TriangleDisposition, TriangleSetup,
-    TriangleSetupError, WindingDebugMode, classify_triangle, normalized_channel_to_u8,
+    AttributeInterpolationMode, CullMode, DepthDebugMode, FaceOrientation, FragmentInput,
+    ScreenVertex, TriangleDisposition, TriangleSetup, TriangleSetupError, WindingDebugMode,
+    classify_triangle, normalized_channel_to_u8,
 };
 #[cfg(test)]
 use transform::CoordinateSpace;
@@ -39,6 +40,7 @@ const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
 const CLIP_DEBUG_SELECTED_VERTEX_INDEX: usize = 2;
 const COVERAGE_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
+const PERSPECTIVE_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const DEPTH_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const DEPTH_DEBUG_BACKGROUND: Color = Color::rgb(12, 18, 28);
 const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
@@ -340,6 +342,10 @@ pub struct FrameStats {
     pub depth_failed_samples: u32,
     pub invalid_depth_samples: u32,
     pub max_barycentric_sum_error: f32,
+    pub interpolated_inv_w_samples: u32,
+    pub invalid_interpolation_samples: u32,
+    pub min_interpolated_inv_w: f32,
+    pub max_interpolated_inv_w: f32,
     pub debug_pixels: u32,
     pub invalid_values: u32,
 }
@@ -399,6 +405,12 @@ impl MeshScene {
         scene
     }
 
+    fn new_perspective_debug(mesh: &Mesh, width: usize, height: usize) -> Self {
+        let mut scene = Self::with_capacity(mesh);
+        scene.rebuild_perspective_debug(mesh, width, height);
+        scene
+    }
+
     fn rebuild_cube(&mut self, mesh: &Mesh, model: Transform, width: usize, height: usize) {
         let aspect = width as f32 / height as f32;
         let view = look_at_lh(CAMERA_EYE, CAMERA_TARGET, CAMERA_WORLD_UP)
@@ -414,6 +426,19 @@ impl MeshScene {
         self.rebuild_with_pipeline(
             mesh,
             TransformPipeline::new(identity, identity, identity),
+            width,
+            height,
+        );
+    }
+
+    fn rebuild_perspective_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
+        let aspect = width as f32 / height as f32;
+        let identity = Mat4::identity();
+        let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
+            .expect("유효한 렌더 타깃의 perspective fixture projection은 항상 유효해야 한다");
+        self.rebuild_with_pipeline(
+            mesh,
+            TransformPipeline::new(identity, identity, projection),
             width,
             height,
         );
@@ -505,6 +530,8 @@ pub struct CoordinateDebugSnapshot {
     pub clip_debug_enabled: bool,
     pub coverage_debug_enabled: bool,
     pub interpolation_debug_enabled: bool,
+    pub perspective_debug_enabled: bool,
+    pub attribute_interpolation_mode: AttributeInterpolationMode,
     pub depth_debug_enabled: bool,
     pub depth_order_reversed: bool,
     pub depth_debug_mode: DepthDebugMode,
@@ -517,10 +544,11 @@ enum ActiveScene {
     Clipping,
     Coverage,
     Interpolation,
+    Perspective,
     Depth,
 }
 
-/// 렌더 타깃과 3-13장 indexed mesh/clipping/coverage/interpolation/depth debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-14장 indexed mesh/clipping/coverage/interpolation/depth debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -532,6 +560,8 @@ pub struct Renderer {
     clip_debug_enabled: bool,
     coverage_debug_enabled: bool,
     interpolation_debug_enabled: bool,
+    perspective_debug_enabled: bool,
+    attribute_interpolation_mode: AttributeInterpolationMode,
     depth_debug_enabled: bool,
     depth_order_reversed: bool,
     depth_debug_mode: DepthDebugMode,
@@ -544,6 +574,8 @@ pub struct Renderer {
     coverage_debug_scene: MeshScene,
     interpolation_debug_mesh: Mesh,
     interpolation_debug_scene: MeshScene,
+    perspective_debug_mesh: Mesh,
+    perspective_debug_scene: MeshScene,
     depth_debug_near_first_mesh: Mesh,
     depth_debug_far_first_mesh: Mesh,
     depth_debug_scene: MeshScene,
@@ -554,6 +586,8 @@ impl Renderer {
     const fn active_scene(&self) -> ActiveScene {
         if self.depth_debug_enabled {
             ActiveScene::Depth
+        } else if self.perspective_debug_enabled {
+            ActiveScene::Perspective
         } else if self.interpolation_debug_enabled {
             ActiveScene::Interpolation
         } else if self.coverage_debug_enabled {
@@ -586,6 +620,9 @@ impl Renderer {
         let interpolation_debug_mesh = interpolation_debug_fixture();
         let interpolation_debug_scene =
             MeshScene::new_identity_debug(&interpolation_debug_mesh, width, height);
+        let perspective_debug_mesh = perspective_debug_fixture(false);
+        let perspective_debug_scene =
+            MeshScene::new_perspective_debug(&perspective_debug_mesh, width, height);
         let depth_debug_near_first_mesh = depth_debug_fixture(false);
         let depth_debug_far_first_mesh = depth_debug_fixture(true);
         let depth_debug_scene =
@@ -600,6 +637,8 @@ impl Renderer {
             clip_debug_enabled: false,
             coverage_debug_enabled: false,
             interpolation_debug_enabled: false,
+            perspective_debug_enabled: false,
+            attribute_interpolation_mode: AttributeInterpolationMode::PerspectiveCorrect,
             depth_debug_enabled: false,
             depth_order_reversed: false,
             depth_debug_mode: DepthDebugMode::Off,
@@ -612,6 +651,8 @@ impl Renderer {
             coverage_debug_scene,
             interpolation_debug_mesh,
             interpolation_debug_scene,
+            perspective_debug_mesh,
+            perspective_debug_scene,
             depth_debug_near_first_mesh,
             depth_debug_far_first_mesh,
             depth_debug_scene,
@@ -641,6 +682,8 @@ impl Renderer {
             MeshScene::new_identity_debug(&self.coverage_debug_mesh, width, height);
         let replacement_interpolation_debug_scene =
             MeshScene::new_identity_debug(&self.interpolation_debug_mesh, width, height);
+        let replacement_perspective_debug_scene =
+            MeshScene::new_perspective_debug(&self.perspective_debug_mesh, width, height);
         let replacement_depth_debug_scene =
             MeshScene::new_identity_debug(&self.depth_debug_near_first_mesh, width, height);
         let (mesh, clip_vertices, selected_vertex_index) = match self.active_scene() {
@@ -666,6 +709,11 @@ impl Renderer {
                     .as_slice(),
                 INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
             ),
+            ActiveScene::Perspective => (
+                &self.perspective_debug_mesh,
+                replacement_perspective_debug_scene.clip_vertices.as_slice(),
+                PERSPECTIVE_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
             ActiveScene::Depth => (
                 if self.depth_order_reversed {
                     &self.depth_debug_far_first_mesh
@@ -690,6 +738,7 @@ impl Renderer {
         self.clip_debug_scene = replacement_clip_debug_scene;
         self.coverage_debug_scene = replacement_coverage_debug_scene;
         self.interpolation_debug_scene = replacement_interpolation_debug_scene;
+        self.perspective_debug_scene = replacement_perspective_debug_scene;
         self.depth_debug_scene = replacement_depth_debug_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
@@ -726,6 +775,11 @@ impl Renderer {
                 self.target.width(),
                 self.target.height(),
             ),
+            ActiveScene::Perspective => self.perspective_debug_scene.rebuild_perspective_debug(
+                &self.perspective_debug_mesh,
+                self.target.width(),
+                self.target.height(),
+            ),
             ActiveScene::Depth => self.depth_debug_scene.rebuild_identity_debug(
                 &self.depth_debug_near_first_mesh,
                 self.target.width(),
@@ -749,6 +803,11 @@ impl Renderer {
                 &self.interpolation_debug_scene,
                 INTERPOLATION_DEBUG_SELECTED_VERTEX_INDEX,
             ),
+            ActiveScene::Perspective => (
+                &self.perspective_debug_mesh,
+                &self.perspective_debug_scene,
+                PERSPECTIVE_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
             ActiveScene::Depth => (
                 if self.depth_order_reversed {
                     &self.depth_debug_far_first_mesh
@@ -766,6 +825,8 @@ impl Renderer {
                 cull_mode: self.cull_mode,
                 winding_debug_mode: self.winding_debug_mode,
                 depth_debug_mode: self.depth_debug_mode,
+                attribute_interpolation_mode: self.attribute_interpolation_mode,
+                uv_checker_enabled: self.perspective_debug_enabled,
             },
             mesh,
             &mut self.clipper,
@@ -796,6 +857,10 @@ impl Renderer {
             depth_failed_samples: draw_report.depth_failed_samples,
             invalid_depth_samples: draw_report.invalid_depth_samples,
             max_barycentric_sum_error: draw_report.max_barycentric_sum_error,
+            interpolated_inv_w_samples: draw_report.interpolated_inv_w_samples,
+            invalid_interpolation_samples: draw_report.invalid_interpolation_samples,
+            min_interpolated_inv_w: draw_report.min_interpolated_inv_w,
+            max_interpolated_inv_w: draw_report.max_interpolated_inv_w,
             debug_pixels: draw_report.debug_pixels,
             invalid_values: scene
                 .diagnostics
@@ -827,6 +892,7 @@ impl Renderer {
         if enabled {
             self.coverage_debug_enabled = false;
             self.interpolation_debug_enabled = false;
+            self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
         }
     }
@@ -836,6 +902,7 @@ impl Renderer {
         if enabled {
             self.clip_debug_enabled = false;
             self.interpolation_debug_enabled = false;
+            self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
         }
     }
@@ -845,8 +912,23 @@ impl Renderer {
         if enabled {
             self.clip_debug_enabled = false;
             self.coverage_debug_enabled = false;
+            self.perspective_debug_enabled = false;
             self.depth_debug_enabled = false;
         }
+    }
+
+    pub fn set_perspective_debug_enabled(&mut self, enabled: bool) {
+        self.perspective_debug_enabled = enabled;
+        if enabled {
+            self.clip_debug_enabled = false;
+            self.coverage_debug_enabled = false;
+            self.interpolation_debug_enabled = false;
+            self.depth_debug_enabled = false;
+        }
+    }
+
+    pub fn set_attribute_interpolation_mode(&mut self, mode: AttributeInterpolationMode) {
+        self.attribute_interpolation_mode = mode;
     }
 
     pub fn set_depth_debug_enabled(&mut self, enabled: bool) {
@@ -855,6 +937,7 @@ impl Renderer {
             self.clip_debug_enabled = false;
             self.coverage_debug_enabled = false;
             self.interpolation_debug_enabled = false;
+            self.perspective_debug_enabled = false;
         }
     }
 
@@ -931,6 +1014,13 @@ impl Renderer {
                     0.0,
                     0,
                 ),
+                ActiveScene::Perspective => (
+                    &self.perspective_debug_mesh,
+                    &self.perspective_debug_scene,
+                    PERSPECTIVE_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                ),
                 ActiveScene::Depth => (
                     if self.depth_order_reversed {
                         &self.depth_debug_far_first_mesh
@@ -967,6 +1057,8 @@ impl Renderer {
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
             interpolation_debug_enabled: self.interpolation_debug_enabled,
+            perspective_debug_enabled: self.perspective_debug_enabled,
+            attribute_interpolation_mode: self.attribute_interpolation_mode,
             depth_debug_enabled: self.depth_debug_enabled,
             depth_order_reversed: self.depth_order_reversed,
             depth_debug_mode: self.depth_debug_mode,
@@ -1053,6 +1145,27 @@ fn interpolation_debug_fixture() -> Mesh {
         .expect("고정 barycentric RGB triangle 계약은 항상 유효해야 한다")
 }
 
+fn perspective_debug_fixture(alternate_diagonal: bool) -> Mesh {
+    let normal = Vec3::new(6.0, 0.0, -4.0)
+        .normalized()
+        .expect("고정 perspective fixture normal은 0이 아니어야 한다");
+    let vertices = [
+        (Vec3::new(-1.0, 1.0, 2.0), Vec2::new(0.0, 0.0)),
+        (Vec3::new(1.0, 1.0, 5.0), Vec2::new(1.0, 0.0)),
+        (Vec3::new(1.0, -1.0, 5.0), Vec2::new(1.0, 1.0)),
+        (Vec3::new(-1.0, -1.0, 2.0), Vec2::new(0.0, 1.0)),
+    ]
+    .into_iter()
+    .map(|(position, uv)| mesh::Vertex::new(position, normal, uv, Vec4::new(1.0, 1.0, 1.0, 1.0)))
+    .collect();
+    let indices = if alternate_diagonal {
+        vec![0, 1, 3, 1, 2, 3]
+    } else {
+        vec![0, 1, 2, 0, 2, 3]
+    };
+    Mesh::new(vertices, indices).expect("고정 perspective UV quad 계약은 항상 유효해야 한다")
+}
+
 fn depth_debug_fixture(far_first: bool) -> Mesh {
     let near = Vec4::new(1.0, 0.2, 0.15, 1.0);
     let far = Vec4::new(0.15, 0.35, 1.0, 1.0);
@@ -1099,6 +1212,10 @@ struct FrameDrawReport {
     depth_failed_samples: u32,
     invalid_depth_samples: u32,
     max_barycentric_sum_error: f32,
+    interpolated_inv_w_samples: u32,
+    invalid_interpolation_samples: u32,
+    min_interpolated_inv_w: f32,
+    max_interpolated_inv_w: f32,
     debug_pixels: u32,
     invalid_values: u32,
 }
@@ -1109,6 +1226,8 @@ struct FrameDrawOptions {
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
     depth_debug_mode: DepthDebugMode,
+    attribute_interpolation_mode: AttributeInterpolationMode,
+    uv_checker_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1116,6 +1235,8 @@ struct RasterDrawOptions {
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
     depth_debug_mode: DepthDebugMode,
+    attribute_interpolation_mode: AttributeInterpolationMode,
+    uv_checker_enabled: bool,
 }
 
 impl FrameDrawOptions {
@@ -1125,6 +1246,8 @@ impl FrameDrawOptions {
             cull_mode: renderer.cull_mode,
             winding_debug_mode: renderer.winding_debug_mode,
             depth_debug_mode: renderer.depth_debug_mode,
+            attribute_interpolation_mode: renderer.attribute_interpolation_mode,
+            uv_checker_enabled: renderer.perspective_debug_enabled,
         }
     }
 
@@ -1133,6 +1256,8 @@ impl FrameDrawOptions {
             cull_mode: self.cull_mode,
             winding_debug_mode: self.winding_debug_mode,
             depth_debug_mode: self.depth_debug_mode,
+            attribute_interpolation_mode: self.attribute_interpolation_mode,
+            uv_checker_enabled: self.uv_checker_enabled,
         }
     }
 }
@@ -1348,6 +1473,16 @@ fn submit_triangle(
             return;
         }
     };
+    let screen_vertices = [
+        ScreenVertex::from_clip_vertex(generated[0], positions[0]),
+        ScreenVertex::from_clip_vertex(generated[1], positions[1]),
+        ScreenVertex::from_clip_vertex(generated[2], positions[2]),
+    ];
+    let [Some(first), Some(second), Some(third)] = screen_vertices else {
+        report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+        return;
+    };
+    let screen_vertices = [first, second, third];
     let ordered_positions = order.map(|index| positions[index]);
     let setup = match TriangleSetup::new(ordered_positions, target.width(), target.height()) {
         Ok(setup) => setup,
@@ -1366,7 +1501,7 @@ fn submit_triangle(
             return;
         }
     };
-    let ordered_colors = order.map(|index| generated[index].color);
+    let ordered_screen_vertices = order.map(|index| screen_vertices[index]);
     let ordered_depths = order.map(|index| positions[index].z_ndc);
     let facing_color = match source_orientation {
         FaceOrientation::Front => Color::rgb(72, 232, 112),
@@ -1377,6 +1512,10 @@ fn submit_triangle(
     let mut depth_passed_samples = 0_u32;
     let mut depth_failed_samples = 0_u32;
     let mut invalid_depth_samples = 0_u32;
+    let mut interpolated_inv_w_samples = 0_u32;
+    let mut invalid_interpolation_samples = 0_u32;
+    let mut min_interpolated_inv_w = 0.0_f32;
+    let mut max_interpolated_inv_w = 0.0_f32;
     let mut invalid_values = 0_u32;
     setup.rasterize(|sample| {
         let barycentric = setup.covered_barycentric(sample.edge_values);
@@ -1394,13 +1533,30 @@ fn submit_triangle(
                 return;
             }
         }
-        let Some(fragment) = FragmentInput::from_affine_color(barycentric, ordered_colors) else {
+        let Some(fragment) = FragmentInput::from_screen_vertices(
+            barycentric,
+            ordered_screen_vertices,
+            options.attribute_interpolation_mode,
+        ) else {
+            invalid_interpolation_samples = invalid_interpolation_samples.saturating_add(1);
             invalid_values = invalid_values.saturating_add(1);
             return;
         };
+        let interpolated_inv_w = fragment.interpolated_inv_w();
+        if interpolated_inv_w_samples == 0 {
+            min_interpolated_inv_w = interpolated_inv_w;
+            max_interpolated_inv_w = interpolated_inv_w;
+        } else {
+            min_interpolated_inv_w = min_interpolated_inv_w.min(interpolated_inv_w);
+            max_interpolated_inv_w = max_interpolated_inv_w.max(interpolated_inv_w);
+        }
+        interpolated_inv_w_samples = interpolated_inv_w_samples.saturating_add(1);
         let fill_color = match options.depth_debug_mode {
             DepthDebugMode::Off => match options.winding_debug_mode {
-                WindingDebugMode::VertexColor => debug_color(fragment.affine_color()),
+                WindingDebugMode::VertexColor if options.uv_checker_enabled => {
+                    uv_checker_color(fragment.uv())
+                }
+                WindingDebugMode::VertexColor => debug_color(fragment.color()),
                 WindingDebugMode::Facing => facing_color,
                 WindingDebugMode::Barycentric => debug_color(fragment.barycentric().debug_color()),
             },
@@ -1430,6 +1586,23 @@ fn submit_triangle(
     report.max_barycentric_sum_error = report
         .max_barycentric_sum_error
         .max(max_barycentric_sum_error);
+    if interpolated_inv_w_samples > 0 {
+        if report.interpolated_inv_w_samples == 0 {
+            report.min_interpolated_inv_w = min_interpolated_inv_w;
+            report.max_interpolated_inv_w = max_interpolated_inv_w;
+        } else {
+            report.min_interpolated_inv_w =
+                report.min_interpolated_inv_w.min(min_interpolated_inv_w);
+            report.max_interpolated_inv_w =
+                report.max_interpolated_inv_w.max(max_interpolated_inv_w);
+        }
+        report.interpolated_inv_w_samples = report
+            .interpolated_inv_w_samples
+            .saturating_add(interpolated_inv_w_samples);
+    }
+    report.invalid_interpolation_samples = report
+        .invalid_interpolation_samples
+        .saturating_add(invalid_interpolation_samples);
     report.invalid_values = report.invalid_values.saturating_add(invalid_values);
     if !draw_enabled {
         return;
@@ -1456,6 +1629,16 @@ fn submit_triangle(
     report.debug_pixels = report
         .debug_pixels
         .saturating_add(target.draw_wireframe_triangle(wireframe_positions, edge_colors));
+}
+
+fn uv_checker_color(uv: Vec2) -> Color {
+    let cell_x = (uv.x * 8.0).floor() as i32;
+    let cell_y = (uv.y * 8.0).floor() as i32;
+    if (cell_x + cell_y).rem_euclid(2) == 0 {
+        Color::rgb(242, 246, 255)
+    } else {
+        Color::rgb(34, 75, 132)
+    }
 }
 
 fn debug_color(color: Vec4) -> Color {
@@ -1539,6 +1722,32 @@ mod tests {
         })
     }
 
+    fn render_perspective_fixture(
+        alternate_diagonal: bool,
+        mode: AttributeInterpolationMode,
+    ) -> (RenderTarget, FrameDrawReport) {
+        let mesh = perspective_debug_fixture(alternate_diagonal);
+        let scene = MeshScene::new_perspective_debug(&mesh, 64, 64);
+        let mut target = RenderTarget::new(64, 64).unwrap();
+        target.render_gradient_checker();
+        let mut clipper = TriangleClipper::default();
+        let report = draw_mesh(
+            &mut target,
+            false,
+            RasterDrawOptions {
+                cull_mode: CullMode::Back,
+                winding_debug_mode: WindingDebugMode::VertexColor,
+                depth_debug_mode: DepthDebugMode::Off,
+                attribute_interpolation_mode: mode,
+                uv_checker_enabled: true,
+            },
+            &mesh,
+            &mut clipper,
+            &scene.clip_vertices,
+        );
+        (target, report)
+    }
+
     fn viewport_point(x: f32, y: f32) -> ViewportPosition {
         ViewportPosition { x, y, z_ndc: 0.5 }
     }
@@ -1551,6 +1760,8 @@ mod tests {
             cull_mode,
             winding_debug_mode,
             depth_debug_mode: DepthDebugMode::Off,
+            attribute_interpolation_mode: AttributeInterpolationMode::PerspectiveCorrect,
+            uv_checker_enabled: false,
         }
     }
 
@@ -2462,6 +2673,192 @@ mod tests {
         assert_eq!(report.shaded_samples, 0);
         assert_eq!(target.color(), color_before);
         assert!(target.depth().iter().all(|depth| depth.is_infinite()));
+    }
+
+    #[test]
+    fn chapter_fourteen_perspective_uv_differs_from_affine_without_changing_depth() {
+        let (affine_target, affine_report) =
+            render_perspective_fixture(false, AttributeInterpolationMode::Affine);
+        let (perspective_target, perspective_report) =
+            render_perspective_fixture(false, AttributeInterpolationMode::PerspectiveCorrect);
+
+        assert_ne!(affine_target.color(), perspective_target.color());
+        assert_eq!(fnv1a(affine_target.color()), 0xe8d9_2635);
+        assert_eq!(fnv1a(perspective_target.color()), 0xf152_6d3d);
+        assert_eq!(affine_target.depth(), perspective_target.depth());
+        assert_eq!(affine_report.submitted_triangles, 2);
+        assert_eq!(perspective_report.submitted_triangles, 2);
+        assert_eq!(
+            affine_report.shaded_samples,
+            perspective_report.shaded_samples
+        );
+        assert_eq!(
+            affine_report.depth_passed_samples,
+            perspective_report.depth_passed_samples
+        );
+        assert_eq!(perspective_report.invalid_depth_samples, 0);
+        assert_eq!(perspective_report.invalid_interpolation_samples, 0);
+        assert_eq!(
+            perspective_report.interpolated_inv_w_samples,
+            perspective_report.shaded_samples
+        );
+        assert!(perspective_report.min_interpolated_inv_w > 0.2);
+        assert!(perspective_report.max_interpolated_inv_w < 0.5);
+        assert!(
+            perspective_report.min_interpolated_inv_w < perspective_report.max_interpolated_inv_w
+        );
+    }
+
+    #[test]
+    fn chapter_fourteen_invalid_q_never_commits_an_invisible_occluder() {
+        let mesh = interpolation_debug_fixture();
+        let scene = MeshScene::new_identity_debug(&mesh, 64, 64);
+        let valid_generated: [ClipVertex; 3] = scene.clip_vertices.clone().try_into().unwrap();
+        let mut tiny_inv_w_generated = valid_generated;
+        for vertex in &mut tiny_inv_w_generated {
+            vertex.clip_pos.0 = Vec4::new(0.0, 0.0, 5.0e8, 1.0e9);
+        }
+        let near_positions = [
+            ViewportPosition {
+                x: 0.0,
+                y: 0.0,
+                z_ndc: 0.25,
+            },
+            ViewportPosition {
+                x: 0.125,
+                y: 0.0,
+                z_ndc: 0.25,
+            },
+            ViewportPosition {
+                x: 0.875,
+                y: 0.875,
+                z_ndc: 0.25,
+            },
+        ];
+        let farther_positions = near_positions.map(|position| ViewportPosition {
+            z_ndc: 0.75,
+            ..position
+        });
+        let mut target = RenderTarget::new(1, 1).unwrap();
+        target.render_gradient_checker();
+        let color_before = target.color().to_vec();
+        let depth_before = target.depth().to_vec();
+        let mut invalid_report = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            tiny_inv_w_generated,
+            near_positions,
+            &mut invalid_report,
+        );
+        assert_eq!(invalid_report.submitted_triangles, 1);
+        assert_eq!(invalid_report.rasterized_triangles, 1);
+        assert_eq!(invalid_report.interpolated_inv_w_samples, 0);
+        assert_eq!(invalid_report.invalid_interpolation_samples, 1);
+        assert_eq!(invalid_report.invalid_values, 1);
+        assert_eq!(invalid_report.depth_passed_samples, 0);
+        assert_eq!(invalid_report.shaded_samples, 0);
+        assert_eq!(target.color(), color_before);
+        assert_eq!(target.depth(), depth_before);
+
+        let mut valid_report = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            raster_options(CullMode::None, WindingDebugMode::VertexColor),
+            valid_generated,
+            farther_positions,
+            &mut valid_report,
+        );
+        assert_eq!(valid_report.depth_passed_samples, 1);
+        assert_eq!(valid_report.shaded_samples, 1);
+        assert_ne!(target.color(), color_before);
+        assert_ne!(target.depth(), depth_before);
+    }
+
+    #[test]
+    fn chapter_fourteen_perspective_quad_is_diagonal_independent() {
+        let (primary, primary_report) =
+            render_perspective_fixture(false, AttributeInterpolationMode::PerspectiveCorrect);
+        let (alternate, alternate_report) =
+            render_perspective_fixture(true, AttributeInterpolationMode::PerspectiveCorrect);
+        assert_eq!(primary.color(), alternate.color());
+        let max_depth_difference = primary
+            .depth()
+            .iter()
+            .zip(alternate.depth().iter())
+            .filter_map(|(primary_depth, alternate_depth)| {
+                if primary_depth.is_infinite() && alternate_depth.is_infinite() {
+                    None
+                } else {
+                    Some((primary_depth - alternate_depth).abs())
+                }
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(max_depth_difference <= DEPTH_RANGE_EPSILON);
+        assert_eq!(
+            primary_report.shaded_samples,
+            alternate_report.shaded_samples
+        );
+        assert_eq!(
+            primary_report.depth_passed_samples,
+            alternate_report.depth_passed_samples
+        );
+        assert_eq!(primary_report.invalid_interpolation_samples, 0);
+        assert_eq!(alternate_report.invalid_interpolation_samples, 0);
+    }
+
+    #[test]
+    fn chapter_fourteen_scene_mode_and_resize_preserve_public_debug_contract() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_perspective_debug_enabled(true);
+        renderer.set_attribute_interpolation_mode(AttributeInterpolationMode::Affine);
+        let affine = renderer.update_and_render(0.0, InputSnapshot::default());
+        let affine_hash = fnv1a(renderer.color_buffer());
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert!(snapshot.perspective_debug_enabled);
+        assert!(!snapshot.interpolation_debug_enabled);
+        assert_eq!(
+            snapshot.attribute_interpolation_mode,
+            AttributeInterpolationMode::Affine
+        );
+        assert_eq!(
+            (
+                snapshot.mesh_vertices,
+                snapshot.mesh_indices,
+                snapshot.mesh_triangles
+            ),
+            (4, 6, 2)
+        );
+        assert_eq!(affine.input_vertices, 4);
+        assert_eq!(affine.input_triangles, 2);
+        assert_eq!(affine.interpolated_inv_w_samples, affine.shaded_samples);
+
+        renderer.set_attribute_interpolation_mode(AttributeInterpolationMode::PerspectiveCorrect);
+        let perspective = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_ne!(fnv1a(renderer.color_buffer()), affine_hash);
+        assert_eq!(perspective.invalid_interpolation_samples, 0);
+
+        renderer.resize(96, 48).unwrap();
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.input_vertices, 4);
+        assert_eq!(resized.input_triangles, 2);
+        assert!(
+            renderer
+                .coordinate_debug_snapshot()
+                .perspective_debug_enabled
+        );
+
+        renderer.set_depth_debug_enabled(true);
+        assert!(
+            !renderer
+                .coordinate_debug_snapshot()
+                .perspective_debug_enabled
+        );
+        renderer.set_perspective_debug_enabled(true);
+        assert!(!renderer.coordinate_debug_snapshot().depth_debug_enabled);
     }
 
     #[test]

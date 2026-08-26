@@ -34,6 +34,8 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#clip-debug").checked = ${JSON.stringify(initialControls.clipDebugEnabled ?? false)};
           document.querySelector("#coverage-debug").checked = ${JSON.stringify(initialControls.coverageDebugEnabled ?? false)};
           document.querySelector("#interpolation-debug").checked = ${JSON.stringify(initialControls.interpolationDebugEnabled ?? false)};
+          document.querySelector("#perspective-debug").checked = ${JSON.stringify(initialControls.perspectiveDebugEnabled ?? false)};
+          document.querySelector("#attribute-interpolation-mode").value = ${JSON.stringify(String(initialControls.attributeInterpolationMode ?? 1))};
           document.querySelector("#depth-debug").checked = ${JSON.stringify(initialControls.depthDebugEnabled ?? false)};
           document.querySelector("#depth-order-reversed").checked = ${JSON.stringify(initialControls.depthOrderReversed ?? false)};
           document.querySelector("#depth-debug-mode").value = ${JSON.stringify(String(initialControls.depthDebugMode ?? 0))};
@@ -401,7 +403,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "clip → fan → divide/viewport → edge/top-left → barycentric → affine z_ndc → strict depth < → color · 선택 정점 흰색(X-ray)",
+    "clip → fan → divide/viewport + 1/w · edge/top-left → barycentric → affine z_ndc → strict depth < → attribute/w ÷ Σ(λ/w) · 선택 정점 흰색(X-ray)",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -786,7 +788,7 @@ test("triangle_pipeline: barycentric 좌표로 R/G/B 정점 색을 affine 보간
     "interpolation stats max |lambda sum - 1|",
   );
   await expect(page.locator("#interpolation-algorithm")).toHaveText(
-    "edge / area barycentric · affine color (Rust)",
+    "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)",
   );
 
   await page.locator("#barycentric-debug").check();
@@ -975,6 +977,192 @@ test("triangle_pipeline: strict depth가 제출 순서와 무관한 가려짐과
     baseSamples,
     grayscaleSamples,
     heatmapSamples,
+  });
+});
+
+test("triangle_pipeline: 기울어진 UV quad를 perspective-correct로 복원한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "triangle_pipeline" },
+    { type: "steps", description: "22" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    windingDebugMode: 0,
+    perspectiveDebugEnabled: true,
+    attributeInterpolationMode: 0,
+  });
+
+  const affine = await page.evaluate(() => {
+    window.__softRasterizer.setDebugLinesEnabled(false);
+    const snapshot = window.__softRasterizer.advanceFrame(0);
+    const canvas = document.querySelector("#framebuffer");
+    window.__chapterFourteenAffine = canvas
+      .getContext("2d")
+      .getImageData(0, 0, canvas.width, canvas.height).data.slice();
+    return snapshot;
+  });
+  expect(affine).toMatchObject({
+    perspectiveDebugEnabled: true,
+    attributeInterpolationMode: 0,
+  });
+  expect(affine.stats).toMatchObject({
+    inputVertices: 4,
+    inputTriangles: 2,
+    transformedVertices: 4,
+    submittedTriangles: 2,
+    culledTriangles: 0,
+    degenerateTriangles: 0,
+    invalidTriangles: 0,
+    fullyClippedTriangles: 0,
+    clipInvalidTriangles: 0,
+    generatedTriangles: 2,
+    maxClipPolygonVertices: 3,
+    rasterizedTriangles: 2,
+    invalidDepthSamples: 0,
+    invalidInterpolationSamples: 0,
+    debugPixels: 0,
+    invalidValues: 0,
+  });
+  expect(affine.stats.interpolatedInvWSamples).toBe(affine.stats.shadedSamples);
+  expect(affine.stats.minInterpolatedInvW).toBeGreaterThan(0.2);
+  expect(affine.stats.maxInterpolatedInvW).toBeLessThan(0.5);
+
+  await page.locator("#attribute-interpolation-mode").selectOption("1");
+  const perspective = await page.locator("#framebuffer").evaluate((canvas) => {
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    const affineData = window.__chapterFourteenAffine;
+    let differingPixels = 0;
+    let maxChannelDifference = 0;
+    for (let index = 0; index < data.length; index += 4) {
+      let differs = false;
+      for (let channel = 0; channel < 4; channel += 1) {
+        const difference = Math.abs(data[index + channel] - affineData[index + channel]);
+        maxChannelDifference = Math.max(maxChannelDifference, difference);
+        differs ||= difference !== 0;
+      }
+      differingPixels += Number(differs);
+    }
+    const pixel = (x, y) =>
+      Array.from(data.slice(4 * (y * canvas.width + x), 4 * (y * canvas.width + x) + 4));
+    return {
+      snapshot: window.__softRasterizer.snapshot(),
+      differingPixels,
+      maxChannelDifference,
+      samples: {
+        near: pixel(300, 270),
+        middle: pixel(450, 270),
+        far: pixel(540, 270),
+      },
+    };
+  });
+  expect(perspective.snapshot).toMatchObject({
+    perspectiveDebugEnabled: true,
+    attributeInterpolationMode: 1,
+  });
+  expect(perspective.snapshot.stats).toEqual({
+    ...affine.stats,
+    frameIndex: affine.stats.frameIndex + 1,
+  });
+  expect(perspective.differingPixels).toBeGreaterThan(0);
+  expect(perspective.maxChannelDifference).toBeGreaterThan(0);
+  expect(perspective.snapshot.pixelHash).not.toBe(affine.pixelHash);
+  expect({
+    shadedSamples: perspective.snapshot.stats.shadedSamples,
+    qSamples: perspective.snapshot.stats.interpolatedInvWSamples,
+    qRange: [
+      perspective.snapshot.stats.minInterpolatedInvW,
+      perspective.snapshot.stats.maxInterpolatedInvW,
+    ],
+    hashes: [affine.pixelHash, perspective.snapshot.pixelHash],
+    differingPixels: perspective.differingPixels,
+    maxChannelDifference: perspective.maxChannelDifference,
+    samples: perspective.samples,
+  }).toEqual({
+    shadedSamples: 107350,
+    qSamples: 107350,
+    qRange: [0.20002862811088562, 0.49969935417175293],
+    hashes: ["cc59bf30", "ddafc684"],
+    differingPixels: 47687,
+    maxChannelDifference: 208,
+    samples: {
+      near: [242, 246, 255, 255],
+      middle: [34, 75, 132, 255],
+      far: [242, 246, 255, 255],
+    },
+  });
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "perspective UV fixture · identity M/V · LH zero-to-one P · viewport aspect 1.778",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "tilted procedural checker quad mesh · vertices 4 · indices 6 · triangles 2 · material 0 · perspective-correct UV",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText(
+    "mode perspective-correct",
+  );
+  await expect(page.locator("#coordinate-debug")).toContainText("inv_w stats samples");
+  await expect(page.locator("#interpolation-algorithm")).toHaveText(
+    "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)",
+  );
+  await expect(page.locator(".space-legend")).toContainText(
+    "attribute/w ÷ Σ(λ/w)",
+  );
+
+  await page.locator("#clip-debug").check();
+  const clipping = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(clipping).toMatchObject({
+    clipDebugEnabled: true,
+    perspectiveDebugEnabled: false,
+    stats: {
+      inputVertices: 3,
+      inputTriangles: 1,
+      generatedTriangles: 3,
+      submittedTriangles: 3,
+      invalidTriangles: 0,
+    },
+  });
+  expect(clipping.pixelHash).not.toBe(perspective.snapshot.pixelHash);
+  await expect(page.locator("#coordinate-debug")).toContainText("동차 clip fixture");
+  await expect(page.locator("#coordinate-debug")).toContainText("clip debug mesh");
+  await page.locator("#perspective-debug").check();
+  const restored = await page.evaluate(() => {
+    delete window.__chapterFourteenAffine;
+    return window.__softRasterizer.snapshot();
+  });
+  expect(restored).toMatchObject({
+    clipDebugEnabled: false,
+    perspectiveDebugEnabled: true,
+    attributeInterpolationMode: 1,
+    pixelHash: perspective.snapshot.pixelHash,
+  });
+  const deterministic = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(deterministic.pixelHash).toBe(restored.pixelHash);
+  expect(deterministic.stats).toEqual({
+    ...restored.stats,
+    frameIndex: restored.stats.frameIndex + 1,
+  });
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter14-perspective-correct.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter14-perspective-correct", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, deterministic, 0, browserLog, screenshotPath, {
+    affinePixelHash: affine.pixelHash,
+    perspectiveDiff: {
+      differingPixels: perspective.differingPixels,
+      maxChannelDifference: perspective.maxChannelDifference,
+    },
+    perspectiveSamples: perspective.samples,
   });
 });
 
