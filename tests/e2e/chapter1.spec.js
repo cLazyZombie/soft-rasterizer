@@ -51,6 +51,10 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#depth-debug").checked = ${JSON.stringify(initialControls.depthDebugEnabled ?? false)};
           document.querySelector("#depth-order-reversed").checked = ${JSON.stringify(initialControls.depthOrderReversed ?? false)};
           document.querySelector("#depth-debug-mode").value = ${JSON.stringify(String(initialControls.depthDebugMode ?? 0))};
+          document.querySelector("#light-x").value = ${JSON.stringify(String(initialControls.lightX ?? -0.4))};
+          document.querySelector("#light-y").value = ${JSON.stringify(String(initialControls.lightY ?? 0.8))};
+          document.querySelector("#light-z").value = ${JSON.stringify(String(initialControls.lightZ ?? -0.45))};
+          document.querySelector("#light-intensity").value = ${JSON.stringify(String(initialControls.lightIntensity ?? 0.9))};
         </script>`;
         await route.fulfill({
           response,
@@ -1756,5 +1760,154 @@ test("texture_sampling: perspective UV로 nearest/bilinear와 repeat/clamp를 �
     nearestHash: nearest.pixelHash,
     bilinearRepeatHash: bilinearRepeat.pixelHash,
     bilinearClampHash: bilinearClamp.pixelHash,
+  });
+});
+
+test("lambert_lighting: normal matrix와 world-space 방향광 debug를 검증한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "lambert_lighting" },
+    { type: "steps", description: "36" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, {
+    cullMode: 1,
+    lightX: 0,
+    lightY: 0,
+    lightZ: -1,
+    lightIntensity: -1,
+  });
+  const recoveredBoot = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(recoveredBoot.directionalLight.intensity).toBeCloseTo(0.9, 6);
+  expect(recoveredBoot.directionalLight.surfaceToLight[2]).toBeLessThan(-0.4);
+  await expect(page.locator("#light-intensity")).toHaveValue("0.9");
+
+  await page.evaluate(() =>
+    window.__softRasterizer.setDirectionalLight(-0.4, 0.8, -0.45, 0.9),
+  );
+
+  await page.evaluate(() => {
+    window.__softRasterizer.uploadTextureRgba(2, 2, [
+      255, 32, 16, 255, 16, 255, 32, 255, 32, 16, 255, 255, 240, 240, 240, 255,
+    ]);
+    window.__softRasterizer.setModelRotationY(0.35);
+  });
+  await page.locator("#texture-sampling").check();
+  await page.locator("#lighting-enabled").check();
+  const lit = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(lit).toMatchObject({
+    textureSamplingEnabled: true,
+    lightingEnabled: true,
+    normalMode: 0,
+  });
+  expect(lit.stats.textureSamples).toBe(lit.stats.shadedSamples);
+  expect(lit.stats.lightingSamples).toBe(lit.stats.shadedSamples);
+  expect(lit.pixelHash).toBe("32be8b00");
+
+  await page.locator("#pipeline-debug-mode").selectOption("7");
+  const normal = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(normal.pipelineDebugMode).toBe(7);
+  expect(normal.stats.lightingSamples).toBe(0);
+  expect(normal.pixelHash).toBe("9f75d849");
+
+  await page.locator("#pipeline-debug-mode").selectOption("8");
+  const ndotl = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(ndotl.pipelineDebugMode).toBe(8);
+  expect(ndotl.stats.lightingSamples).toBe(ndotl.stats.shadedSamples);
+  expect(ndotl.pixelHash).toBe("e1f88a20");
+
+  await page.locator("#interpolation-debug").check();
+  const smoothFixture = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(smoothFixture.interpolationDebugEnabled).toBe(true);
+  expect(smoothFixture.normalMode).toBe(0);
+  expect(smoothFixture.pixelHash).toBe("2dd6e34b");
+  await page.locator("#normal-mode").selectOption("1");
+  const flatFixture = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(flatFixture.normalMode).toBe(1);
+  expect(flatFixture.pixelHash).toBe("52c8b439");
+  await page.locator("#interpolation-debug").uncheck();
+  const flat = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(flat.normalMode).toBe(1);
+  expect(flat.stats.lightingSamples).toBe(flat.stats.shadedSamples);
+  expect(flat.pixelHash).toBe("e1f88a20");
+
+  await page.locator("#light-x").fill("0.7");
+  await page.locator("#light-x").press("Enter");
+  const movedLight = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(movedLight.directionalLight.surfaceToLight[0]).toBeGreaterThan(0.5);
+  expect(movedLight.pixelHash).toBe("1ef1d825");
+
+  await page.locator("#pipeline-debug-mode").selectOption("0");
+  const movedLightLit = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(movedLightLit.stats.lightingSamples).toBe(movedLightLit.stats.shadedSamples);
+  expect(movedLightLit.pixelHash).toBe("ad4cc1f1");
+  await page.locator("#light-intensity").fill("0.25");
+  await page.locator("#light-intensity").press("Enter");
+  const lowIntensity = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(lowIntensity.directionalLight.intensity).toBe(0.25);
+  expect(lowIntensity.pixelHash).toBe("6fdc64fd");
+  await page.locator("#light-intensity").fill("-1");
+  await page.locator("#light-intensity").press("Enter");
+  await expect(page.locator("#error")).toContainText("intensity");
+  const afterInvalidIntensity = await page.evaluate(() =>
+    window.__softRasterizer.advanceFrame(0),
+  );
+  expect(afterInvalidIntensity.directionalLight.intensity).toBe(0.25);
+  expect(afterInvalidIntensity.pixelHash).toBe(lowIntensity.pixelHash);
+
+  await page.locator("#light-intensity").fill("0.0000004");
+  await page.locator("#light-intensity").press("Enter");
+  const tinyIntensity = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(tinyIntensity.directionalLight.intensity).toBeCloseTo(0.0000004, 12);
+
+  await page.locator("#light-x").fill("0");
+  await page.locator("#light-x").press("Enter");
+  await page.locator("#light-y").fill("0");
+  await page.locator("#light-y").press("Enter");
+  await page.locator("#light-z").fill("0");
+  await page.locator("#light-z").press("Enter");
+  await expect(page.locator("#error")).toContainText("surface_to_light");
+  await expect(page.locator("#light-intensity")).toHaveValue("4e-7");
+  await page.locator("#light-x").fill("0.1");
+  await page.locator("#light-x").press("Enter");
+  const afterRecoveredEdit = await page.evaluate(() =>
+    window.__softRasterizer.advanceFrame(0),
+  );
+  expect(afterRecoveredEdit.directionalLight.intensity).toBeCloseTo(0.0000004, 12);
+
+  await page.locator("#normal-mode").selectOption("0");
+  await page.locator("#light-x").fill("-0.4");
+  await page.locator("#light-y").fill("0.8");
+  await page.locator("#light-z").fill("-0.45");
+  await page.locator("#light-z").press("Enter");
+  await page.locator("#light-intensity").fill("0.9");
+  await page.locator("#light-intensity").press("Enter");
+  const restored = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(restored.pixelHash).toBe(lit.pixelHash);
+  await expect(page.locator("#lighting-status")).toContainText("Lambert 켬");
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter18-lambert-lighting.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter18-lambert-lighting", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    litHash: lit.pixelHash,
+    normalHash: normal.pixelHash,
+    ndotlHash: ndotl.pixelHash,
+    flatHash: flat.pixelHash,
+    smoothFixtureHash: smoothFixture.pixelHash,
+    flatFixtureHash: flatFixture.pixelHash,
+    movedLightHash: movedLight.pixelHash,
+    movedLightLitHash: movedLightLit.pixelHash,
+    lowIntensityHash: lowIntensity.pixelHash,
   });
 });

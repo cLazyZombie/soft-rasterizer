@@ -1,4 +1,4 @@
-//! 렌더링 좌표 규약을 드러내는 최소 벡터와 4x4 행렬 타입.
+//! 렌더링 좌표 규약을 드러내는 최소 벡터와 3x3/4x4 행렬 타입.
 
 use std::ops::{Add, Div, Mul, Sub};
 
@@ -265,6 +265,83 @@ impl Div<f32> for Vec4 {
     }
 }
 
+/// normal matrix 계산에 필요한 최소 3x3 행렬이다.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Mat3 {
+    rows: [[f32; 3]; 3],
+}
+
+impl Mat3 {
+    pub const fn from_rows(rows: [[f32; 3]; 3]) -> Self {
+        Self { rows }
+    }
+
+    pub const fn get(&self, row: usize, column: usize) -> f32 {
+        self.rows[row][column]
+    }
+
+    pub const fn transpose(self) -> Self {
+        Self::from_rows([
+            [self.get(0, 0), self.get(1, 0), self.get(2, 0)],
+            [self.get(0, 1), self.get(1, 1), self.get(2, 1)],
+            [self.get(0, 2), self.get(1, 2), self.get(2, 2)],
+        ])
+    }
+
+    pub fn determinant(self) -> f32 {
+        let [a, b, c] = self.rows[0];
+        let [d, e, f] = self.rows[1];
+        let [g, h, i] = self.rows[2];
+        a * (e * i - f * h) - b * (d * i - f * g) + c * (d * h - e * g)
+    }
+
+    pub fn inverse(self) -> Option<Self> {
+        let determinant = self.determinant();
+        if !determinant.is_finite() || determinant == 0.0 {
+            return None;
+        }
+        let [a, b, c] = self.rows[0];
+        let [d, e, f] = self.rows[1];
+        let [g, h, i] = self.rows[2];
+        let inverse_determinant = determinant.recip();
+        let inverse = Self::from_rows([
+            [e * i - f * h, c * h - b * i, b * f - c * e],
+            [f * g - d * i, a * i - c * g, c * d - a * f],
+            [d * h - e * g, b * g - a * h, a * e - b * d],
+        ]);
+        let inverse = inverse * inverse_determinant;
+        inverse
+            .rows
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+            .then_some(inverse)
+    }
+}
+
+impl Mul<Vec3> for Mat3 {
+    type Output = Vec3;
+
+    fn mul(self, vector: Vec3) -> Self::Output {
+        let component = |row| {
+            self.get(row, 0) * vector.x + self.get(row, 1) * vector.y + self.get(row, 2) * vector.z
+        };
+        Vec3::new(component(0), component(1), component(2))
+    }
+}
+
+impl Mul<f32> for Mat3 {
+    type Output = Self;
+
+    fn mul(self, scalar: f32) -> Self::Output {
+        let mut rows = self.rows;
+        for value in rows.iter_mut().flatten() {
+            *value *= scalar;
+        }
+        Self::from_rows(rows)
+    }
+}
+
 /// 논리적 행/열 접근과 열벡터 곱을 제공하는 4x4 행렬이다.
 ///
 /// 저장 순서는 private이며 외부 코드는 [`Mat4::get`]으로만 성분을 읽는다.
@@ -337,6 +414,14 @@ impl Mat4 {
 
     pub const fn get(&self, row: usize, column: usize) -> f32 {
         self.rows[row][column]
+    }
+
+    pub const fn upper_left_3x3(self) -> Mat3 {
+        Mat3::from_rows([
+            [self.get(0, 0), self.get(0, 1), self.get(0, 2)],
+            [self.get(1, 0), self.get(1, 1), self.get(1, 2)],
+            [self.get(2, 0), self.get(2, 1), self.get(2, 2)],
+        ])
     }
 
     pub fn transform_point(self, point: Vec3) -> Vec4 {
@@ -496,6 +581,49 @@ mod tests {
         assert_eq!(
             translation.transform_direction(Vec3::new(1.0, 2.0, 3.0)),
             Vec4::new(1.0, 2.0, 3.0, 0.0)
+        );
+    }
+
+    #[test]
+    fn mat3_inverse_transpose_preserves_normal_tangent_perpendicularity() {
+        let model = Mat4::rotation_y(0.7) * Mat4::scale(Vec3::new(2.0, 0.5, 3.0));
+        let model3 = model.upper_left_3x3();
+        let normal_matrix = model3.inverse().unwrap().transpose();
+        let tangent_object = Vec3::new(1.0, 1.0, 0.0).normalized().unwrap();
+        let normal_object = Vec3::new(-1.0, 1.0, 0.0).normalized().unwrap();
+        let tangent_world = model3 * tangent_object;
+        let normal_world = normal_matrix * normal_object;
+
+        assert!(tangent_world.dot(normal_world).abs() <= EPSILON);
+        assert_close(model3.determinant(), 3.0);
+    }
+
+    #[test]
+    fn mat3_uniform_scale_matches_model_direction_and_rejects_singular_or_invalid() {
+        let model3 =
+            (Mat4::rotation_x(0.4) * Mat4::scale(Vec3::new(2.0, 2.0, 2.0))).upper_left_3x3();
+        let normal = Vec3::new(0.2, 0.8, -0.4).normalized().unwrap();
+        assert_vec3_close(
+            (model3 * normal).normalized().unwrap(),
+            (model3.inverse().unwrap().transpose() * normal)
+                .normalized()
+                .unwrap(),
+        );
+        assert_eq!(
+            Mat4::scale(Vec3::new(1.0, 0.0, 1.0))
+                .upper_left_3x3()
+                .inverse(),
+            None
+        );
+        assert!(
+            Mat4::scale(Vec3::new(0.001, 0.001, 0.001))
+                .upper_left_3x3()
+                .inverse()
+                .is_some()
+        );
+        assert_eq!(
+            Mat3::from_rows([[f32::NAN, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0],]).inverse(),
+            None
         );
     }
 

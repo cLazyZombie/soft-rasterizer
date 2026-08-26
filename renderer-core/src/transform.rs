@@ -1,6 +1,6 @@
-//! 6장의 object/world/view/clip 공간 구분과 MVP 캐시.
+//! object/world/view/clip 공간, MVP 캐시와 18장 normal matrix 변환.
 
-use crate::math::{Mat4, Vec3, Vec4};
+use crate::math::{Mat3, Mat4, Vec3, Vec4};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct ObjectPosition(pub Vec3);
@@ -66,6 +66,7 @@ pub struct TransformPipeline {
     projection: Mat4,
     view_projection: Mat4,
     model_view_projection: Mat4,
+    normal_matrix: Option<Mat3>,
 }
 
 impl TransformPipeline {
@@ -77,6 +78,7 @@ impl TransformPipeline {
             projection,
             view_projection,
             model_view_projection: view_projection * model,
+            normal_matrix: model.upper_left_3x3().inverse().map(Mat3::transpose),
         }
     }
 
@@ -97,11 +99,10 @@ impl TransformPipeline {
         ClipPosition(self.model_view_projection * Vec4::point(object_pos.0))
     }
 
-    /// 8장 정점 단계가 translation을 제외한 model 변환을 normal에 적용한다.
-    ///
-    /// non-uniform scale의 inverse-transpose 보정은 조명을 도입하는 18장 범위다.
-    pub fn transform_model_direction(self, object_direction: Vec3) -> Vec4 {
-        self.model.transform_direction(object_direction)
+    /// model upper 3x3의 inverse-transpose로 object normal을 world 공간에 둔다.
+    /// singular model이면 `None`을 반환해 NaN이 vertex 속성으로 퍼지지 않게 한다.
+    pub fn transform_model_normal(self, object_normal: Vec3) -> Option<Vec3> {
+        (self.normal_matrix? * object_normal).normalized()
     }
 }
 
@@ -238,6 +239,10 @@ mod tests {
         }
     }
 
+    fn assert_vec3_close(actual: Vec3, expected: Vec3) {
+        assert_vec4_close(Vec4::direction(actual), Vec4::direction(expected));
+    }
+
     #[test]
     fn identity_pipeline_preserves_every_named_space() {
         let object = ObjectPosition(Vec3::new(0.25, -0.5, 0.75));
@@ -295,10 +300,23 @@ mod tests {
             pipeline.model_view_projection,
             projection * view * pipeline.model
         );
-        assert_eq!(
-            pipeline.transform_model_direction(Vec3::Y),
-            pipeline.model.transform_direction(Vec3::Y)
+        let expected_normal = pipeline
+            .model
+            .upper_left_3x3()
+            .inverse()
+            .unwrap()
+            .transpose()
+            * Vec3::Y;
+        assert_vec3_close(
+            pipeline.transform_model_normal(Vec3::Y).unwrap(),
+            expected_normal.normalized().unwrap(),
         );
+        let singular = TransformPipeline::new(
+            Mat4::scale(Vec3::new(1.0, 0.0, 1.0)),
+            Mat4::identity(),
+            Mat4::identity(),
+        );
+        assert_eq!(singular.transform_model_normal(Vec3::Y), None);
     }
 
     #[test]

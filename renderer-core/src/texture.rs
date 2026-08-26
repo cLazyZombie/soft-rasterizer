@@ -1,5 +1,5 @@
-//! 16장의 브라우저 디코드 결과를 소유하고 17장의 UV 주소화와 filtering을
-//! 수행하는 RGBA8 texture 저장소.
+//! 16장의 브라우저 디코드 결과를 소유하고 17장의 UV sampler와 18장의
+//! material normal/Lambert 상태를 묶는 RGBA8 texture 저장소.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
@@ -55,9 +55,42 @@ pub struct SamplerState {
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NormalMode {
+    #[default]
+    Smooth,
+    Flat,
+}
+
+impl NormalMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Smooth => "smooth",
+            Self::Flat => "flat",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Material {
     pub base_color_texture: Option<TextureId>,
     pub sampler: SamplerState,
+    pub base_color: Vec4,
+    pub ambient: f32,
+    pub lighting_enabled: bool,
+    pub normal_mode: NormalMode,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        Self {
+            base_color_texture: None,
+            sampler: SamplerState::default(),
+            base_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
+            ambient: 0.18,
+            lighting_enabled: false,
+            normal_mode: NormalMode::Smooth,
+        }
+    }
 }
 
 impl SamplerState {
@@ -565,5 +598,17 @@ mod tests {
         assert_eq!(AddressMode::ClampToEdge.label(), "clamp-to-edge");
         assert_eq!(FilterMode::Nearest.label(), "nearest");
         assert_eq!(FilterMode::Bilinear.label(), "bilinear");
+    }
+
+    #[test]
+    fn normal_mode_labels_and_material_defaults_are_stable() {
+        assert_eq!(NormalMode::Smooth.label(), "smooth");
+        assert_eq!(NormalMode::Flat.label(), "flat");
+        let material = Material::default();
+        assert_eq!(material.base_color_texture, None);
+        assert_eq!(material.base_color, Vec4::new(1.0, 1.0, 1.0, 1.0));
+        assert_eq!(material.ambient, 0.18);
+        assert!(!material.lighting_enabled);
+        assert_eq!(material.normal_mode, NormalMode::Smooth);
     }
 }

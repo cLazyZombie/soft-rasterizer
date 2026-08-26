@@ -47,7 +47,7 @@ pub enum WindingDebugMode {
     Barycentric,
 }
 
-/// 15장에서 하나의 pipeline state로 통합한 fragment 표시 방식이다.
+/// 18장까지 하나의 pipeline state로 통합한 fragment 표시 방식이다.
 ///
 /// 모든 모드는 같은 transform/clip/coverage/depth 경로를 통과하고 마지막
 /// fragment 색 표현만 바꾼다.
@@ -61,6 +61,8 @@ pub enum PipelineDebugMode {
     Depth,
     DepthHeatmap,
     FrontBack,
+    Normal,
+    NdotL,
 }
 
 impl PipelineDebugMode {
@@ -73,6 +75,8 @@ impl PipelineDebugMode {
             Self::Depth => "depth grayscale",
             Self::DepthHeatmap => "depth range heatmap",
             Self::FrontBack => "front green / back red",
+            Self::Normal => "world normal RGB",
+            Self::NdotL => "Lambert N dot L",
         }
     }
 }
@@ -399,6 +403,23 @@ impl FragmentInput {
         vertices: [ScreenVertex; 3],
         mode: AttributeInterpolationMode,
     ) -> Option<Self> {
+        Self::from_screen_vertices_internal(barycentric, vertices, mode, true)
+    }
+
+    pub(crate) fn from_screen_vertices_for_flat_normal(
+        barycentric: BarycentricCoordinates,
+        vertices: [ScreenVertex; 3],
+        mode: AttributeInterpolationMode,
+    ) -> Option<Self> {
+        Self::from_screen_vertices_internal(barycentric, vertices, mode, false)
+    }
+
+    fn from_screen_vertices_internal(
+        barycentric: BarycentricCoordinates,
+        vertices: [ScreenVertex; 3],
+        mode: AttributeInterpolationMode,
+        normalize_vertex_normal: bool,
+    ) -> Option<Self> {
         if !vertices.into_iter().all(ScreenVertex::values_are_finite) {
             return None;
         }
@@ -428,7 +449,11 @@ impl FragmentInput {
                     / interpolated_inv_w,
             ),
         };
-        let normal = normal.normalized()?;
+        let normal = if normalize_vertex_normal {
+            normal.normalized()?
+        } else {
+            normal
+        };
         if !vec3_is_finite(world_position)
             || !vec3_is_finite(normal)
             || !vec2_is_finite(uv)
@@ -927,6 +952,8 @@ mod tests {
             PipelineDebugMode::FrontBack.label(),
             "front green / back red"
         );
+        assert_eq!(PipelineDebugMode::Normal.label(), "world normal RGB");
+        assert_eq!(PipelineDebugMode::NdotL.label(), "Lambert N dot L");
         assert_eq!(PipelineDebugMode::default(), PipelineDebugMode::Solid);
         assert_eq!(DepthDebugMode::Off.label(), "off");
         assert_eq!(DepthDebugMode::Grayscale.label(), "grayscale");

@@ -48,6 +48,7 @@ function rendererStats(renderer) {
     textureUploadFailures: renderer.stats_texture_upload_failures(),
     activeTextureId: renderer.stats_active_texture_id(),
     textureSamples: renderer.stats_texture_samples(),
+    lightingSamples: renderer.stats_lighting_samples(),
   };
 }
 
@@ -98,6 +99,12 @@ async function bootstrap() {
   const textureFilterSelect = document.querySelector("#texture-filter");
   const textureAddressUSelect = document.querySelector("#texture-address-u");
   const textureAddressVSelect = document.querySelector("#texture-address-v");
+  const lightingEnabledCheckbox = document.querySelector("#lighting-enabled");
+  const normalModeSelect = document.querySelector("#normal-mode");
+  const lightXInput = document.querySelector("#light-x");
+  const lightYInput = document.querySelector("#light-y");
+  const lightZInput = document.querySelector("#light-z");
+  const lightIntensityInput = document.querySelector("#light-intensity");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -138,6 +145,15 @@ async function bootstrap() {
       `V ${textureAddressVSelect.options[textureAddressVSelect.selectedIndex].text} · Rust fragment sampling`;
     document.querySelector("#texture-sample-stats").textContent =
       `${renderer.stats_texture_samples()} sampled after depth`;
+    document.querySelector("#lighting-status").textContent =
+      `${lightingEnabledCheckbox.checked ? "Lambert 켬" : "Lambert 끔"} · ` +
+      `${normalModeSelect.options[normalModeSelect.selectedIndex].text} normal · ` +
+      `surface→light (${renderer.light_surface_to_light_x().toFixed(3)}, ` +
+      `${renderer.light_surface_to_light_y().toFixed(3)}, ` +
+      `${renderer.light_surface_to_light_z().toFixed(3)}) · ` +
+      `intensity ${renderer.light_intensity().toFixed(2)}`;
+    document.querySelector("#lighting-sample-stats").textContent =
+      `${renderer.stats_lighting_samples()} Lambert evaluations after depth`;
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#pipeline-algorithm").textContent =
@@ -303,6 +319,41 @@ async function bootstrap() {
     textureAddressVSelect.value = String(addressV);
   };
 
+  const setLightingEnabled = (enabled) => {
+    renderer.set_lighting_enabled(enabled);
+    lightingEnabledCheckbox.checked = enabled;
+  };
+
+  const setNormalMode = (mode) => {
+    renderer.set_normal_mode(mode);
+    normalModeSelect.value = String(mode);
+  };
+
+  const setDirectionalLight = (x, y, z, intensity) => {
+    renderer.set_directional_light(x, y, z, intensity);
+    lightXInput.value = String(x);
+    lightYInput.value = String(y);
+    lightZInput.value = String(z);
+    lightIntensityInput.value = String(intensity);
+  };
+
+  const restoreDirectionalLightInputs = () => {
+    const formatControlValue = (value) => {
+      const expected = Math.fround(value);
+      for (let precision = 1; precision <= 9; precision += 1) {
+        const candidate = Number(value.toPrecision(precision));
+        if (Object.is(Math.fround(candidate), expected)) {
+          return String(candidate);
+        }
+      }
+      return String(value);
+    };
+    lightXInput.value = formatControlValue(renderer.light_surface_to_light_x());
+    lightYInput.value = formatControlValue(renderer.light_surface_to_light_y());
+    lightZInput.value = formatControlValue(renderer.light_surface_to_light_z());
+    lightIntensityInput.value = formatControlValue(renderer.light_intensity());
+  };
+
   const uploadTextureRgba = (width, height, pixels) => {
     try {
       const id = renderer.upload_texture_rgba(width, height, pixels);
@@ -337,6 +388,19 @@ async function bootstrap() {
     Number(textureAddressVSelect.value),
   );
   setTextureSamplingEnabled(textureSamplingCheckbox.checked);
+  setLightingEnabled(lightingEnabledCheckbox.checked);
+  setNormalMode(Number(normalModeSelect.value));
+  try {
+    setDirectionalLight(
+      Number(lightXInput.value),
+      Number(lightYInput.value),
+      Number(lightZInput.value),
+      Number(lightIntensityInput.value),
+    );
+  } catch (error) {
+    errorOutput.textContent = error instanceof Error ? error.message : String(error);
+    restoreDirectionalLightInputs();
+  }
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -406,6 +470,32 @@ async function bootstrap() {
         Number(textureAddressVSelect.value),
       );
       renderFrame(0);
+    });
+  }
+  lightingEnabledCheckbox.addEventListener("change", () => {
+    setLightingEnabled(lightingEnabledCheckbox.checked);
+    renderFrame(0);
+  });
+  normalModeSelect.addEventListener("change", () => {
+    setNormalMode(Number(normalModeSelect.value));
+    renderFrame(0);
+  });
+  for (const input of [lightXInput, lightYInput, lightZInput, lightIntensityInput]) {
+    input.addEventListener("change", () => {
+      try {
+        setDirectionalLight(
+          Number(lightXInput.value),
+          Number(lightYInput.value),
+          Number(lightZInput.value),
+          Number(lightIntensityInput.value),
+        );
+        errorOutput.textContent = "";
+        renderFrame(0);
+      } catch (error) {
+        errorOutput.textContent = error instanceof Error ? error.message : String(error);
+        restoreDirectionalLightInputs();
+        updateStatus();
+      }
     });
   }
   const decodeAndUploadTextureFile = async (file, decode = decodeImageFileToRgba) => {
@@ -506,6 +596,16 @@ async function bootstrap() {
       addressU: renderer.sampler_address_u(),
       addressV: renderer.sampler_address_v(),
     },
+    lightingEnabled: lightingEnabledCheckbox.checked,
+    normalMode: renderer.normal_mode(),
+    directionalLight: {
+      surfaceToLight: [
+        renderer.light_surface_to_light_x(),
+        renderer.light_surface_to_light_y(),
+        renderer.light_surface_to_light_z(),
+      ],
+      intensity: renderer.light_intensity(),
+    },
     textureStatus: {
       activeId: renderer.active_texture_id(),
       width: renderer.active_texture_width(),
@@ -552,6 +652,13 @@ async function bootstrap() {
         setTextureSamplingEnabled,
         setSamplerState(filter, addressU, addressV) {
           setSamplerState(filter, addressU, addressV);
+          renderFrame(0);
+          return snapshot();
+        },
+        setLightingEnabled,
+        setNormalMode,
+        setDirectionalLight(x, y, z, intensity) {
+          setDirectionalLight(x, y, z, intensity);
           renderFrame(0);
           return snapshot();
         },

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 17장</title>
+    <title>소프트웨어 래스터라이저 · 18장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,9 +119,9 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>17장 · UV 주소화, Nearest, Bilinear 샘플링</h1>
+        <h1>18장 · 법선 변환과 Lambert 조명</h1>
       </div>
-      <p>Perspective-correct UV로 Rust texture를 샘플링하고 nearest/bilinear와 repeat/clamp 결과를 즉시 비교합니다.</p>
+      <p>Inverse-transpose normal matrix와 world-space 방향광으로 textured cube를 Lambert 조명하고 normal/N·L을 진단합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="cull-mode">
           Culling
@@ -141,6 +141,8 @@
             <option value="4">Depth grayscale</option>
             <option value="5">Depth heatmap</option>
             <option value="6">Front / Back</option>
+            <option value="7">World normal RGB</option>
+            <option value="8">N · L grayscale</option>
           </select>
         </label>
         <label for="winding-debug">
@@ -223,6 +225,21 @@
             <option value="1">Clamp</option>
           </select>
         </label>
+        <label for="lighting-enabled">
+          <input id="lighting-enabled" type="checkbox" />
+          Lambert 조명
+        </label>
+        <label for="normal-mode">
+          Normal
+          <select id="normal-mode">
+            <option value="0" selected>Smooth</option>
+            <option value="1">Flat</option>
+          </select>
+        </label>
+        <label for="light-x">Light X <input id="light-x" type="number" value="-0.4" step="0.05" /></label>
+        <label for="light-y">Light Y <input id="light-y" type="number" value="0.8" step="0.05" /></label>
+        <label for="light-z">Light Z <input id="light-z" type="number" value="-0.45" step="0.05" /></label>
+        <label for="light-intensity">Intensity <input id="light-intensity" type="number" value="0.9" min="0" step="0.05" /></label>
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
@@ -258,6 +275,10 @@
         <dd id="texture-sampler">초기화 중</dd>
         <dt>Texture samples</dt>
         <dd id="texture-sample-stats">초기화 중</dd>
+        <dt>Lambert lighting</dt>
+        <dd id="lighting-status">초기화 중</dd>
+        <dt>Lighting samples</dt>
+        <dd id="lighting-sample-stats">초기화 중</dd>
         <dt>프레임</dt>
         <dd id="frame-index">0</dd>
         <dt>고수준 렌더 호출</dt>

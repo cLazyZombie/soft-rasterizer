@@ -1,8 +1,7 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 17장까지 homogeneous clipping 뒤 scalar cube pipeline과 브라우저에서 한 번
-//! 업로드한 RGBA8 texture의 검증된 소유/debug 경로, perspective-correct UV
-//! sampler를 조립한다.
+//! 18장까지 homogeneous clipping 뒤 scalar cube pipeline, perspective-correct
+//! texture sampler와 inverse-transpose normal/Lambert 조명 경로를 조립한다.
 
 pub mod camera;
 pub mod clip;
@@ -27,7 +26,8 @@ use raster::{
     WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
 use texture::{
-    Material, SamplerState, Texture, TextureColorSpace, TextureError, TextureId, TextureStore,
+    Material, NormalMode, SamplerState, Texture, TextureColorSpace, TextureError, TextureId,
+    TextureStore,
 };
 #[cfg(test)]
 use transform::CoordinateSpace;
@@ -390,6 +390,7 @@ pub struct FrameStats {
     pub texture_upload_failures: u32,
     pub active_texture_id: u32,
     pub texture_samples: u32,
+    pub lighting_samples: u32,
 }
 
 impl FrameStats {
@@ -418,7 +419,7 @@ const fn pipeline_stats_are_consistent_or_overflowed(stats: FrameStats) -> bool 
     stats.sample_counter_overflow || stats.pipeline_relations_hold()
 }
 
-/// 15장의 고정 scalar pipeline state다. Material은 각 `DrawItem`이 소유하고,
+/// 18장까지의 고정 scalar pipeline state다. Material은 각 `DrawItem`이 소유하고,
 /// depth는 모든 debug mode에서 같은 strict-less test/write 계약을 사용한다.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PipelineState {
@@ -452,6 +453,74 @@ pub struct TextureAssetStatus {
     pub active_height: usize,
     pub successful_uploads: u32,
     pub failed_uploads: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DirectionalLight {
+    pub surface_to_light: Vec3,
+    pub color: Vec3,
+    pub intensity: f32,
+}
+
+impl Default for DirectionalLight {
+    fn default() -> Self {
+        Self {
+            surface_to_light: Vec3::new(-0.4, 0.8, -0.45)
+                .normalized()
+                .expect("기본 surface_to_light는 0이 아니어야 한다"),
+            color: Vec3::new(1.0, 0.96, 0.88),
+            intensity: 0.9,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LightingError {
+    InvalidDirection,
+    InvalidColor,
+    InvalidIntensity,
+}
+
+impl Display for LightingError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidDirection => {
+                formatter.write_str("surface_to_light는 유한한 0이 아닌 방향이어야 합니다")
+            }
+            Self::InvalidColor => {
+                formatter.write_str("directional light color는 유한한 음이 아닌 값이어야 합니다")
+            }
+            Self::InvalidIntensity => formatter
+                .write_str("directional light intensity는 유한한 음이 아닌 값이어야 합니다"),
+        }
+    }
+}
+
+impl Error for LightingError {}
+
+impl DirectionalLight {
+    pub fn new(surface_to_light: Vec3, color: Vec3, intensity: f32) -> Result<Self, LightingError> {
+        let surface_to_light = surface_to_light
+            .normalized()
+            .ok_or(LightingError::InvalidDirection)?;
+        if !color.x.is_finite()
+            || !color.y.is_finite()
+            || !color.z.is_finite()
+            || color.x < 0.0
+            || color.y < 0.0
+            || color.z < 0.0
+        {
+            return Err(LightingError::InvalidColor);
+        }
+        if !intensity.is_finite() || intensity < 0.0 {
+            return Err(LightingError::InvalidIntensity);
+        }
+        Ok(Self {
+            surface_to_light,
+            color,
+            intensity,
+        })
+    }
 }
 
 impl InputSnapshot {
@@ -508,9 +577,21 @@ impl MeshScene {
     }
 
     fn rebuild_cube(&mut self, mesh: &Mesh, model: Transform, width: usize, height: usize) {
+        self.rebuild_cube_with_camera(mesh, model, CAMERA_EYE, CAMERA_TARGET, width, height);
+    }
+
+    fn rebuild_cube_with_camera(
+        &mut self,
+        mesh: &Mesh,
+        model: Transform,
+        eye: Vec3,
+        target: Vec3,
+        width: usize,
+        height: usize,
+    ) {
         let aspect = width as f32 / height as f32;
-        let view = look_at_lh(CAMERA_EYE, CAMERA_TARGET, CAMERA_WORLD_UP)
-            .expect("고정 카메라 view 계약은 항상 유효해야 한다");
+        let view = look_at_lh(eye, target, CAMERA_WORLD_UP)
+            .expect("cube camera view 계약은 항상 유효해야 한다");
         let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
             .expect("유효한 렌더 타깃의 고정 projection 계약은 항상 유효해야 한다");
         let pipeline = TransformPipeline::new(model.model_matrix(), view, projection);
@@ -554,8 +635,9 @@ impl MeshScene {
         self.diagnostic_viewport_positions.clear();
         for vertex in mesh.vertices() {
             let trace = pipeline.trace(ObjectPosition(vertex.position_object));
-            let normal = pipeline.transform_model_direction(vertex.normal_object);
-            let raw_normal = Vec3::new(normal.x, normal.y, normal.z);
+            let normal_world = pipeline
+                .transform_model_normal(vertex.normal_object)
+                .unwrap_or(Vec3::ZERO);
             self.clip_vertices.push(ClipVertex {
                 clip_pos: trace.clip_pos,
                 world_pos: Vec3::new(
@@ -563,7 +645,7 @@ impl MeshScene {
                     trace.world_pos.0.y,
                     trace.world_pos.0.z,
                 ),
-                normal_world: raw_normal.normalized().unwrap_or(raw_normal),
+                normal_world,
                 uv: vertex.uv,
                 color: vertex.color,
             });
@@ -654,7 +736,7 @@ fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mu
     materials.get_mut(id.0 as usize)
 }
 
-/// 렌더 타깃과 3-16장 scalar cube pipeline/texture debug scene 상태를 소유한다.
+/// 렌더 타깃과 3-18장 scalar cube pipeline/texture/lighting 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -674,6 +756,7 @@ pub struct Renderer {
     texture_upload_successes: u32,
     texture_upload_failures: u32,
     materials: Vec<Material>,
+    directional_light: DirectionalLight,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -756,6 +839,7 @@ impl Renderer {
             texture_upload_successes: 0,
             texture_upload_failures: 0,
             materials: vec![Material::default()],
+            directional_light: DirectionalLight::default(),
             mesh,
             draw_item,
             mesh_scene,
@@ -777,6 +861,8 @@ impl Renderer {
             pipeline_state: renderer.pipeline_state,
             uv_checker_enabled: renderer.perspective_debug_enabled,
             sampled_texture: None,
+            material: Material::default(),
+            light: renderer.directional_light,
         };
         draw_frame(
             &mut renderer.target,
@@ -843,9 +929,17 @@ impl Renderer {
                 DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
             ),
         };
+        let cube_material = *material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        let material = if matches!(self.active_scene(), ActiveScene::Cube) {
+            cube_material
+        } else {
+            Material {
+                normal_mode: cube_material.normal_mode,
+                ..Material::default()
+            }
+        };
         let sampled_texture = if matches!(self.active_scene(), ActiveScene::Cube) {
-            let material = material_for_id(&self.materials, self.draw_item.material_id)
-                .expect("DrawItem material ID는 저장소에 존재해야 한다");
             material.base_color_texture.map(|texture_id| {
                 (
                     self.textures
@@ -862,6 +956,8 @@ impl Renderer {
             pipeline_state: self.pipeline_state,
             uv_checker_enabled: self.perspective_debug_enabled,
             sampled_texture,
+            material,
+            light: self.directional_light,
         };
         if self.texture_debug_enabled {
             let texture = self
@@ -978,9 +1074,17 @@ impl Renderer {
                 self.target.render_texture_nearest(texture),
             )
         } else {
+            let cube_material = *material_for_id(&self.materials, self.draw_item.material_id)
+                .expect("DrawItem material ID는 저장소에 존재해야 한다");
+            let material = if matches!(self.active_scene(), ActiveScene::Cube) {
+                cube_material
+            } else {
+                Material {
+                    normal_mode: cube_material.normal_mode,
+                    ..Material::default()
+                }
+            };
             let sampled_texture = if matches!(self.active_scene(), ActiveScene::Cube) {
-                let material = material_for_id(&self.materials, self.draw_item.material_id)
-                    .expect("DrawItem material ID는 저장소에 존재해야 한다");
                 material.base_color_texture.map(|texture_id| {
                     (
                         self.textures
@@ -1000,6 +1104,8 @@ impl Renderer {
                         pipeline_state: self.pipeline_state,
                         uv_checker_enabled: self.perspective_debug_enabled,
                         sampled_texture,
+                        material,
+                        light: self.directional_light,
                     },
                     mesh,
                     &mut self.clipper,
@@ -1064,6 +1170,7 @@ impl Renderer {
             texture_upload_failures: self.texture_upload_failures,
             active_texture_id: self.active_texture_id.0,
             texture_samples: draw_report.texture_samples,
+            lighting_samples: draw_report.lighting_samples,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
@@ -1190,6 +1297,44 @@ impl Renderer {
         material_for_id(&self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다")
             .sampler
+    }
+
+    pub fn set_lighting_enabled(&mut self, enabled: bool) {
+        material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .lighting_enabled = enabled;
+    }
+
+    pub fn lighting_enabled(&self) -> bool {
+        material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .lighting_enabled
+    }
+
+    pub fn set_normal_mode(&mut self, normal_mode: NormalMode) {
+        material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .normal_mode = normal_mode;
+    }
+
+    pub fn normal_mode(&self) -> NormalMode {
+        material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .normal_mode
+    }
+
+    pub fn set_directional_light(
+        &mut self,
+        surface_to_light: Vec3,
+        intensity: f32,
+    ) -> Result<(), LightingError> {
+        self.directional_light =
+            DirectionalLight::new(surface_to_light, self.directional_light.color, intensity)?;
+        Ok(())
+    }
+
+    pub const fn directional_light(&self) -> DirectionalLight {
+        self.directional_light
     }
 
     pub const fn texture_debug_enabled(&self) -> bool {
@@ -1362,7 +1507,9 @@ impl Renderer {
                 | PipelineDebugMode::Wireframe
                 | PipelineDebugMode::TriangleId
                 | PipelineDebugMode::Depth
-                | PipelineDebugMode::DepthHeatmap => WindingDebugMode::VertexColor,
+                | PipelineDebugMode::DepthHeatmap
+                | PipelineDebugMode::Normal
+                | PipelineDebugMode::NdotL => WindingDebugMode::VertexColor,
             },
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
@@ -1378,7 +1525,9 @@ impl Renderer {
                 | PipelineDebugMode::Wireframe
                 | PipelineDebugMode::TriangleId
                 | PipelineDebugMode::Barycentric
-                | PipelineDebugMode::FrontBack => DepthDebugMode::Off,
+                | PipelineDebugMode::FrontBack
+                | PipelineDebugMode::Normal
+                | PipelineDebugMode::NdotL => DepthDebugMode::Off,
             },
             frame_stats: self.stats,
         }
@@ -1442,22 +1591,25 @@ fn interpolation_debug_fixture() -> Mesh {
     let vertices = [
         (
             Vec3::new(-0.65, 0.65, 0.5),
+            Vec3::new(-0.6, 0.0, -0.8),
             math::Vec2::new(0.0, 0.0),
             Vec4::new(1.0, 0.0, 0.0, 1.0),
         ),
         (
             Vec3::new(0.65, 0.65, 0.5),
+            Vec3::new(0.6, 0.0, -0.8),
             math::Vec2::new(1.0, 0.0),
             Vec4::new(0.0, 1.0, 0.0, 1.0),
         ),
         (
             Vec3::new(0.0, -0.65, 0.5),
+            Vec3::new(0.0, 0.6, -0.8),
             math::Vec2::new(0.5, 1.0),
             Vec4::new(0.0, 0.0, 1.0, 1.0),
         ),
     ]
     .into_iter()
-    .map(|(position, uv, color)| mesh::Vertex::new(position, Vec3::Z, uv, color))
+    .map(|(position, normal, uv, color)| mesh::Vertex::new(position, normal, uv, color))
     .collect();
     Mesh::new(vertices, vec![0, 1, 2])
         .expect("고정 barycentric RGB triangle 계약은 항상 유효해야 한다")
@@ -1539,21 +1691,26 @@ struct FrameDrawReport {
     debug_pixels: u32,
     invalid_values: u32,
     texture_samples: u32,
+    lighting_samples: u32,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct FrameDrawOptions<'a> {
     debug_lines_enabled: bool,
     pipeline_state: PipelineState,
     uv_checker_enabled: bool,
     sampled_texture: Option<(&'a Texture, SamplerState)>,
+    material: Material,
+    light: DirectionalLight,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct RasterDrawOptions<'a> {
     pipeline_state: PipelineState,
     uv_checker_enabled: bool,
     sampled_texture: Option<(&'a Texture, SamplerState)>,
+    material: Material,
+    light: DirectionalLight,
 }
 
 impl<'a> FrameDrawOptions<'a> {
@@ -1562,6 +1719,8 @@ impl<'a> FrameDrawOptions<'a> {
             pipeline_state: self.pipeline_state,
             uv_checker_enabled: self.uv_checker_enabled,
             sampled_texture: self.sampled_texture,
+            material: self.material,
+            light: self.light,
         }
     }
 }
@@ -1582,7 +1741,9 @@ fn draw_frame(
         | PipelineDebugMode::Wireframe
         | PipelineDebugMode::TriangleId
         | PipelineDebugMode::Barycentric
-        | PipelineDebugMode::FrontBack => target.render_gradient_checker(),
+        | PipelineDebugMode::FrontBack
+        | PipelineDebugMode::Normal
+        | PipelineDebugMode::NdotL => target.render_gradient_checker(),
     }
     draw_debug_scene(
         target,
@@ -1797,6 +1958,17 @@ fn submit_triangle(
         return;
     };
     let screen_vertices = [first, second, third];
+    let flat_normal = if options.material.normal_mode == NormalMode::Flat {
+        let first_edge = generated[1].world_pos - generated[0].world_pos;
+        let second_edge = generated[2].world_pos - generated[0].world_pos;
+        let Some(normal) = first_edge.cross(second_edge).normalized() else {
+            report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+            return;
+        };
+        Some(normal)
+    } else {
+        None
+    };
     let ordered_positions = order.map(|index| positions[index]);
     let setup = match TriangleSetup::new(ordered_positions, target.width(), target.height()) {
         Ok(setup) => setup,
@@ -1833,6 +2005,7 @@ fn submit_triangle(
     let mut max_interpolated_inv_w = 0.0_f32;
     let mut invalid_values = 0_u32;
     let mut texture_samples = 0_u32;
+    let mut lighting_samples = 0_u32;
     let mut sample_counter_overflow = false;
     setup.rasterize(|sample| {
         increment_sample_counter(&mut covered_samples, &mut sample_counter_overflow);
@@ -1851,11 +2024,19 @@ fn submit_triangle(
                 return;
             }
         }
-        let Some(fragment) = FragmentInput::from_screen_vertices(
-            barycentric,
-            ordered_screen_vertices,
-            options.pipeline_state.attribute_interpolation_mode,
-        ) else {
+        let fragment = match options.material.normal_mode {
+            NormalMode::Smooth => FragmentInput::from_screen_vertices(
+                barycentric,
+                ordered_screen_vertices,
+                options.pipeline_state.attribute_interpolation_mode,
+            ),
+            NormalMode::Flat => FragmentInput::from_screen_vertices_for_flat_normal(
+                barycentric,
+                ordered_screen_vertices,
+                options.pipeline_state.attribute_interpolation_mode,
+            ),
+        };
+        let Some(fragment) = fragment else {
             increment_sample_counter(
                 &mut invalid_interpolation_samples,
                 &mut sample_counter_overflow,
@@ -1875,19 +2056,32 @@ fn submit_triangle(
             &mut interpolated_inv_w_samples,
             &mut sample_counter_overflow,
         );
+        let shading_normal = flat_normal.unwrap_or_else(|| fragment.normal());
         let fill_color = match options.pipeline_state.debug_mode {
             PipelineDebugMode::Solid if options.uv_checker_enabled => {
                 uv_checker_color(fragment.uv())
             }
             PipelineDebugMode::Solid => {
-                if let Some((texture, sampler)) = options.sampled_texture {
+                let albedo = if let Some((texture, sampler)) = options.sampled_texture {
                     let texture_color = sampler
                         .sample(texture, fragment.uv())
                         .expect("FragmentInput은 유한한 UV를 보장해야 한다");
                     increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
-                    debug_color(modulate_color(texture_color, fragment.color()))
+                    modulate_color(texture_color, fragment.color())
                 } else {
-                    debug_color(fragment.color())
+                    fragment.color()
+                };
+                let albedo = modulate_color(albedo, options.material.base_color);
+                if options.material.lighting_enabled {
+                    increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
+                    debug_color(lambert_color(
+                        albedo,
+                        shading_normal,
+                        options.material,
+                        options.light,
+                    ))
+                } else {
+                    debug_color(albedo)
                 }
             }
             PipelineDebugMode::Wireframe => wireframe_fragment_color(fragment.barycentric()),
@@ -1896,6 +2090,12 @@ fn submit_triangle(
             PipelineDebugMode::Depth => depth_grayscale_color(depth),
             PipelineDebugMode::DepthHeatmap => depth_heatmap_color(depth),
             PipelineDebugMode::FrontBack => facing_color,
+            PipelineDebugMode::Normal => normal_debug_color(shading_normal),
+            PipelineDebugMode::NdotL => {
+                increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
+                let ndotl = lambert_ndotl(shading_normal, options.light);
+                debug_color(Vec4::new(ndotl, ndotl, ndotl, 1.0))
+            }
         };
         let written = target.commit_depth_and_color(point, depth, fill_color);
         debug_assert!(
@@ -1964,6 +2164,11 @@ fn submit_triangle(
         texture_samples,
         &mut report.sample_counter_overflow,
     );
+    add_sample_counter(
+        &mut report.lighting_samples,
+        lighting_samples,
+        &mut report.sample_counter_overflow,
+    );
     report.invalid_values = report.invalid_values.saturating_add(invalid_values);
     if !draw_enabled {
         return;
@@ -1984,7 +2189,9 @@ fn submit_triangle(
         | PipelineDebugMode::Wireframe
         | PipelineDebugMode::TriangleId
         | PipelineDebugMode::Depth
-        | PipelineDebugMode::DepthHeatmap => {
+        | PipelineDebugMode::DepthHeatmap
+        | PipelineDebugMode::Normal
+        | PipelineDebugMode::NdotL => {
             // 제출 geometry는 positive winding이지만, 기존 Bresenham 방향과 edge
             // 덮어쓰기 순서를 보존하기 위해 vertex-color wireframe은 원본 순서로 그린다.
             let colors = generated.map(|vertex| debug_color(vertex.color));
@@ -2063,6 +2270,34 @@ fn modulate_color(first: Vec4, second: Vec4) -> Vec4 {
         first.z * second.z,
         first.w * second.w,
     )
+}
+
+pub fn lambert_ndotl(normal_world: Vec3, light: DirectionalLight) -> f32 {
+    normal_world.dot(light.surface_to_light).max(0.0)
+}
+
+fn lambert_color(
+    albedo: Vec4,
+    normal_world: Vec3,
+    material: Material,
+    light: DirectionalLight,
+) -> Vec4 {
+    let ndotl = lambert_ndotl(normal_world, light);
+    Vec4::new(
+        albedo.x * (material.ambient + light.color.x * light.intensity * ndotl),
+        albedo.y * (material.ambient + light.color.y * light.intensity * ndotl),
+        albedo.z * (material.ambient + light.color.z * light.intensity * ndotl),
+        albedo.w,
+    )
+}
+
+fn normal_debug_color(normal_world: Vec3) -> Color {
+    debug_color(Vec4::new(
+        normal_world.x * 0.5 + 0.5,
+        normal_world.y * 0.5 + 0.5,
+        normal_world.z * 0.5 + 0.5,
+        1.0,
+    ))
 }
 
 fn depth_grayscale_color(depth: f32) -> Color {
@@ -2158,6 +2393,8 @@ mod tests {
                 },
                 uv_checker_enabled: true,
                 sampled_texture: None,
+                material: Material::default(),
+                light: DirectionalLight::default(),
             },
             &mesh,
             &mut clipper,
@@ -2170,7 +2407,7 @@ mod tests {
         ViewportPosition { x, y, z_ndc: 0.5 }
     }
 
-    const fn raster_options(
+    fn raster_options(
         cull_mode: CullMode,
         winding_debug_mode: WindingDebugMode,
     ) -> RasterDrawOptions<'static> {
@@ -2186,6 +2423,8 @@ mod tests {
             },
             uv_checker_enabled: false,
             sampled_texture: None,
+            material: Material::default(),
+            light: DirectionalLight::default(),
         }
     }
 
@@ -3954,6 +4193,8 @@ mod tests {
             PipelineDebugMode::Depth,
             PipelineDebugMode::DepthHeatmap,
             PipelineDebugMode::FrontBack,
+            PipelineDebugMode::Normal,
+            PipelineDebugMode::NdotL,
         ] {
             renderer.set_pipeline_debug_mode(mode);
             let stats = renderer.update_and_render(0.0, InputSnapshot::default());
@@ -3984,7 +4225,7 @@ mod tests {
         }
         hashes.sort_unstable();
         hashes.dedup();
-        assert_eq!(hashes.len(), 7);
+        assert_eq!(hashes.len(), 9);
         assert_eq!(
             raster_options(CullMode::None, WindingDebugMode::Facing)
                 .pipeline_state
@@ -4408,6 +4649,7 @@ mod tests {
                 address_v: texture::AddressMode::Repeat,
                 filter: texture::FilterMode::Bilinear,
             },
+            ..Material::default()
         });
         renderer.draw_item.material_id = MaterialId(1);
 
@@ -4455,6 +4697,8 @@ mod tests {
                     pipeline_state: PipelineState::default(),
                     uv_checker_enabled: false,
                     sampled_texture: Some((&texture, sampler)),
+                    material: Material::default(),
+                    light: DirectionalLight::default(),
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -4501,5 +4745,190 @@ mod tests {
         assert!(max_depth_difference <= DEPTH_RANGE_EPSILON);
         assert_eq!(first_report.texture_samples, first_report.shaded_samples);
         assert_eq!(second_report.texture_samples, second_report.shaded_samples);
+    }
+
+    #[test]
+    fn chapter_eighteen_lambert_endpoints_and_light_validation_are_explicit() {
+        let light = DirectionalLight::new(Vec3::Z, Vec3::new(1.0, 0.5, 0.25), 2.0).unwrap();
+        assert_eq!(lambert_ndotl(Vec3::Z, light), 1.0);
+        assert_eq!(lambert_ndotl(Vec3::X, light), 0.0);
+        assert_eq!(lambert_ndotl(Vec3::new(0.0, 0.0, -1.0), light), 0.0);
+        let lit = lambert_color(
+            Vec4::new(0.5, 0.5, 0.5, 0.75),
+            Vec3::Z,
+            Material {
+                ambient: 0.1,
+                ..Material::default()
+            },
+            light,
+        );
+        assert_eq!(lit, Vec4::new(1.05, 0.55, 0.3, 0.75));
+        assert_eq!(
+            DirectionalLight::new(Vec3::ZERO, Vec3::new(1.0, 1.0, 1.0), 1.0),
+            Err(LightingError::InvalidDirection)
+        );
+        assert_eq!(
+            DirectionalLight::new(Vec3::Z, Vec3::new(-1.0, 1.0, 1.0), 1.0),
+            Err(LightingError::InvalidColor)
+        );
+        assert_eq!(
+            DirectionalLight::new(Vec3::Z, Vec3::new(1.0, 1.0, 1.0), f32::NAN),
+            Err(LightingError::InvalidIntensity)
+        );
+        for error in [
+            LightingError::InvalidDirection,
+            LightingError::InvalidColor,
+            LightingError::InvalidIntensity,
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
+
+        let mesh = unit_cube_mesh();
+        let model = Transform {
+            rotation_radians: Vec3::new(0.3, 0.7, 0.0),
+            scale: Vec3::new(2.0, 0.5, 1.5),
+            ..Transform::IDENTITY
+        };
+        let first = MeshScene::new(&mesh, model, 64, 64);
+        let mut moved_camera = MeshScene::with_capacity(&mesh);
+        moved_camera.rebuild_cube_with_camera(
+            &mesh,
+            model,
+            Vec3::new(2.0, 1.0, -4.0),
+            Vec3::ZERO,
+            64,
+            64,
+        );
+        for (first, moved) in first.clip_vertices.iter().zip(&moved_camera.clip_vertices) {
+            assert_eq!(first.normal_world, moved.normal_world);
+            assert_eq!(
+                lambert_ndotl(first.normal_world, light),
+                lambert_ndotl(moved.normal_world, light)
+            );
+        }
+    }
+
+    #[test]
+    fn chapter_eighteen_textured_lambert_and_debug_views_share_depth_coverage() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_texture_sampling_enabled(true);
+        renderer.set_lighting_enabled(true);
+        assert!(renderer.lighting_enabled());
+        renderer
+            .set_directional_light(Vec3::new(-0.4, 0.8, -0.45), 0.9)
+            .unwrap();
+        let lit = renderer.update_and_render(0.0, InputSnapshot::default());
+        let lit_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(lit.lighting_samples, lit.shaded_samples);
+        assert_eq!(lit.texture_samples, lit.shaded_samples);
+        assert_eq!(renderer.directional_light().intensity, 0.9);
+
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Normal);
+        let normal = renderer.update_and_render(0.0, InputSnapshot::default());
+        let normal_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(normal.lighting_samples, 0);
+        assert_eq!(normal.covered_samples, lit.covered_samples);
+        assert_ne!(normal_hash, lit_hash);
+
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::NdotL);
+        let ndotl = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(ndotl.lighting_samples, ndotl.shaded_samples);
+        assert_eq!(ndotl.covered_samples, lit.covered_samples);
+        assert_ne!(fnv1a(renderer.color_buffer()), normal_hash);
+
+        renderer.set_pipeline_debug_mode(PipelineDebugMode::Solid);
+        renderer.set_normal_mode(NormalMode::Flat);
+        assert_eq!(renderer.normal_mode(), NormalMode::Flat);
+        let flat = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(flat.lighting_samples, flat.shaded_samples);
+        assert_eq!(fnv1a(renderer.color_buffer()), lit_hash);
+
+        renderer.set_model_rotation_y(0.75);
+        renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_ne!(fnv1a(renderer.color_buffer()), lit_hash);
+        assert!(renderer.set_directional_light(Vec3::ZERO, 1.0).is_err());
+        assert_eq!(renderer.directional_light().intensity, 0.9);
+        renderer.set_lighting_enabled(false);
+        assert!(!renderer.lighting_enabled());
+    }
+
+    #[test]
+    fn chapter_eighteen_flat_normal_ignores_vertex_normal_and_rejects_degenerate_geometry() {
+        let mesh = interpolation_debug_fixture();
+        let scene = MeshScene::new_identity_debug(&mesh, 1, 1);
+        let mut zero_vertex_normals: [ClipVertex; 3] =
+            scene.clip_vertices.clone().try_into().unwrap();
+        for vertex in &mut zero_vertex_normals {
+            vertex.normal_world = Vec3::ZERO;
+        }
+        let covered_positions = [
+            ViewportPosition {
+                x: -1.0,
+                y: -1.0,
+                z_ndc: 0.5,
+            },
+            ViewportPosition {
+                x: 3.0,
+                y: -1.0,
+                z_ndc: 0.5,
+            },
+            ViewportPosition {
+                x: -1.0,
+                y: 3.0,
+                z_ndc: 0.5,
+            },
+        ];
+        let mut options = raster_options(CullMode::None, WindingDebugMode::VertexColor);
+        options.material.normal_mode = NormalMode::Flat;
+        let mut target = RenderTarget::new(1, 1).unwrap();
+        let mut fallback_report = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            options,
+            zero_vertex_normals,
+            covered_positions,
+            0,
+            &mut fallback_report,
+        );
+        assert_eq!(fallback_report.submitted_triangles, 1);
+        assert_eq!(fallback_report.invalid_interpolation_samples, 0);
+        assert_eq!(fallback_report.shaded_samples, 1);
+
+        let mut generated: [ClipVertex; 3] = scene.clip_vertices.try_into().unwrap();
+        for vertex in &mut generated {
+            vertex.world_pos = Vec3::ZERO;
+        }
+        let positions = [
+            ViewportPosition {
+                x: 0.0,
+                y: 0.0,
+                z_ndc: 0.5,
+            },
+            ViewportPosition {
+                x: 1.0,
+                y: 0.0,
+                z_ndc: 0.5,
+            },
+            ViewportPosition {
+                x: 0.0,
+                y: 1.0,
+                z_ndc: 0.5,
+            },
+        ];
+        let mut target = RenderTarget::new(1, 1).unwrap();
+        let mut report = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            options,
+            generated,
+            positions,
+            0,
+            &mut report,
+        );
+        assert_eq!(report.invalid_triangles, 1);
+        assert_eq!(report.submitted_triangles, 0);
+        assert_eq!(report.shaded_samples, 0);
     }
 }

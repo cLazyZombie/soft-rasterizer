@@ -6,7 +6,7 @@ use renderer_core::{
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
-    texture::{AddressMode, FilterMode, SamplerState, TextureColorSpace, TextureId},
+    texture::{AddressMode, FilterMode, NormalMode, SamplerState, TextureColorSpace, TextureId},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -132,6 +132,8 @@ impl Renderer {
             4 => PipelineDebugMode::Depth,
             5 => PipelineDebugMode::DepthHeatmap,
             6 => PipelineDebugMode::FrontBack,
+            7 => PipelineDebugMode::Normal,
+            8 => PipelineDebugMode::NdotL,
             _ => return Err(format!("알 수 없는 pipeline debug mode입니다: {mode}")),
         };
         self.core.set_pipeline_debug_mode(mode);
@@ -230,6 +232,66 @@ impl Renderer {
             AddressMode::Repeat => 0,
             AddressMode::ClampToEdge => 1,
         }
+    }
+
+    pub fn set_lighting_enabled(&mut self, enabled: bool) {
+        self.core.set_lighting_enabled(enabled);
+    }
+
+    pub fn lighting_enabled(&self) -> bool {
+        self.core.lighting_enabled()
+    }
+
+    pub fn set_normal_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => NormalMode::Smooth,
+            1 => NormalMode::Flat,
+            _ => return Err(format!("알 수 없는 normal mode입니다: {mode}")),
+        };
+        self.core.set_normal_mode(mode);
+        Ok(())
+    }
+
+    pub fn normal_mode(&self) -> u32 {
+        match self.core.normal_mode() {
+            NormalMode::Smooth => 0,
+            NormalMode::Flat => 1,
+        }
+    }
+
+    pub fn set_directional_light(
+        &mut self,
+        surface_to_light_x: f32,
+        surface_to_light_y: f32,
+        surface_to_light_z: f32,
+        intensity: f32,
+    ) -> Result<(), String> {
+        self.core
+            .set_directional_light(
+                renderer_core::math::Vec3::new(
+                    surface_to_light_x,
+                    surface_to_light_y,
+                    surface_to_light_z,
+                ),
+                intensity,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn light_surface_to_light_x(&self) -> f32 {
+        self.core.directional_light().surface_to_light.x
+    }
+
+    pub fn light_surface_to_light_y(&self) -> f32 {
+        self.core.directional_light().surface_to_light.y
+    }
+
+    pub fn light_surface_to_light_z(&self) -> f32 {
+        self.core.directional_light().surface_to_light.z
+    }
+
+    pub fn light_intensity(&self) -> f32 {
+        self.core.directional_light().intensity
     }
 
     pub fn active_texture_id(&self) -> u32 {
@@ -410,6 +472,10 @@ impl Renderer {
 
     pub fn stats_texture_samples(&self) -> u32 {
         self.stats().texture_samples
+    }
+
+    pub fn stats_lighting_samples(&self) -> u32 {
+        self.stats().lighting_samples
     }
 }
 
@@ -978,7 +1044,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_maps_all_chapter_fifteen_pipeline_debug_modes() {
+    fn adapter_maps_all_pipeline_debug_modes_through_chapter_eighteen() {
         let mut renderer = Renderer::new(64, 64).unwrap();
         renderer.set_debug_lines_enabled(true);
         let expected_labels = [
@@ -989,6 +1055,8 @@ mod tests {
             "depth grayscale",
             "depth range heatmap",
             "front green / back red",
+            "world normal RGB",
+            "Lambert N dot L",
         ];
         let mut reference_counts = None;
         for (mode, expected_label) in expected_labels.into_iter().enumerate() {
@@ -1012,7 +1080,7 @@ mod tests {
         }
         assert!(
             renderer
-                .set_pipeline_debug_mode(7)
+                .set_pipeline_debug_mode(9)
                 .unwrap_err()
                 .contains("pipeline debug mode")
         );
@@ -1161,5 +1229,47 @@ mod tests {
         assert_eq!(renderer.sampler_filter_mode(), 0);
         assert_eq!(renderer.sampler_address_u(), 0);
         assert_eq!(renderer.sampler_address_v(), 1);
+    }
+
+    #[test]
+    fn adapter_maps_chapter_eighteen_light_normal_modes_and_stats() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert!(!renderer.lighting_enabled());
+        assert_eq!(renderer.normal_mode(), 0);
+        renderer.set_normal_mode(0).unwrap();
+        renderer.set_lighting_enabled(true);
+        assert!(renderer.lighting_enabled());
+        renderer.set_normal_mode(1).unwrap();
+        assert_eq!(renderer.normal_mode(), 1);
+        assert!(
+            renderer
+                .set_normal_mode(2)
+                .unwrap_err()
+                .contains("normal mode")
+        );
+        renderer
+            .set_directional_light(0.0, 0.0, -2.0, 1.25)
+            .unwrap();
+        assert_eq!(renderer.light_surface_to_light_x(), 0.0);
+        assert_eq!(renderer.light_surface_to_light_y(), 0.0);
+        assert_eq!(renderer.light_surface_to_light_z(), -1.0);
+        assert_eq!(renderer.light_intensity(), 1.25);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(
+            renderer.stats_lighting_samples(),
+            renderer.stats_shaded_samples()
+        );
+        assert!(
+            renderer
+                .set_directional_light(0.0, 0.0, 0.0, 1.0)
+                .unwrap_err()
+                .contains("surface_to_light")
+        );
+        assert!(
+            renderer
+                .set_directional_light(0.0, 0.0, -1.0, -1.0)
+                .unwrap_err()
+                .contains("intensity")
+        );
     }
 }
