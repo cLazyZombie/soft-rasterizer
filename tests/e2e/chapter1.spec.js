@@ -2055,3 +2055,390 @@ test("blinn_phong_color_space: linear shading과 sRGB wrong-way를 비교한다"
     comparisonScreenshotPath,
   });
 });
+
+test("input_camera_fast_release: rAF 사이에 끝난 drag delta를 한 번 적용한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "input_camera_fast_release" },
+    { type: "steps", description: "10" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+  const canvas = page.locator("#framebuffer");
+  const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  const bounds = await canvas.boundingBox();
+  expect(bounds).not.toBeNull();
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x + bounds.width / 2 + 96, bounds.y + bounds.height / 2 + 24);
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.__softRasterizer.inputState())).toMatchObject({
+    dragging: false,
+    pointerButtons: 0,
+  });
+  const applied = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(applied.inputSnapshot).toMatchObject({
+    pointerDx: 96,
+    pointerDy: 24,
+    pointerButtons: 0,
+  });
+  expect(applied.inputSnapshot.flags & 1).toBe(1);
+  expect(applied.camera.yaw).toBeGreaterThan(0);
+  expect(applied.camera.pitch).toBeGreaterThan(0);
+  expect(applied.pixelHash).not.toBe(initial.pixelHash);
+  const consumed = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(consumed.inputSnapshot).toMatchObject({ pointerDx: 0, pointerDy: 0, flags: 0 });
+  expect(consumed.camera).toEqual(applied.camera);
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, consumed, 0, browserLog, null, {
+    initialCamera: initial.camera,
+    appliedCamera: applied.camera,
+  });
+});
+
+test("input_camera: DOM collector를 거쳐 Orbit/Fly와 focus 해제를 검증한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "input_camera" },
+    { type: "steps", description: "78" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+  const canvas = page.locator("#framebuffer");
+  const initial = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(initial.camera).toMatchObject({
+    mode: 0,
+    eye: [0, 0, -3],
+    forward: [0, 0, 1],
+    yaw: 0,
+    pitch: 0,
+    orbitRadius: 3,
+    input: { heldBits: 0, dragging: false, pointerButtons: 0 },
+  });
+
+  const invalidInput = await page.evaluate(() =>
+    window.__softRasterizer.testInputSnapshot([0, 0, 0, 0, 0, 0, 0]),
+  );
+  expect(invalidInput.error).toContain("input snapshot 길이는 8");
+  expect(invalidInput.snapshot.camera).toEqual(initial.camera);
+  expect(invalidInput.snapshot.pixelHash).toBe(initial.pixelHash);
+
+  const bounds = await canvas.boundingBox();
+  expect(bounds).not.toBeNull();
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await page.mouse.down();
+  expect(await page.evaluate(() => window.__softRasterizer.inputState())).toMatchObject({
+    dragging: true,
+    pointerButtons: 1,
+  });
+  await page.mouse.move(bounds.x + bounds.width + 40, bounds.y + bounds.height / 2 + 30, {
+    steps: 4,
+  });
+  const orbitDragged = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(orbitDragged.camera.forward[0]).toBeGreaterThan(0.5);
+  expect(orbitDragged.camera.pitch).toBeGreaterThan(0);
+  expect(orbitDragged.stats.inputBits).toBe(0);
+  expect(orbitDragged.inputSnapshot.pointerDx).toBeGreaterThan(500);
+  expect(orbitDragged.inputSnapshot.pointerDy).toBe(30);
+  expect(orbitDragged.inputSnapshot.pointerButtons).toBe(1);
+  expect(orbitDragged.inputSnapshot.flags & 1).toBe(1);
+  expect(orbitDragged.pixelHash).not.toBe(initial.pixelHash);
+  await page.mouse.up();
+  expect(await page.evaluate(() => window.__softRasterizer.inputState())).toMatchObject({
+    dragging: false,
+    pointerButtons: 0,
+  });
+
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  const radiusBeforeWheel = orbitDragged.camera.orbitRadius;
+  await canvas.dispatchEvent("wheel", { deltaY: 200 });
+  const orbitZoomed = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(orbitZoomed.camera.orbitRadius).toBeGreaterThan(radiusBeforeWheel);
+  expect(orbitZoomed.camera.eye).not.toEqual(orbitDragged.camera.eye);
+  expect(orbitZoomed.inputSnapshot.wheelDelta).toBe(200);
+
+  await page.mouse.down();
+  expect((await page.evaluate(() => window.__softRasterizer.inputState())).dragging).toBe(true);
+  await canvas.dispatchEvent("pointercancel", {
+    pointerId: 1,
+    pointerType: "mouse",
+    buttons: 0,
+  });
+  expect(await page.evaluate(() => window.__softRasterizer.inputState())).toMatchObject({
+    dragging: false,
+    pointerButtons: 0,
+  });
+  await page.mouse.up();
+
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x + bounds.width / 2 + 20, bounds.y + bounds.height / 2 + 10);
+  await canvas.dispatchEvent("lostpointercapture", {
+    pointerId: 1,
+    pointerType: "mouse",
+    buttons: 0,
+  });
+  expect(await page.evaluate(() => window.__softRasterizer.inputState())).toMatchObject({
+    dragging: false,
+    pointerButtons: 0,
+  });
+  const afterLostCapture = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(afterLostCapture.inputSnapshot).toMatchObject({
+    pointerDx: 0,
+    pointerDy: 0,
+    pointerButtons: 0,
+    flags: 0,
+  });
+  await page.mouse.up();
+
+  await page.mouse.move(bounds.x + bounds.width / 2, bounds.y + bounds.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(bounds.x + bounds.width / 2 + 15, bounds.y + bounds.height / 2 + 12);
+  await canvas.dispatchEvent("wheel", { deltaY: 75 });
+  await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+  const afterQueuedBlur = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(afterQueuedBlur.inputSnapshot).toMatchObject({
+    pointerDx: 0,
+    pointerDy: 0,
+    wheelDelta: 0,
+    pointerButtons: 0,
+    flags: 0,
+  });
+  expect(afterQueuedBlur.camera.eye).toEqual(orbitZoomed.camera.eye);
+  await page.mouse.up();
+
+  const flyStart = await page.evaluate(() => window.__softRasterizer.setCameraMode(1));
+  expect(flyStart.camera.mode).toBe(1);
+  await canvas.focus();
+
+  await page.keyboard.down("Control");
+  const controlHeld = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(controlHeld.inputSnapshot.flags & 4).toBe(4);
+  await page.keyboard.up("Control");
+  const controlReleased = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(controlReleased.inputSnapshot.flags & 4).toBe(0);
+
+  await page.keyboard.down("w");
+  const aliasFirst = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasFirst.inputSnapshot).toMatchObject({ heldBits: 1, pressedBits: 1 });
+  await page.evaluate(() =>
+    window.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        code: "KeyW",
+        key: "w",
+        repeat: true,
+        bubbles: true,
+      }),
+    ),
+  );
+  const repeatedAlias = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(repeatedAlias.inputSnapshot).toMatchObject({ heldBits: 1, pressedBits: 0 });
+  await page.keyboard.down("ArrowUp");
+  const aliasSecond = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasSecond.inputSnapshot).toMatchObject({ heldBits: 1, pressedBits: 0 });
+  await page.keyboard.up("w");
+  const aliasOneReleased = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasOneReleased.inputSnapshot).toMatchObject({ heldBits: 1, releasedBits: 0 });
+  await page.keyboard.down("w");
+  const aliasRepressed = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasRepressed.inputSnapshot).toMatchObject({ heldBits: 1, pressedBits: 0 });
+  await page.keyboard.up("ArrowUp");
+  const aliasOtherReleased = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasOtherReleased.inputSnapshot).toMatchObject({ heldBits: 1, releasedBits: 0 });
+  await page.keyboard.up("w");
+  const aliasFullyReleased = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(aliasFullyReleased.inputSnapshot).toMatchObject({ heldBits: 0, releasedBits: 1 });
+
+  await page.keyboard.down("w");
+  const pressedForward = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(pressedForward.inputSnapshot).toMatchObject({
+    heldBits: 1,
+    pressedBits: 1,
+    releasedBits: 0,
+  });
+  const heldForward = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(heldForward.inputSnapshot).toMatchObject({
+    heldBits: 1,
+    pressedBits: 0,
+    releasedBits: 0,
+  });
+  const sixtyFrames = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 60; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 120);
+    }
+    return snapshot;
+  });
+  expect(sixtyFrames.stats.inputBits).toBe(1);
+  await page.keyboard.up("w");
+  const releasedForward = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(releasedForward.inputSnapshot).toMatchObject({
+    heldBits: 0,
+    pressedBits: 0,
+    releasedBits: 1,
+  });
+  const displacement60 = Math.hypot(
+    ...sixtyFrames.camera.eye.map((value, index) => value - flyStart.camera.eye[index]),
+  );
+  expect(displacement60).toBeCloseTo(1.5, 4);
+
+  await page.keyboard.down("s");
+  const returned = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 60; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 120);
+    }
+    return snapshot;
+  });
+  await page.keyboard.up("s");
+  await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(returned.camera.eye[0]).toBeCloseTo(flyStart.camera.eye[0], 4);
+  expect(returned.camera.eye[1]).toBeCloseTo(flyStart.camera.eye[1], 4);
+  expect(returned.camera.eye[2]).toBeCloseTo(flyStart.camera.eye[2], 4);
+
+  await page.keyboard.down("w");
+  const thirtyFrames = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 30; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 60);
+    }
+    return snapshot;
+  });
+  await page.keyboard.up("w");
+  await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  const displacement30 = Math.hypot(
+    ...thirtyFrames.camera.eye.map((value, index) => value - returned.camera.eye[index]),
+  );
+  expect(displacement30).toBeCloseTo(displacement60, 4);
+
+  await page.keyboard.down("w");
+  expect((await page.evaluate(() => window.__softRasterizer.inputState())).heldBits).toBe(1);
+  await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+  expect((await page.evaluate(() => window.__softRasterizer.inputState())).heldBits).toBe(0);
+  const afterBlur = await page.evaluate(() => window.__softRasterizer.advanceFrame(0.1));
+  expect(afterBlur.stats.inputBits).toBe(0);
+  expect(afterBlur.inputSnapshot.releasedBits).toBe(1);
+  expect(afterBlur.camera.eye).toEqual(thirtyFrames.camera.eye);
+  await page.keyboard.up("w");
+
+  await canvas.focus();
+  await page.keyboard.down("d");
+  expect((await page.evaluate(() => window.__softRasterizer.inputState())).heldBits).toBe(8);
+  await canvas.dispatchEvent("wheel", { deltaY: 90 });
+  await page.evaluate(() => {
+    Object.defineProperty(document, "hidden", { configurable: true, value: true });
+    document.dispatchEvent(new Event("visibilitychange"));
+    Object.defineProperty(document, "hidden", { configurable: true, value: false });
+  });
+  expect((await page.evaluate(() => window.__softRasterizer.inputState())).heldBits).toBe(0);
+  await page.keyboard.up("d");
+  const afterVisibility = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(afterVisibility.inputSnapshot.releasedBits).toBe(8);
+  expect(afterVisibility.inputSnapshot.wheelDelta).toBe(0);
+
+  await canvas.focus();
+  await page.keyboard.down("s");
+  const returnedAgain = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 30; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 60);
+    }
+    return snapshot;
+  });
+  await page.keyboard.up("s");
+  await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(returnedAgain.camera.eye[0]).toBeCloseTo(flyStart.camera.eye[0], 4);
+  expect(returnedAgain.camera.eye[1]).toBeCloseTo(flyStart.camera.eye[1], 4);
+  expect(returnedAgain.camera.eye[2]).toBeCloseTo(flyStart.camera.eye[2], 4);
+
+  await page.keyboard.down("w");
+  await page.keyboard.down("d");
+  const diagonal = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 30; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 60);
+    }
+    return snapshot;
+  });
+  await page.keyboard.up("w");
+  await page.keyboard.up("d");
+  await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  const diagonalDisplacement = Math.hypot(
+    ...diagonal.camera.eye.map((value, index) => value - returnedAgain.camera.eye[index]),
+  );
+  expect(diagonalDisplacement).toBeCloseTo(displacement30, 4);
+
+  await page.keyboard.down("s");
+  await page.keyboard.down("a");
+  const finalCamera = await page.evaluate(() => {
+    let snapshot;
+    for (let frame = 0; frame < 30; frame += 1) {
+      snapshot = window.__softRasterizer.advanceFrame(1 / 60);
+    }
+    return snapshot;
+  });
+  await page.keyboard.up("s");
+  await page.keyboard.up("a");
+  const finalSnapshot = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(finalCamera.camera.eye[0]).toBeCloseTo(flyStart.camera.eye[0], 4);
+  expect(finalCamera.camera.eye[1]).toBeCloseTo(flyStart.camera.eye[1], 4);
+  expect(finalCamera.camera.eye[2]).toBeCloseTo(flyStart.camera.eye[2], 4);
+
+  await canvas.evaluate((element) => {
+    element.style.width = "800px";
+  });
+  const resized = await page.evaluate(() => {
+    window.__softRasterizer.applyDisplayResize();
+    return window.__softRasterizer.snapshot();
+  });
+  expect(resized.internalSize).toEqual([800, 450]);
+  expect(resized.camera.eye).toEqual(finalSnapshot.camera.eye);
+  await canvas.evaluate((element) => {
+    element.style.width = "";
+  });
+  const finalRestored = await page.evaluate(() => {
+    window.__softRasterizer.applyDisplayResize();
+    return window.__softRasterizer.advanceFrame(0);
+  });
+  expect(finalRestored.internalSize).toEqual([960, 540]);
+  expect(finalRestored.camera.eye).toEqual(finalSnapshot.camera.eye);
+  expect(finalRestored.pixelHash).toBe(finalSnapshot.pixelHash);
+  expect(finalRestored.pixelHash).toBe("5600f051");
+  expect(finalRestored.stats).toMatchObject({
+    inputBits: 0,
+    inputTriangles: 12,
+    submittedTriangles: 6,
+    culledTriangles: 6,
+    coveredSamples: 41798,
+    invalidValues: 0,
+  });
+
+  await expect(page.locator("#camera-status")).toContainText("Fly · drag/WASD");
+  await expect(page.locator("#camera-status")).toContainText("forward (");
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter20-input-camera.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter20-input-camera", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, finalRestored, 0, browserLog, screenshotPath, {
+    initialCamera: initial.camera,
+    orbitDraggedCamera: orbitDragged.camera,
+    orbitZoomedCamera: orbitZoomed.camera,
+    flyStartCamera: flyStart.camera,
+    sixtyFrameCamera: sixtyFrames.camera,
+    thirtyFrameCamera: thirtyFrames.camera,
+    displacement60,
+    displacement30,
+    diagonalDisplacement,
+    invalidInputError: invalidInput.error,
+  });
+});

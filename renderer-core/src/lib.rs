@@ -1,9 +1,10 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 19장까지 homogeneous clipping 뒤 scalar cube pipeline, linear texture sampling,
-//! inverse-transpose normal과 Unlit/Lambert/Blinn-Phong 조명 경로를 조립한다.
+//! 20장까지 homogeneous clipping 뒤 scalar cube pipeline, linear texture sampling,
+//! Blinn-Phong 조명과 프레임 단위 Orbit/Fly 카메라 입력 경로를 조립한다.
 
 pub mod camera;
+pub mod camera_control;
 pub mod clip;
 pub mod color;
 pub mod math;
@@ -18,6 +19,7 @@ use std::fmt::{Display, Formatter};
 use camera::{
     NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
 };
+use camera_control::{CameraControlInput, CameraController, CameraMode};
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use color::{srgb_decode_channel, srgb_decode_rgba, srgb_encode_rgba};
 use math::{Mat4, Vec2, Vec3, Vec4};
@@ -440,13 +442,64 @@ impl Default for PipelineState {
     }
 }
 
-/// 아직 의미를 부여하지 않은 장치 입력을 한 프레임 단위로 전달하는 작은 값이다.
-///
-/// 실제 키/포인터 비트 배치는 입력 카메라를 구현하는 20장에서 정한다.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// DOM 이벤트 수와 무관하게 프레임당 한 번 전달하는 고정 입력 snapshot이다.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct InputSnapshot {
-    packed_bits: u32,
+    held_bits: u32,
+    pressed_bits: u32,
+    released_bits: u32,
+    pointer_dx: f32,
+    pointer_dy: f32,
+    wheel_delta: f32,
+    pointer_buttons: u32,
+    flags: u32,
 }
+
+pub const INPUT_FORWARD: u32 = 1 << 0;
+pub const INPUT_BACKWARD: u32 = 1 << 1;
+pub const INPUT_LEFT: u32 = 1 << 2;
+pub const INPUT_RIGHT: u32 = 1 << 3;
+pub const INPUT_UP: u32 = 1 << 4;
+pub const INPUT_DOWN: u32 = 1 << 5;
+pub const INPUT_KEY_MASK: u32 = (1 << 6) - 1;
+pub const INPUT_FLAG_DRAGGING: u32 = 1 << 0;
+pub const INPUT_MODIFIER_SHIFT: u32 = 1 << 1;
+pub const INPUT_MODIFIER_CONTROL: u32 = 1 << 2;
+pub const INPUT_MODIFIER_ALT: u32 = 1 << 3;
+pub const INPUT_MODIFIER_META: u32 = 1 << 4;
+pub const INPUT_FLAG_MASK: u32 = (1 << 5) - 1;
+pub const INPUT_POINTER_BUTTON_MASK: u32 = (1 << 5) - 1;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InputSnapshotError {
+    UnsupportedKeyBits,
+    InvalidPointerDelta,
+    InvalidWheelDelta,
+    UnsupportedPointerButtons,
+    UnsupportedFlags,
+}
+
+impl Display for InputSnapshotError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedKeyBits => {
+                formatter.write_str("input key bit에는 정의된 이동 키만 사용할 수 있습니다")
+            }
+            Self::InvalidPointerDelta => {
+                formatter.write_str("pointer delta는 유한한 값이어야 합니다")
+            }
+            Self::InvalidWheelDelta => formatter.write_str("wheel delta는 유한한 값이어야 합니다"),
+            Self::UnsupportedPointerButtons => {
+                formatter.write_str("pointer button bit는 0..4만 사용할 수 있습니다")
+            }
+            Self::UnsupportedFlags => {
+                formatter.write_str("input flag에는 dragging/modifier bit만 사용할 수 있습니다")
+            }
+        }
+    }
+}
+
+impl Error for InputSnapshotError {}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TextureAssetStatus {
@@ -547,12 +600,92 @@ impl DirectionalLight {
 }
 
 impl InputSnapshot {
-    pub const fn from_packed(packed_bits: u32) -> Self {
-        Self { packed_bits }
+    pub fn new(
+        key_bits: [u32; 3],
+        pointer_delta: Vec2,
+        wheel_delta: f32,
+        pointer_buttons: u32,
+        flags: u32,
+    ) -> Result<Self, InputSnapshotError> {
+        let [held_bits, pressed_bits, released_bits] = key_bits;
+        if (held_bits | pressed_bits | released_bits) & !INPUT_KEY_MASK != 0 {
+            return Err(InputSnapshotError::UnsupportedKeyBits);
+        }
+        if !pointer_delta.x.is_finite() || !pointer_delta.y.is_finite() {
+            return Err(InputSnapshotError::InvalidPointerDelta);
+        }
+        if !wheel_delta.is_finite() {
+            return Err(InputSnapshotError::InvalidWheelDelta);
+        }
+        if pointer_buttons & !INPUT_POINTER_BUTTON_MASK != 0 {
+            return Err(InputSnapshotError::UnsupportedPointerButtons);
+        }
+        if flags & !INPUT_FLAG_MASK != 0 {
+            return Err(InputSnapshotError::UnsupportedFlags);
+        }
+        Ok(Self {
+            held_bits,
+            pressed_bits,
+            released_bits,
+            pointer_dx: pointer_delta.x,
+            pointer_dy: pointer_delta.y,
+            wheel_delta,
+            pointer_buttons,
+            flags,
+        })
     }
 
     pub const fn packed_bits(self) -> u32 {
-        self.packed_bits
+        self.held_bits
+    }
+
+    pub const fn pressed_bits(self) -> u32 {
+        self.pressed_bits
+    }
+
+    pub const fn released_bits(self) -> u32 {
+        self.released_bits
+    }
+
+    pub const fn pointer_delta(self) -> Vec2 {
+        Vec2::new(self.pointer_dx, self.pointer_dy)
+    }
+
+    pub const fn wheel_delta(self) -> f32 {
+        self.wheel_delta
+    }
+
+    pub const fn pointer_buttons(self) -> u32 {
+        self.pointer_buttons
+    }
+
+    pub const fn flags(self) -> u32 {
+        self.flags
+    }
+
+    fn camera_control_input(self) -> CameraControlInput {
+        let axis = |positive, negative| {
+            let positive = if self.held_bits & positive != 0 {
+                1.0
+            } else {
+                0.0
+            };
+            let negative = if self.held_bits & negative != 0 {
+                1.0
+            } else {
+                0.0
+            };
+            positive - negative
+        };
+        CameraControlInput {
+            move_right: axis(INPUT_RIGHT, INPUT_LEFT),
+            move_up: axis(INPUT_UP, INPUT_DOWN),
+            move_forward: axis(INPUT_FORWARD, INPUT_BACKWARD),
+            pointer_dx: self.pointer_dx,
+            pointer_dy: self.pointer_dy,
+            wheel_delta: self.wheel_delta,
+            dragging: self.flags & INPUT_FLAG_DRAGGING != 0,
+        }
     }
 }
 
@@ -764,7 +897,7 @@ fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mu
     materials.get_mut(id.0 as usize)
 }
 
-/// 렌더 타깃과 3-18장 scalar cube pipeline/texture/lighting 상태를 소유한다.
+/// 렌더 타깃과 scalar cube pipeline/texture/lighting/camera 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -785,6 +918,7 @@ pub struct Renderer {
     texture_upload_failures: u32,
     materials: Vec<Material>,
     directional_light: DirectionalLight,
+    camera_controller: CameraController,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -868,6 +1002,7 @@ impl Renderer {
             texture_upload_failures: 0,
             materials: vec![Material::default()],
             directional_light: DirectionalLight::default(),
+            camera_controller: CameraController::default(),
             mesh,
             draw_item,
             mesh_scene,
@@ -909,7 +1044,16 @@ impl Renderer {
             return Ok(());
         }
         let mut replacement = RenderTarget::new(width, height)?;
-        let replacement_scene = MeshScene::new(&self.mesh, self.draw_item.model, width, height);
+        let camera_pose = self.camera_controller.pose();
+        let mut replacement_scene = MeshScene::with_capacity(&self.mesh);
+        replacement_scene.rebuild_cube_with_camera(
+            &self.mesh,
+            self.draw_item.model,
+            camera_pose.eye,
+            camera_pose.target,
+            width,
+            height,
+        );
         let replacement_clip_debug_scene =
             MeshScene::new_identity_debug(&self.clip_debug_mesh, width, height);
         let replacement_coverage_debug_scene =
@@ -1022,6 +1166,11 @@ impl Renderer {
 
     pub fn update_and_render(&mut self, dt_seconds: f32, input: InputSnapshot) -> FrameStats {
         let (dt_seconds, invalid_dt) = sanitize_dt(dt_seconds);
+        let invalid_camera_update = self
+            .camera_controller
+            .update(dt_seconds, input.camera_control_input())
+            .is_err();
+        let camera_pose = self.camera_controller.pose();
         let rotation_y = self.draw_item.model.rotation_radians.y;
         self.draw_item.model.rotation_radians.y = if rotation_y.is_finite() {
             (rotation_y + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
@@ -1031,9 +1180,11 @@ impl Renderer {
         };
         if !self.texture_debug_enabled {
             match self.active_scene() {
-                ActiveScene::Cube => self.mesh_scene.rebuild_cube(
+                ActiveScene::Cube => self.mesh_scene.rebuild_cube_with_camera(
                     &self.mesh,
                     self.draw_item.model,
+                    camera_pose.eye,
+                    camera_pose.target,
                     self.target.width(),
                     self.target.height(),
                 ),
@@ -1199,7 +1350,8 @@ impl Renderer {
                 scene.diagnostics.invalid_values
             })
             .saturating_add(draw_report.invalid_values)
-            .saturating_add(u32::from(invalid_dt)),
+            .saturating_add(u32::from(invalid_dt))
+            .saturating_add(u32::from(invalid_camera_update)),
             texture_debug_pixels,
             texture_upload_successes: self.texture_upload_successes,
             texture_upload_failures: self.texture_upload_failures,
@@ -1221,6 +1373,33 @@ impl Renderer {
 
     pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
         self.debug_lines_enabled = enabled;
+    }
+
+    pub fn set_camera_mode(
+        &mut self,
+        mode: CameraMode,
+    ) -> Result<(), camera_control::CameraControlError> {
+        self.camera_controller.set_mode(mode)
+    }
+
+    pub const fn camera_mode(&self) -> CameraMode {
+        self.camera_controller.mode()
+    }
+
+    pub fn camera_pose(&self) -> camera_control::CameraPose {
+        self.camera_controller.pose()
+    }
+
+    pub const fn camera_yaw(&self) -> f32 {
+        self.camera_controller.yaw()
+    }
+
+    pub const fn camera_pitch(&self) -> f32 {
+        self.camera_controller.pitch()
+    }
+
+    pub const fn camera_orbit_radius(&self) -> f32 {
+        self.camera_controller.orbit_radius()
     }
 
     pub fn set_cull_mode(&mut self, mode: CullMode) {
@@ -3045,10 +3224,13 @@ mod tests {
         let viewport_cache_pointer = renderer.mesh_scene.diagnostic_viewport_positions.as_ptr();
 
         renderer.set_debug_lines_enabled(true);
-        let first = renderer.update_and_render(0.25, InputSnapshot::from_packed(0xa5));
+        let first = renderer.update_and_render(
+            0.25,
+            InputSnapshot::new([0x25, 0, 0], Vec2::ZERO, 0.0, 0, 0).unwrap(),
+        );
         assert_eq!(first.frame_index, 1);
         assert_eq!(first.dt_seconds, 0.1);
-        assert_eq!(first.input_bits, 0xa5);
+        assert_eq!(first.input_bits, 0x25);
         assert_eq!(first.input_vertices, 24);
         assert_eq!(first.input_triangles, 12);
         assert_eq!(first.transformed_vertices, 24);
@@ -4402,9 +4584,96 @@ mod tests {
 
     #[test]
     fn input_snapshot_round_trips_all_packed_bits() {
-        let snapshot = InputSnapshot::from_packed(u32::MAX);
-        assert_eq!(snapshot.packed_bits(), u32::MAX);
+        let snapshot = InputSnapshot::new([INPUT_KEY_MASK, 0, 0], Vec2::ZERO, 0.0, 0, 0).unwrap();
+        assert_eq!(snapshot.packed_bits(), INPUT_KEY_MASK);
         assert_eq!(InputSnapshot::default().packed_bits(), 0);
+    }
+
+    #[test]
+    fn chapter_twenty_input_snapshot_validates_layout_and_maps_camera_axes() {
+        let snapshot = InputSnapshot::new(
+            [INPUT_FORWARD | INPUT_RIGHT, INPUT_FORWARD, INPUT_LEFT],
+            Vec2::new(12.5, -4.0),
+            120.0,
+            1,
+            INPUT_FLAG_DRAGGING | INPUT_MODIFIER_SHIFT,
+        )
+        .unwrap();
+        assert_eq!(snapshot.packed_bits(), INPUT_FORWARD | INPUT_RIGHT);
+        assert_eq!(snapshot.pressed_bits(), INPUT_FORWARD);
+        assert_eq!(snapshot.released_bits(), INPUT_LEFT);
+        assert_eq!(snapshot.pointer_delta(), Vec2::new(12.5, -4.0));
+        assert_eq!(snapshot.wheel_delta(), 120.0);
+        assert_eq!(snapshot.pointer_buttons(), 1);
+        assert_eq!(snapshot.flags(), INPUT_FLAG_DRAGGING | INPUT_MODIFIER_SHIFT);
+        assert_eq!(
+            snapshot.camera_control_input(),
+            CameraControlInput {
+                move_right: 1.0,
+                move_forward: 1.0,
+                pointer_dx: 12.5,
+                pointer_dy: -4.0,
+                wheel_delta: 120.0,
+                dragging: true,
+                ..CameraControlInput::default()
+            }
+        );
+
+        for (result, expected) in [
+            (
+                InputSnapshot::new([1 << 8, 0, 0], Vec2::ZERO, 0.0, 0, 0),
+                InputSnapshotError::UnsupportedKeyBits,
+            ),
+            (
+                InputSnapshot::new([0, 0, 0], Vec2::new(f32::NAN, 0.0), 0.0, 0, 0),
+                InputSnapshotError::InvalidPointerDelta,
+            ),
+            (
+                InputSnapshot::new([0, 0, 0], Vec2::ZERO, f32::INFINITY, 0, 0),
+                InputSnapshotError::InvalidWheelDelta,
+            ),
+            (
+                InputSnapshot::new([0, 0, 0], Vec2::ZERO, 0.0, 1 << 8, 0),
+                InputSnapshotError::UnsupportedPointerButtons,
+            ),
+            (
+                InputSnapshot::new([0, 0, 0], Vec2::ZERO, 0.0, 0, 1 << 8),
+                InputSnapshotError::UnsupportedFlags,
+            ),
+        ] {
+            assert_eq!(result.unwrap_err(), expected);
+            assert!(!expected.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn chapter_twenty_renderer_applies_orbit_and_dt_scaled_fly_before_projection() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert_eq!(renderer.camera_mode(), CameraMode::Orbit);
+        assert_eq!(renderer.camera_pose().eye, CAMERA_EYE);
+        renderer.update_and_render(
+            0.0,
+            InputSnapshot::new([0, 0, 0], Vec2::new(20.0, 0.0), 0.0, 1, INPUT_FLAG_DRAGGING)
+                .unwrap(),
+        );
+        assert!(renderer.camera_pose().forward.x > 0.0);
+        assert_eq!(renderer.mesh_scene.camera_world, renderer.camera_pose().eye);
+
+        renderer.set_camera_mode(CameraMode::Fly).unwrap();
+        let before = renderer.camera_pose();
+        let stats = renderer.update_and_render(
+            0.1,
+            InputSnapshot::new([INPUT_FORWARD, 0, 0], Vec2::ZERO, 0.0, 0, 0).unwrap(),
+        );
+        let after = renderer.camera_pose();
+        assert_eq!(stats.input_bits, INPUT_FORWARD);
+        assert!((after.eye - before.eye).length() > 0.29);
+        assert!((after.eye - before.eye).length() < 0.31);
+        assert_eq!(renderer.mesh_scene.camera_world, after.eye);
+
+        renderer.resize(80, 40).unwrap();
+        assert_eq!(renderer.camera_pose(), after);
+        assert_eq!(renderer.mesh_scene.camera_world, after.eye);
     }
 
     #[test]

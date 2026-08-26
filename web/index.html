@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 19장</title>
+    <title>소프트웨어 래스터라이저 · 20장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,10 +119,17 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>19장 · Blinn-Phong과 sRGB/Linear 색 공간</h1>
+        <h1>20장 · 마우스/키보드와 Orbit/Fly 카메라</h1>
       </div>
-      <p>Base-color texel을 linear에서 filter/조명하고, Blinn-Phong highlight와 sRGB wrong-way 비교를 진단합니다.</p>
+      <p>Canvas가 focus된 동안 드래그/휠로 Orbit하고, Fly 모드에서 WASD·방향키로 이동합니다.</p>
       <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
+        <label for="camera-mode">
+          Camera
+          <select id="camera-mode">
+            <option value="0" selected>Orbit · drag/wheel</option>
+            <option value="1">Fly · drag/WASD</option>
+          </select>
+        </label>
         <label for="cull-mode">
           Culling
           <select id="cull-mode">
@@ -253,7 +260,7 @@
         <label for="specular-color">Specular sRGB <input id="specular-color" type="color" value="#ffffff" /></label>
         <label for="shininess">Shininess <input id="shininess" type="number" value="32" min="0.01" step="1" /></label>
       </div>
-      <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
+      <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
       <p class="space-legend">
         transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write
       </p>
@@ -291,6 +298,8 @@
         <dd id="lighting-status">초기화 중</dd>
         <dt>Lighting samples</dt>
         <dd id="lighting-sample-stats">초기화 중</dd>
+        <dt>Camera input</dt>
+        <dd id="camera-status">초기화 중</dd>
         <dt>프레임</dt>
         <dd id="frame-index">0</dd>
         <dt>고수준 렌더 호출</dt>

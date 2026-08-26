@@ -1,4 +1,5 @@
 import init, { Renderer } from "./pkg/renderer_wasm.js";
+import { InputCollector } from "./input.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
 
@@ -52,11 +53,6 @@ function rendererStats(renderer) {
   };
 }
 
-function collectInputSnapshot() {
-  // 2장은 프레임 입력의 ABI만 고정한다. 키/포인터 의미와 event collector는 20장 범위다.
-  return 0;
-}
-
 function formatMilliseconds(value) {
   return `${value.toFixed(3)} ms`;
 }
@@ -78,6 +74,7 @@ function canvasPixelHash(context, width, height) {
 async function bootstrap() {
   const canvas = document.querySelector("#framebuffer");
   const errorOutput = document.querySelector("#error");
+  const cameraModeSelect = document.querySelector("#camera-mode");
   const cullModeSelect = document.querySelector("#cull-mode");
   const pipelineDebugModeSelect = document.querySelector("#pipeline-debug-mode");
   const windingDebugCheckbox = document.querySelector("#winding-debug");
@@ -118,6 +115,7 @@ async function bootstrap() {
   canvas.width = initialSize.width;
   canvas.height = initialSize.height;
   const renderer = new Renderer(initialSize.width, initialSize.height);
+  const inputCollector = new InputCollector(canvas);
   const presenter = new FramebufferPresenter(context, wasm.memory, renderer);
   let previousTimestamp = null;
   let updateCalls = 0;
@@ -125,6 +123,7 @@ async function bootstrap() {
   let resizeScheduled = false;
   let currentSize = initialSize;
   let lastFrameMetrics = null;
+  let lastInputSnapshot = new Float64Array(8);
   let coordinateDebugText = "좌표 계산 대기 중";
   let textureStatusText = "fallback checkerboard · 2 × 2 · texture 0";
   let textureDecodeGeneration = 0;
@@ -158,6 +157,11 @@ async function bootstrap() {
       `specular ${specularColorInput.value} · shininess ${renderer.material_shininess().toFixed(1)}`;
     document.querySelector("#lighting-sample-stats").textContent =
       `${renderer.stats_lighting_samples()} lighting evaluations after depth`;
+    document.querySelector("#camera-status").textContent =
+      `${cameraModeSelect.options[cameraModeSelect.selectedIndex].text} · ` +
+      `eye (${renderer.camera_eye_x().toFixed(3)}, ${renderer.camera_eye_y().toFixed(3)}, ${renderer.camera_eye_z().toFixed(3)}) · ` +
+      `forward (${renderer.camera_forward_x().toFixed(3)}, ${renderer.camera_forward_y().toFixed(3)}, ${renderer.camera_forward_z().toFixed(3)}) · ` +
+      `yaw ${renderer.camera_yaw().toFixed(3)} · pitch ${renderer.camera_pitch().toFixed(3)} · radius ${renderer.camera_orbit_radius().toFixed(3)}`;
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#pipeline-algorithm").textContent =
@@ -191,10 +195,11 @@ async function bootstrap() {
   const renderFrame = (dtSeconds) => {
     const frameStart = performance.now();
     const inputStart = performance.now();
-    const packedInput = collectInputSnapshot();
+    const inputSnapshot = inputCollector.snapshot();
+    lastInputSnapshot = inputSnapshot;
     const inputEnd = performance.now();
     const updateStart = performance.now();
-    renderer.update_and_render(dtSeconds, packedInput);
+    renderer.update_and_render_input(dtSeconds, inputSnapshot);
     coordinateDebugText = renderer.coordinate_debug_text();
     const updateEnd = performance.now();
     updateCalls += 1;
@@ -215,6 +220,11 @@ async function bootstrap() {
   const setCullMode = (mode) => {
     renderer.set_cull_mode(mode);
     cullModeSelect.value = String(mode);
+  };
+
+  const setCameraMode = (mode) => {
+    renderer.set_camera_mode(mode);
+    cameraModeSelect.value = String(mode);
   };
 
   const setPipelineDebugMode = (mode) => {
@@ -411,6 +421,7 @@ async function bootstrap() {
   };
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
+  setCameraMode(Number(cameraModeSelect.value));
   setCullMode(Number(cullModeSelect.value));
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
@@ -450,6 +461,10 @@ async function bootstrap() {
     restoreDirectionalLightInputs();
   }
 
+  cameraModeSelect.addEventListener("change", () => {
+    setCameraMode(Number(cameraModeSelect.value));
+    renderFrame(0);
+  });
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
     renderFrame(0);
@@ -631,6 +646,7 @@ async function bootstrap() {
   const resizeObserver = new ResizeObserver(scheduleDisplayResize);
   resizeObserver.observe(canvas);
   window.addEventListener("resize", scheduleDisplayResize);
+  window.addEventListener("beforeunload", () => inputCollector.dispose(), { once: true });
 
   const snapshot = () => ({
     internalSize: [renderer.width(), renderer.height()],
@@ -644,6 +660,29 @@ async function bootstrap() {
     lastFrameMetrics,
     resizeEvents,
     contextKind: "2d",
+    camera: {
+      mode: renderer.camera_mode(),
+      eye: [renderer.camera_eye_x(), renderer.camera_eye_y(), renderer.camera_eye_z()],
+      forward: [
+        renderer.camera_forward_x(),
+        renderer.camera_forward_y(),
+        renderer.camera_forward_z(),
+      ],
+      yaw: renderer.camera_yaw(),
+      pitch: renderer.camera_pitch(),
+      orbitRadius: renderer.camera_orbit_radius(),
+      input: inputCollector.debugState(),
+    },
+    inputSnapshot: {
+      heldBits: lastInputSnapshot[0],
+      pressedBits: lastInputSnapshot[1],
+      releasedBits: lastInputSnapshot[2],
+      pointerDx: lastInputSnapshot[3],
+      pointerDy: lastInputSnapshot[4],
+      wheelDelta: lastInputSnapshot[5],
+      pointerButtons: lastInputSnapshot[6],
+      flags: lastInputSnapshot[7],
+    },
     cullMode: Number(cullModeSelect.value),
     pipelineDebugMode: Number(pipelineDebugModeSelect.value),
     windingDebugMode: barycentricDebugCheckbox.checked
@@ -713,6 +752,25 @@ async function bootstrap() {
           return snapshot();
         },
         applyDisplayResize,
+        setCameraMode(mode) {
+          setCameraMode(mode);
+          renderFrame(0);
+          return snapshot();
+        },
+        inputState() {
+          return inputCollector.debugState();
+        },
+        testInputSnapshot(values) {
+          try {
+            renderer.update_and_render_input(0, Float64Array.from(values));
+            return { error: null, snapshot: snapshot() };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              snapshot: snapshot(),
+            };
+          }
+        },
         setDebugLinesEnabled(enabled) {
           renderer.set_debug_lines_enabled(enabled);
         },

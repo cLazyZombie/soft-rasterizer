@@ -2,7 +2,8 @@
 
 use renderer_core::{
     CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
-    math::{Vec3, Vec4},
+    camera_control::CameraMode,
+    math::{Vec2, Vec3, Vec4},
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
@@ -12,6 +13,51 @@ use renderer_core::{
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
+
+const INPUT_SNAPSHOT_LENGTH: usize = 8;
+
+fn input_u32(value: f64, name: &str) -> Result<u32, String> {
+    if !value.is_finite() || value.fract() != 0.0 || !(0.0..=u32::MAX as f64).contains(&value) {
+        return Err(format!(
+            "input snapshot {name}는 u32 범위의 정수여야 합니다"
+        ));
+    }
+    Ok(value as u32)
+}
+
+fn input_f32(value: f64, name: &str) -> Result<f32, String> {
+    let value = value as f32;
+    if !value.is_finite() {
+        return Err(format!(
+            "input snapshot {name}는 유한한 f32 값이어야 합니다"
+        ));
+    }
+    Ok(value)
+}
+
+fn decode_input_snapshot(values: &[f64]) -> Result<InputSnapshot, String> {
+    if values.len() != INPUT_SNAPSHOT_LENGTH {
+        return Err(format!(
+            "input snapshot 길이는 {INPUT_SNAPSHOT_LENGTH}이어야 하지만 {}입니다",
+            values.len()
+        ));
+    }
+    InputSnapshot::new(
+        [
+            input_u32(values[0], "held_bits")?,
+            input_u32(values[1], "pressed_bits")?,
+            input_u32(values[2], "released_bits")?,
+        ],
+        Vec2::new(
+            input_f32(values[3], "pointer_dx")?,
+            input_f32(values[4], "pointer_dy")?,
+        ),
+        input_f32(values[5], "wheel_delta")?,
+        input_u32(values[6], "pointer_buttons")?,
+        input_u32(values[7], "flags")?,
+    )
+    .map_err(|error| error.to_string())
+}
 
 #[wasm_bindgen]
 #[derive(Debug)]
@@ -45,9 +91,90 @@ impl Renderer {
         }
     }
 
-    pub fn update_and_render(&mut self, dt_seconds: f32, packed_input: u32) {
+    pub fn update_and_render(&mut self, dt_seconds: f32, packed_input: u32) -> bool {
+        let input = InputSnapshot::new(
+            [packed_input, 0, 0],
+            renderer_core::math::Vec2::ZERO,
+            0.0,
+            0,
+            0,
+        );
+        match input {
+            Ok(input) => {
+                self.core.update_and_render(dt_seconds, input);
+                self.last_error.clear();
+                true
+            }
+            Err(error) => {
+                self.last_error = error.to_string();
+                false
+            }
+        }
+    }
+
+    /// Layout: held, pressed, released, pointer dx, pointer dy, wheel, buttons, flags.
+    pub fn update_and_render_input(
+        &mut self,
+        dt_seconds: f32,
+        values: &[f64],
+    ) -> Result<(), String> {
+        let input = decode_input_snapshot(values)?;
+        self.core.update_and_render(dt_seconds, input);
+        Ok(())
+    }
+
+    pub fn set_camera_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => CameraMode::Orbit,
+            1 => CameraMode::Fly,
+            _ => return Err(format!("알 수 없는 camera mode입니다: {mode}")),
+        };
         self.core
-            .update_and_render(dt_seconds, InputSnapshot::from_packed(packed_input));
+            .set_camera_mode(mode)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn camera_mode(&self) -> u32 {
+        match self.core.camera_mode() {
+            CameraMode::Orbit => 0,
+            CameraMode::Fly => 1,
+        }
+    }
+
+    pub fn camera_eye_x(&self) -> f32 {
+        self.core.camera_pose().eye.x
+    }
+
+    pub fn camera_eye_y(&self) -> f32 {
+        self.core.camera_pose().eye.y
+    }
+
+    pub fn camera_eye_z(&self) -> f32 {
+        self.core.camera_pose().eye.z
+    }
+
+    pub fn camera_forward_x(&self) -> f32 {
+        self.core.camera_pose().forward.x
+    }
+
+    pub fn camera_forward_y(&self) -> f32 {
+        self.core.camera_pose().forward.y
+    }
+
+    pub fn camera_forward_z(&self) -> f32 {
+        self.core.camera_pose().forward.z
+    }
+
+    pub fn camera_yaw(&self) -> f32 {
+        self.core.camera_yaw()
+    }
+
+    pub fn camera_pitch(&self) -> f32 {
+        self.core.camera_pitch()
+    }
+
+    pub fn camera_orbit_radius(&self) -> f32 {
+        self.core.camera_orbit_radius()
     }
 
     pub fn set_debug_lines_enabled(&mut self, enabled: bool) {
@@ -768,10 +895,10 @@ mod tests {
         assert_eq!(renderer.framebuffer_generation(), 0);
         assert_eq!(renderer.last_error(), "");
 
-        renderer.update_and_render(0.016, 0xa5);
+        assert!(renderer.update_and_render(0.016, 0x25));
         assert_eq!(renderer.stats_frame_index(), 1);
         assert_eq!(renderer.stats_dt_seconds(), 0.016);
-        assert_eq!(renderer.stats_input_bits(), 0xa5);
+        assert_eq!(renderer.stats_input_bits(), 0x25);
         assert_eq!(renderer.stats_input_vertices(), 24);
         assert_eq!(renderer.stats_input_triangles(), 12);
         assert_eq!(renderer.stats_transformed_vertices(), 24);
@@ -1366,5 +1493,68 @@ mod tests {
                 .contains("shininess")
         );
         assert_eq!(renderer.material_shininess(), 48.0);
+    }
+
+    #[test]
+    fn adapter_validates_chapter_twenty_input_layout_and_maps_camera_state() {
+        let valid = [1.0, 1.0, 0.0, 10.0, -2.0, 0.0, 1.0, 1.0];
+        let decoded = decode_input_snapshot(&valid).unwrap();
+        assert_eq!(decoded.packed_bits(), 1);
+        assert_eq!(decoded.pressed_bits(), 1);
+
+        for (values, message) in [
+            (vec![0.0; 7], "길이"),
+            (vec![f64::NAN, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "정수"),
+            (vec![0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "정수"),
+            (
+                vec![u32::MAX as f64 + 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                "정수",
+            ),
+            (vec![0.0, 0.0, 0.0, f64::MAX, 0.0, 0.0, 0.0, 0.0], "f32"),
+            (vec![64.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0], "이동 키"),
+        ] {
+            assert!(
+                decode_input_snapshot(&values)
+                    .unwrap_err()
+                    .contains(message)
+            );
+        }
+
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        assert_eq!(renderer.camera_mode(), 0);
+        assert_eq!(renderer.camera_eye_x(), 0.0);
+        assert_eq!(renderer.camera_eye_y(), 0.0);
+        assert_eq!(renderer.camera_eye_z(), -3.0);
+        assert_eq!(renderer.camera_forward_x(), 0.0);
+        assert_eq!(renderer.camera_forward_y(), 0.0);
+        assert_eq!(renderer.camera_forward_z(), 1.0);
+        assert_eq!(renderer.camera_yaw(), 0.0);
+        assert_eq!(renderer.camera_pitch(), 0.0);
+        assert_eq!(renderer.camera_orbit_radius(), 3.0);
+        renderer.set_camera_mode(0).unwrap();
+        renderer.set_camera_mode(1).unwrap();
+        renderer
+            .update_and_render_input(0.1, &[1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+            .unwrap();
+        assert_eq!(renderer.camera_mode(), 1);
+        assert!(renderer.camera_eye_z() > -3.0);
+        assert!(
+            renderer
+                .set_camera_mode(2)
+                .unwrap_err()
+                .contains("camera mode")
+        );
+        assert!(
+            renderer
+                .update_and_render_input(0.0, &[0.0; 7])
+                .unwrap_err()
+                .contains("길이")
+        );
+        let frame_index = renderer.stats_frame_index();
+        assert!(!renderer.update_and_render(0.0, 1 << 31));
+        assert!(renderer.last_error().contains("이동 키"));
+        assert_eq!(renderer.stats_frame_index(), frame_index);
+        assert!(renderer.update_and_render(0.0, 0));
+        assert_eq!(renderer.last_error(), "");
     }
 }
