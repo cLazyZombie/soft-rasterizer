@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 10장</title>
+    <title>소프트웨어 래스터라이저 · 11장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,10 +119,10 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>10장 · 동차 Clip 공간에서 삼각형 자르기</h1>
+        <h1>11장 · Edge 함수, 픽셀 중심, Top-left 규칙</h1>
       </div>
-      <p>삼각형을 perspective divide 전에 여섯 동차 평면으로 자르고, 생성된 polygon을 triangle fan으로 표시합니다.</p>
-      <div class="controls" role="group" aria-label="Winding, culling과 clipping debug 설정">
+      <p>S=256 고정소수점 edge 함수로 픽셀 중심을 검사하고, 공유 변을 top-left 규칙으로 정확히 한 삼각형에 배정합니다.</p>
+      <div class="controls" role="group" aria-label="Winding, culling, clipping과 coverage debug 설정">
         <label for="cull-mode">
           Culling
           <select id="cull-mode">
@@ -139,10 +139,14 @@
           <input id="clip-debug" type="checkbox" />
           Near/모서리 clipping fixture
         </label>
+        <label for="coverage-debug">
+          <input id="coverage-debug" type="checkbox" />
+          두 삼각형 Top-left quad fixture
+        </label>
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
-        clip → fan → divide/viewport → orient2d · 선택 정점 흰색(X-ray) · 화면 좌표는 y-down
+        clip → fan → divide/viewport → S=256 edge/top-left coverage · 선택 정점 흰색(X-ray)
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -158,6 +162,8 @@
         <dd id="framebuffer-mib">초기화 중</dd>
         <dt>선 알고리즘</dt>
         <dd id="line-algorithm">초기화 중</dd>
+        <dt>Coverage 알고리즘</dt>
+        <dd id="coverage-algorithm">초기화 중</dd>
         <dt>수학 규약</dt>
         <dd id="math-convention">초기화 중</dd>
         <dt>프레임</dt>

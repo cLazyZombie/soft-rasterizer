@@ -74,6 +74,10 @@ impl Renderer {
         self.core.set_clip_debug_enabled(enabled);
     }
 
+    pub fn set_coverage_debug_enabled(&mut self, enabled: bool) {
+        self.core.set_coverage_debug_enabled(enabled);
+    }
+
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.core.set_model_rotation_y(rotation_y_radians);
     }
@@ -219,7 +223,12 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         },
     );
     let attributes = snapshot.selected_attributes;
-    let pipeline = if snapshot.clip_debug_enabled {
+    let pipeline = if snapshot.coverage_debug_enabled {
+        format!(
+            "top-left coverage fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
+            snapshot.aspect
+        )
+    } else if snapshot.clip_debug_enabled {
         format!(
             "동차 clip fixture · identity M/V/P vertex stage · viewport aspect {:.3}",
             snapshot.aspect
@@ -233,12 +242,16 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             snapshot.aspect
         )
     };
-    let scene_name = if snapshot.clip_debug_enabled {
+    let scene_name = if snapshot.coverage_debug_enabled {
+        "coverage quad mesh"
+    } else if snapshot.clip_debug_enabled {
         "clip debug mesh"
     } else {
         "indexed cube mesh"
     };
-    let scene_suffix = if snapshot.clip_debug_enabled {
+    let scene_suffix = if snapshot.coverage_debug_enabled {
+        " · 두 삼각형/공유 대각선"
+    } else if snapshot.clip_debug_enabled {
         " · near/left/top 교차"
     } else {
         ""
@@ -258,6 +271,7 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
          winding screen y-down orient2d > 0 front · cull {} · debug {}\n\
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
+         coverage stats rasterized {} · shaded samples {} · S=256 pixel center/top-left\n\
          선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
@@ -280,6 +294,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.clip_invalid_triangles,
         snapshot.frame_stats.generated_triangles,
         snapshot.frame_stats.max_clip_polygon_vertices,
+        snapshot.frame_stats.rasterized_triangles,
+        snapshot.frame_stats.shaded_samples,
         snapshot.selected_vertex_index,
         snapshot.rotation_y_radians,
         attributes.normal_world.x,
@@ -347,7 +363,7 @@ mod tests {
         assert_eq!(renderer.stats_clip_invalid_triangles(), 0);
         assert_eq!(renderer.stats_generated_triangles(), 12);
         assert_eq!(renderer.stats_max_clip_polygon_vertices(), 3);
-        assert_eq!(renderer.stats_rasterized_triangles(), 0);
+        assert_eq!(renderer.stats_rasterized_triangles(), 4);
         assert_eq!(renderer.stats_shaded_samples(), 0);
         assert!(renderer.stats_debug_pixels() > 0);
         assert_eq!(renderer.stats_invalid_values(), 0);
@@ -421,6 +437,35 @@ mod tests {
         assert!(renderer.coordinate_debug_text().contains(
             "clip stats fully clipped 0 · clip invalid 0 · generated 3 · max polygon vertices 5"
         ));
+    }
+
+    #[test]
+    fn adapter_exposes_fixed_point_top_left_coverage_fixture_and_stats() {
+        let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_coverage_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_input_vertices(), 6);
+        assert_eq!(renderer.stats_input_triangles(), 2);
+        assert_eq!(renderer.stats_generated_triangles(), 2);
+        assert_eq!(renderer.stats_submitted_triangles(), 2);
+        assert_eq!(renderer.stats_rasterized_triangles(), 2);
+        assert_eq!(renderer.stats_shaded_samples(), 1_024);
+        assert_eq!(renderer.stats_debug_pixels(), 0);
+        let text = renderer.coordinate_debug_text();
+        assert!(text.contains(
+            "top-left coverage fixture · identity M/V/P vertex stage · viewport aspect 1.000"
+        ));
+        assert!(text.contains(
+            "coverage quad mesh · vertices 6 · indices 6 · triangles 2 · material 0 · 두 삼각형/공유 대각선"
+        ));
+        assert!(text.contains(
+            "coverage stats rasterized 2 · shaded samples 1024 · S=256 pixel center/top-left"
+        ));
+
+        renderer.set_clip_debug_enabled(true);
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.coordinate_debug_text().contains("clip debug mesh"));
     }
 
     #[test]

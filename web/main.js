@@ -64,6 +64,7 @@ async function bootstrap() {
   const cullModeSelect = document.querySelector("#cull-mode");
   const windingDebugCheckbox = document.querySelector("#winding-debug");
   const clipDebugCheckbox = document.querySelector("#clip-debug");
+  const coverageDebugCheckbox = document.querySelector("#coverage-debug");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -90,6 +91,8 @@ async function bootstrap() {
     document.querySelector("#present-path").textContent = "Rust/Wasm RGBA8 → Canvas 2D";
     document.querySelector("#framebuffer-mib").textContent = `${framebufferMiB(currentSize).toFixed(2)} MiB`;
     document.querySelector("#line-algorithm").textContent = "All-octants Bresenham (Rust)";
+    document.querySelector("#coverage-algorithm").textContent =
+      "S=256 incremental edge · pixel center · top-left (Rust)";
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
@@ -152,12 +155,24 @@ async function bootstrap() {
   const setClipDebugEnabled = (enabled) => {
     renderer.set_clip_debug_enabled(enabled);
     clipDebugCheckbox.checked = enabled;
+    if (enabled) {
+      coverageDebugCheckbox.checked = false;
+    }
+  };
+
+  const setCoverageDebugEnabled = (enabled) => {
+    renderer.set_coverage_debug_enabled(enabled);
+    coverageDebugCheckbox.checked = enabled;
+    if (enabled) {
+      clipDebugCheckbox.checked = false;
+    }
   };
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCullMode(Number(cullModeSelect.value));
   setWindingDebugMode(windingDebugCheckbox.checked ? 1 : 0);
   setClipDebugEnabled(clipDebugCheckbox.checked);
+  setCoverageDebugEnabled(coverageDebugCheckbox.checked);
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -169,6 +184,10 @@ async function bootstrap() {
   });
   clipDebugCheckbox.addEventListener("change", () => {
     setClipDebugEnabled(clipDebugCheckbox.checked);
+    renderFrame(0);
+  });
+  coverageDebugCheckbox.addEventListener("change", () => {
+    setCoverageDebugEnabled(coverageDebugCheckbox.checked);
     renderFrame(0);
   });
 
@@ -218,6 +237,7 @@ async function bootstrap() {
     cullMode: Number(cullModeSelect.value),
     windingDebugMode: windingDebugCheckbox.checked ? 1 : 0,
     clipDebugEnabled: clipDebugCheckbox.checked,
+    coverageDebugEnabled: coverageDebugCheckbox.checked,
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
   });
@@ -244,6 +264,7 @@ async function bootstrap() {
         setCullMode,
         setWindingDebugMode,
         setClipDebugEnabled,
+        setCoverageDebugEnabled,
         setModelRotationY(rotationYRadians) {
           renderer.set_model_rotation_y(rotationYRadians);
         },

@@ -63,7 +63,9 @@ P rows:
 - handedness 변경만으로 screen area, edge 또는 top-left 부호를 뒤집지 않는다.
 - 9장 wireframe 제출 단계는 non-finite area나 screen projection 실패를 `invalid`, 이름 붙인 최소 float epsilon 이하의 area를 `degenerate`로 조기 거부한다. 10장부터는 source triangle이 fan triangle 여러 개를 만들 수 있으므로 `generated = submitted + culled + degenerate + invalid`로 fan 출력을 완전히 분류한다. 11장 coverage의 최종 퇴화 판정은 고정소수점 양자화 뒤 `area==0`이며 float epsilon을 top-left equality에 사용하지 않는다.
 - culling은 `none`, `back`, `front`를 지원한다. culling을 통과한 back face는 정점 순서를 바꿔 이후 단계에 positive winding으로 제출한다.
-- 포함 edge는 `dy<0 || (dy==0 && dx>0)`이며 sample 위치는 `(x+0.5,y+0.5)`다.
+- coverage 화면 좌표는 `S=256`으로 `round(screen*S)`한 i64 고정소수점이며, 양자화 뒤 `area==0`이면 버린다. 포함 edge는 `dy<0 || (dy==0 && dx>0)`이고 sample 위치는 `(x+0.5,y+0.5)`다.
+- 정상 clip/viewport 출력과 최대 `16,777,216` 픽셀 계약에서는 각 edge 교차항이 최대 `width*height*S^2 = 1,099,511,627,776`이므로 i64 범위에 안전하다. 독립 setup API의 더 넓은 좌표는 i128로 area, edge step과 clamp된 bbox 네 모서리를 preflight하고 i64 범위를 벗어나면 명시적 오류로 거부한다.
+- bbox는 양자화 정점의 보수적인 정수 범위를 화면에 clamp한다. 첫 픽셀 중심에서 edge 세 개를 한 번 계산하고 x에는 `-dy*S`, y에는 `dx*S`를 더한다. 단색 sample 쓰기 수는 `shaded_samples`, setup을 통과한 삼각형 수는 `rasterized_triangles`로 관찰한다.
 
 ## 카메라 입력
 

@@ -1,6 +1,6 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 10장까지 RGBA8 프레임버퍼에 homogeneous clipping이 적용된 indexed mesh wireframe을 그린다.
+//! 11장까지 homogeneous clipping 뒤 fixed-point top-left coverage로 단색 mesh를 그린다.
 
 pub mod camera;
 pub mod clip;
@@ -18,7 +18,10 @@ use camera::{
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use math::{Mat4, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
-use raster::{CullMode, FaceOrientation, TriangleDisposition, WindingDebugMode, classify_triangle};
+use raster::{
+    CullMode, FaceOrientation, TriangleDisposition, TriangleSetup, TriangleSetupError,
+    WindingDebugMode, classify_triangle,
+};
 #[cfg(test)]
 use transform::CoordinateSpace;
 use transform::{
@@ -32,6 +35,7 @@ const MAX_FRAME_DT_SECONDS: f32 = 0.1;
 const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
 const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
 const CLIP_DEBUG_SELECTED_VERTEX_INDEX: usize = 2;
+const COVERAGE_DEBUG_SELECTED_VERTEX_INDEX: usize = 0;
 const CAMERA_EYE: Vec3 = Vec3::new(2.0, 1.5, -4.0);
 const CAMERA_TARGET: Vec3 = Vec3::ZERO;
 const CAMERA_WORLD_UP: Vec3 = Vec3::Y;
@@ -330,9 +334,9 @@ impl MeshScene {
         scene
     }
 
-    fn new_clip_debug(mesh: &Mesh, width: usize, height: usize) -> Self {
+    fn new_identity_debug(mesh: &Mesh, width: usize, height: usize) -> Self {
         let mut scene = Self::with_capacity(mesh);
-        scene.rebuild_clip_debug(mesh, width, height);
+        scene.rebuild_identity_debug(mesh, width, height);
         scene
     }
 
@@ -346,7 +350,7 @@ impl MeshScene {
         self.rebuild_with_pipeline(mesh, pipeline, width, height);
     }
 
-    fn rebuild_clip_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
+    fn rebuild_identity_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
         let identity = Mat4::identity();
         self.rebuild_with_pipeline(
             mesh,
@@ -440,10 +444,18 @@ pub struct CoordinateDebugSnapshot {
     pub cull_mode: CullMode,
     pub winding_debug_mode: WindingDebugMode,
     pub clip_debug_enabled: bool,
+    pub coverage_debug_enabled: bool,
     pub frame_stats: FrameStats,
 }
 
-/// 렌더 타깃과 3-10장 indexed mesh/clipping debug scene 상태를 소유한다.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ActiveScene {
+    Cube,
+    Clipping,
+    Coverage,
+}
+
+/// 렌더 타깃과 3-11장 indexed mesh/clipping/coverage debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
     target: RenderTarget,
@@ -453,15 +465,28 @@ pub struct Renderer {
     cull_mode: CullMode,
     winding_debug_mode: WindingDebugMode,
     clip_debug_enabled: bool,
+    coverage_debug_enabled: bool,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
     clip_debug_mesh: Mesh,
     clip_debug_scene: MeshScene,
+    coverage_debug_mesh: Mesh,
+    coverage_debug_scene: MeshScene,
     clipper: TriangleClipper,
 }
 
 impl Renderer {
+    const fn active_scene(&self) -> ActiveScene {
+        if self.coverage_debug_enabled {
+            ActiveScene::Coverage
+        } else if self.clip_debug_enabled {
+            ActiveScene::Clipping
+        } else {
+            ActiveScene::Cube
+        }
+    }
+
     pub fn new(width: usize, height: usize) -> Result<Self, RenderTargetError> {
         let target = RenderTarget::new(width, height)?;
         let mesh = unit_cube_mesh();
@@ -476,7 +501,10 @@ impl Renderer {
         );
         let mesh_scene = MeshScene::new(&mesh, draw_item.model, width, height);
         let clip_debug_mesh = clipping_debug_fixture();
-        let clip_debug_scene = MeshScene::new_clip_debug(&clip_debug_mesh, width, height);
+        let clip_debug_scene = MeshScene::new_identity_debug(&clip_debug_mesh, width, height);
+        let coverage_debug_mesh = coverage_debug_fixture();
+        let coverage_debug_scene =
+            MeshScene::new_identity_debug(&coverage_debug_mesh, width, height);
         let mut renderer = Self {
             target,
             stats: FrameStats::default(),
@@ -485,11 +513,14 @@ impl Renderer {
             cull_mode: CullMode::Back,
             winding_debug_mode: WindingDebugMode::VertexColor,
             clip_debug_enabled: false,
+            coverage_debug_enabled: false,
             mesh,
             draw_item,
             mesh_scene,
             clip_debug_mesh,
             clip_debug_scene,
+            coverage_debug_mesh,
+            coverage_debug_scene,
             clipper: TriangleClipper::default(),
         };
         let draw_options = FrameDrawOptions::from_renderer(&renderer);
@@ -511,19 +542,25 @@ impl Renderer {
         let mut replacement = RenderTarget::new(width, height)?;
         let replacement_scene = MeshScene::new(&self.mesh, self.draw_item.model, width, height);
         let replacement_clip_debug_scene =
-            MeshScene::new_clip_debug(&self.clip_debug_mesh, width, height);
-        let (mesh, clip_vertices, selected_vertex_index) = if self.clip_debug_enabled {
-            (
-                &self.clip_debug_mesh,
-                replacement_clip_debug_scene.clip_vertices.as_slice(),
-                CLIP_DEBUG_SELECTED_VERTEX_INDEX,
-            )
-        } else {
-            (
+            MeshScene::new_identity_debug(&self.clip_debug_mesh, width, height);
+        let replacement_coverage_debug_scene =
+            MeshScene::new_identity_debug(&self.coverage_debug_mesh, width, height);
+        let (mesh, clip_vertices, selected_vertex_index) = match self.active_scene() {
+            ActiveScene::Cube => (
                 &self.mesh,
                 replacement_scene.clip_vertices.as_slice(),
                 CUBE_SELECTED_VERTEX_INDEX,
-            )
+            ),
+            ActiveScene::Clipping => (
+                &self.clip_debug_mesh,
+                replacement_clip_debug_scene.clip_vertices.as_slice(),
+                CLIP_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
+            ActiveScene::Coverage => (
+                &self.coverage_debug_mesh,
+                replacement_coverage_debug_scene.clip_vertices.as_slice(),
+                COVERAGE_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
         };
         let draw_options = FrameDrawOptions::from_renderer(self);
         draw_frame(
@@ -537,6 +574,7 @@ impl Renderer {
         self.target = replacement;
         self.mesh_scene = replacement_scene;
         self.clip_debug_scene = replacement_clip_debug_scene;
+        self.coverage_debug_scene = replacement_coverage_debug_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
         Ok(())
     }
@@ -550,28 +588,36 @@ impl Renderer {
         } else {
             rotation_y
         };
-        if self.clip_debug_enabled {
-            self.clip_debug_scene.rebuild_clip_debug(
-                &self.clip_debug_mesh,
-                self.target.width(),
-                self.target.height(),
-            );
-        } else {
-            self.mesh_scene.rebuild_cube(
+        match self.active_scene() {
+            ActiveScene::Cube => self.mesh_scene.rebuild_cube(
                 &self.mesh,
                 self.draw_item.model,
                 self.target.width(),
                 self.target.height(),
-            );
+            ),
+            ActiveScene::Clipping => self.clip_debug_scene.rebuild_identity_debug(
+                &self.clip_debug_mesh,
+                self.target.width(),
+                self.target.height(),
+            ),
+            ActiveScene::Coverage => self.coverage_debug_scene.rebuild_identity_debug(
+                &self.coverage_debug_mesh,
+                self.target.width(),
+                self.target.height(),
+            ),
         }
-        let (mesh, scene, selected_vertex_index) = if self.clip_debug_enabled {
-            (
+        let (mesh, scene, selected_vertex_index) = match self.active_scene() {
+            ActiveScene::Cube => (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX),
+            ActiveScene::Clipping => (
                 &self.clip_debug_mesh,
                 &self.clip_debug_scene,
                 CLIP_DEBUG_SELECTED_VERTEX_INDEX,
-            )
-        } else {
-            (&self.mesh, &self.mesh_scene, CUBE_SELECTED_VERTEX_INDEX)
+            ),
+            ActiveScene::Coverage => (
+                &self.coverage_debug_mesh,
+                &self.coverage_debug_scene,
+                COVERAGE_DEBUG_SELECTED_VERTEX_INDEX,
+            ),
         };
         let draw_report = draw_frame(
             &mut self.target,
@@ -603,12 +649,13 @@ impl Renderer {
             clip_invalid_triangles: draw_report.clip_invalid_triangles,
             generated_triangles: draw_report.generated_triangles,
             max_clip_polygon_vertices: draw_report.max_clip_polygon_vertices,
+            rasterized_triangles: draw_report.rasterized_triangles,
+            shaded_samples: draw_report.shaded_samples,
             debug_pixels: draw_report.debug_pixels,
             invalid_values: scene
                 .diagnostics
                 .invalid_values
                 .saturating_add(u32::from(invalid_dt)),
-            ..FrameStats::default()
         };
         self.stats
     }
@@ -631,6 +678,16 @@ impl Renderer {
 
     pub fn set_clip_debug_enabled(&mut self, enabled: bool) {
         self.clip_debug_enabled = enabled;
+        if enabled {
+            self.coverage_debug_enabled = false;
+        }
+    }
+
+    pub fn set_coverage_debug_enabled(&mut self, enabled: bool) {
+        self.coverage_debug_enabled = enabled;
+        if enabled {
+            self.clip_debug_enabled = false;
+        }
     }
 
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
@@ -669,22 +726,28 @@ impl Renderer {
 
     pub fn coordinate_debug_snapshot(&self) -> CoordinateDebugSnapshot {
         let (mesh, scene, selected_vertex_index, rotation_y_radians, material_id) =
-            if self.clip_debug_enabled {
-                (
-                    &self.clip_debug_mesh,
-                    &self.clip_debug_scene,
-                    CLIP_DEBUG_SELECTED_VERTEX_INDEX,
-                    0.0,
-                    0,
-                )
-            } else {
-                (
+            match self.active_scene() {
+                ActiveScene::Cube => (
                     &self.mesh,
                     &self.mesh_scene,
                     CUBE_SELECTED_VERTEX_INDEX,
                     self.draw_item.model.rotation_radians.y,
                     self.draw_item.material_id.0,
-                )
+                ),
+                ActiveScene::Clipping => (
+                    &self.clip_debug_mesh,
+                    &self.clip_debug_scene,
+                    CLIP_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                ),
+                ActiveScene::Coverage => (
+                    &self.coverage_debug_mesh,
+                    &self.coverage_debug_scene,
+                    COVERAGE_DEBUG_SELECTED_VERTEX_INDEX,
+                    0.0,
+                    0,
+                ),
             };
         let selected_vertex = scene.traces[selected_vertex_index];
         CoordinateDebugSnapshot {
@@ -708,6 +771,7 @@ impl Renderer {
             cull_mode: self.cull_mode,
             winding_debug_mode: self.winding_debug_mode,
             clip_debug_enabled: self.clip_debug_enabled,
+            coverage_debug_enabled: self.coverage_debug_enabled,
             frame_stats: self.stats,
         }
     }
@@ -740,6 +804,32 @@ fn clipping_debug_fixture() -> Mesh {
     Mesh::new(vertices, vec![0, 1, 2]).expect("고정 clipping debug mesh 계약은 항상 유효해야 한다")
 }
 
+fn coverage_debug_fixture() -> Mesh {
+    let orange = Vec4::new(1.0, 0.35, 0.15, 1.0);
+    let cyan = Vec4::new(0.15, 0.75, 1.0, 1.0);
+    let vertices = [
+        (Vec3::new(-0.5, 0.5, 0.5), orange),
+        (Vec3::new(0.5, 0.5, 0.5), orange),
+        (Vec3::new(0.5, -0.5, 0.5), orange),
+        (Vec3::new(-0.5, 0.5, 0.5), cyan),
+        (Vec3::new(0.5, -0.5, 0.5), cyan),
+        (Vec3::new(-0.5, -0.5, 0.5), cyan),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(index, (position, color))| {
+        mesh::Vertex::new(
+            position,
+            Vec3::Z,
+            math::Vec2::new((index % 3) as f32 * 0.5, (index / 3) as f32),
+            color,
+        )
+    })
+    .collect();
+    Mesh::new(vertices, vec![0, 1, 2, 3, 4, 5])
+        .expect("고정 top-left coverage quad 계약은 항상 유효해야 한다")
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct FrameDrawReport {
     submitted_triangles: u32,
@@ -750,6 +840,8 @@ struct FrameDrawReport {
     clip_invalid_triangles: u32,
     generated_triangles: u32,
     max_clip_polygon_vertices: u32,
+    rasterized_triangles: u32,
+    shaded_samples: u32,
     debug_pixels: u32,
 }
 
@@ -802,7 +894,7 @@ fn draw_debug_scene(
     let shortest_side = width.min(height);
     let white = Color::rgb(238, 244, 255);
     if !options.debug_lines_enabled {
-        return draw_mesh_wireframe(
+        return draw_mesh(
             target,
             false,
             options.cull_mode,
@@ -813,7 +905,7 @@ fn draw_debug_scene(
         );
     }
     if width < 16 || height < 16 {
-        let mut report = draw_mesh_wireframe(
+        let mut report = draw_mesh(
             target,
             false,
             options.cull_mode,
@@ -848,7 +940,7 @@ fn draw_debug_scene(
         ));
     }
 
-    let mut report = draw_mesh_wireframe(
+    let mut report = draw_mesh(
         target,
         true,
         options.cull_mode,
@@ -901,7 +993,7 @@ fn project_inside_clip(
     Some((ndc, viewport))
 }
 
-fn draw_mesh_wireframe(
+fn draw_mesh(
     target: &mut RenderTarget,
     draw_enabled: bool,
     cull_mode: CullMode,
@@ -948,7 +1040,7 @@ fn draw_mesh_wireframe(
                 report.invalid_triangles = report.invalid_triangles.saturating_add(1);
                 continue;
             };
-            submit_wireframe_triangle(
+            submit_triangle(
                 target,
                 draw_enabled,
                 cull_mode,
@@ -962,7 +1054,7 @@ fn draw_mesh_wireframe(
     report
 }
 
-fn submit_wireframe_triangle(
+fn submit_triangle(
     target: &mut RenderTarget,
     draw_enabled: bool,
     cull_mode: CullMode,
@@ -989,7 +1081,41 @@ fn submit_wireframe_triangle(
             return;
         }
     };
+    let ordered_positions = order.map(|index| positions[index]);
+    let setup = match TriangleSetup::new(ordered_positions, target.width(), target.height()) {
+        Ok(setup) => setup,
+        Err(TriangleSetupError::Degenerate) => {
+            report.degenerate_triangles = report.degenerate_triangles.saturating_add(1);
+            return;
+        }
+        Err(
+            TriangleSetupError::InvalidTarget
+            | TriangleSetupError::NonFinitePosition
+            | TriangleSetupError::FixedPointOverflow
+            | TriangleSetupError::ArithmeticOverflow
+            | TriangleSetupError::BackFacing,
+        ) => {
+            report.invalid_triangles = report.invalid_triangles.saturating_add(1);
+            return;
+        }
+    };
+    let fill_color = match winding_debug_mode {
+        WindingDebugMode::VertexColor => debug_color(generated[order[0]].color),
+        WindingDebugMode::Facing => match source_orientation {
+            FaceOrientation::Front => Color::rgb(72, 232, 112),
+            FaceOrientation::Back => Color::rgb(255, 82, 92),
+        },
+    };
+    let shaded_samples = setup.rasterize(|sample| {
+        let written = target.put_pixel(
+            ScreenPoint::new(sample.x as i32, sample.y as i32),
+            fill_color,
+        );
+        debug_assert!(written, "clamp된 coverage sample은 렌더 타깃 내부여야 한다");
+    });
     report.submitted_triangles = report.submitted_triangles.saturating_add(1);
+    report.rasterized_triangles = report.rasterized_triangles.saturating_add(1);
+    report.shaded_samples = report.shaded_samples.saturating_add(shaded_samples);
     if !draw_enabled {
         return;
     }
@@ -1076,6 +1202,10 @@ mod tests {
         bytes.iter().fold(0x811c_9dc5, |hash, byte| {
             (hash ^ u32::from(*byte)).wrapping_mul(0x0100_0193)
         })
+    }
+
+    fn viewport_point(x: f32, y: f32) -> ViewportPosition {
+        ViewportPosition { x, y, z_ndc: 0.5 }
     }
 
     #[test]
@@ -1335,8 +1465,8 @@ mod tests {
         assert_eq!(first.clip_invalid_triangles, 0);
         assert_eq!(first.generated_triangles, 12);
         assert_eq!(first.max_clip_polygon_vertices, 3);
-        assert_eq!(first.rasterized_triangles, 0);
-        assert_eq!(first.shaded_samples, 0);
+        assert_eq!(first.rasterized_triangles, 4);
+        assert_eq!(first.shaded_samples, 329);
         assert!(first.debug_pixels > 0);
         assert_eq!(first.invalid_values, 0);
         assert_eq!(renderer.stats(), first);
@@ -1357,6 +1487,8 @@ mod tests {
         assert_eq!(negative.dt_seconds, 0.0);
         assert_eq!(negative.submitted_triangles, 4);
         assert_eq!(negative.culled_triangles, 8);
+        assert_eq!(negative.rasterized_triangles, 4);
+        assert_eq!(negative.shaded_samples, first.shaded_samples);
         assert_eq!(negative.debug_pixels, 0);
         assert_eq!(negative.invalid_values, 0);
         assert_eq!(renderer.color_buffer()[..4], [0, 0, 220, 255]);
@@ -1377,21 +1509,21 @@ mod tests {
                 .debug_pixels,
             0
         );
-        assert_eq!(tiny.color_buffer(), [0, 0, 220, 255]);
+        assert_eq!(tiny.color_buffer(), [255, 89, 64, 255]);
     }
 
     #[test]
-    fn chapter_eight_indexed_mesh_wireframe_matches_64_by_64_golden_hash() {
+    fn chapter_eleven_double_sided_flat_coverage_matches_64_by_64_golden_hash() {
         let mut renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
         renderer.set_cull_mode(CullMode::None);
         renderer.update_and_render(0.0, InputSnapshot::default());
-        assert_eq!(fnv1a(renderer.color_buffer()), 0xf1ef_5933);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x06f6_b714);
     }
 
     #[test]
-    fn chapter_nine_backface_culled_wireframe_matches_64_by_64_golden_hash() {
+    fn chapter_eleven_backface_culled_flat_coverage_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x647c_0b11);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x4235_c453);
     }
 
     #[test]
@@ -1452,7 +1584,7 @@ mod tests {
         assert_eq!(snapshot.mesh_indices, 3);
         assert_eq!(snapshot.mesh_triangles, 1);
         assert_eq!(snapshot.rotation_y_radians, 0.0);
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x0d76_cd40);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x3de5_f88f);
 
         renderer
             .resize(128, 64)
@@ -1463,6 +1595,84 @@ mod tests {
             resized.max_clip_polygon_vertices,
             stats.max_clip_polygon_vertices
         );
+    }
+
+    #[test]
+    fn chapter_eleven_quad_uses_one_top_left_owner_per_pixel_center() {
+        let mut renderer = Renderer::new(64, 64).expect("renderer should be valid");
+        renderer.set_debug_lines_enabled(false);
+        renderer.set_coverage_debug_enabled(true);
+        let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(stats.input_vertices, 6);
+        assert_eq!(stats.input_triangles, 2);
+        assert_eq!(stats.transformed_vertices, 6);
+        assert_eq!(stats.generated_triangles, 2);
+        assert_eq!(stats.submitted_triangles, 2);
+        assert_eq!(stats.culled_triangles, 0);
+        assert_eq!(stats.degenerate_triangles, 0);
+        assert_eq!(stats.invalid_triangles, 0);
+        assert_eq!(stats.rasterized_triangles, 2);
+        assert_eq!(stats.shaded_samples, 32 * 32);
+        assert_eq!(stats.debug_pixels, 0);
+        assert!(
+            renderer
+                .depth_buffer()
+                .iter()
+                .all(|depth| depth.is_infinite())
+        );
+
+        let orange = [255, 89, 38, 255];
+        let cyan = [38, 191, 255, 255];
+        let orange_count = renderer
+            .color_buffer()
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == orange)
+            .count();
+        let cyan_count = renderer
+            .color_buffer()
+            .chunks_exact(4)
+            .filter(|pixel| *pixel == cyan)
+            .count();
+        assert_eq!((orange_count, cyan_count), (528, 496));
+        assert_eq!(orange_count + cyan_count, stats.shaded_samples as usize);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x1d6a_3195);
+
+        let snapshot = renderer.coordinate_debug_snapshot();
+        assert!(!snapshot.clip_debug_enabled);
+        assert!(snapshot.coverage_debug_enabled);
+        assert_eq!(snapshot.selected_vertex_index, 0);
+        assert_eq!(
+            snapshot.selected_viewport.unwrap(),
+            ViewportPosition {
+                x: 16.0,
+                y: 16.0,
+                z_ndc: 0.5,
+            }
+        );
+
+        renderer
+            .resize(128, 64)
+            .expect("active coverage fixture resize should succeed");
+        assert_eq!(renderer.framebuffer_generation(), 1);
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.input_triangles, 2);
+        assert_eq!(resized.rasterized_triangles, 2);
+        assert_eq!(resized.shaded_samples, 64 * 32);
+        let resized_snapshot = renderer.coordinate_debug_snapshot();
+        assert!(resized_snapshot.coverage_debug_enabled);
+        assert_eq!(
+            resized_snapshot.selected_viewport.unwrap(),
+            ViewportPosition {
+                x: 32.0,
+                y: 16.0,
+                z_ndc: 0.5,
+            }
+        );
+
+        renderer.set_clip_debug_enabled(true);
+        let clipping = renderer.coordinate_debug_snapshot();
+        assert!(clipping.clip_debug_enabled);
+        assert!(!clipping.coverage_debug_enabled);
     }
 
     #[test]
@@ -1542,10 +1752,10 @@ mod tests {
         let source = clipping_debug_fixture();
         let reversed = Mesh::new(source.vertices().to_vec(), vec![0, 2, 1])
             .expect("reversed clipping fixture should remain a valid mesh");
-        let reversed_scene = MeshScene::new_clip_debug(&reversed, 64, 64);
+        let reversed_scene = MeshScene::new_identity_debug(&reversed, 64, 64);
         let mut target = RenderTarget::new(64, 64).expect("target should be valid");
         let mut clipper = TriangleClipper::default();
-        let reversed_back = draw_mesh_wireframe(
+        let reversed_back = draw_mesh(
             &mut target,
             false,
             CullMode::Back,
@@ -1564,7 +1774,7 @@ mod tests {
         );
         assert_eq!(reversed_back.degenerate_triangles, 0);
 
-        let reversed_front = draw_mesh_wireframe(
+        let reversed_front = draw_mesh(
             &mut target,
             false,
             CullMode::Front,
@@ -1643,7 +1853,7 @@ mod tests {
             ),
             (facing.submitted_triangles, facing.culled_triangles)
         );
-        assert_eq!(fnv1a(renderer.color_buffer()), 0xf1ef_5933);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0x06f6_b714);
     }
 
     #[test]
@@ -1667,7 +1877,7 @@ mod tests {
         let mut target = RenderTarget::new(64, 64).unwrap();
         let mut clipper = TriangleClipper::default();
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::Back,
@@ -1690,7 +1900,7 @@ mod tests {
         let color_before_degenerate = target.color().to_vec();
         let depth_before_degenerate = target.depth().to_vec();
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::Back,
@@ -1712,7 +1922,7 @@ mod tests {
         let mut invalid_vertices = degenerate_scene.clip_vertices.clone();
         invalid_vertices[0].uv.x = f32::NAN;
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::None,
@@ -1728,10 +1938,10 @@ mod tests {
         );
 
         let fixture_mesh = clipping_debug_fixture();
-        let fixture_scene = MeshScene::new_clip_debug(&fixture_mesh, 64, 64);
+        let fixture_scene = MeshScene::new_identity_debug(&fixture_mesh, 64, 64);
         let mut fixture_vertices = fixture_scene.clip_vertices;
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::None,
@@ -1747,7 +1957,7 @@ mod tests {
         );
 
         let mut invalid_submission = FrameDrawReport::default();
-        submit_wireframe_triangle(
+        submit_triangle(
             &mut target,
             true,
             CullMode::None,
@@ -1784,11 +1994,78 @@ mod tests {
             }
         );
 
+        let generated = [
+            fixture_vertices[0],
+            fixture_vertices[1],
+            fixture_vertices[2],
+        ];
+        let mut quantized_degenerate = FrameDrawReport::default();
+        submit_triangle(
+            &mut target,
+            false,
+            CullMode::None,
+            WindingDebugMode::VertexColor,
+            generated,
+            [
+                viewport_point(0.0, 0.0),
+                viewport_point(1.0, 0.0),
+                viewport_point(0.0, 0.0015),
+            ],
+            &mut quantized_degenerate,
+        );
+        assert_eq!(
+            quantized_degenerate,
+            FrameDrawReport {
+                degenerate_triangles: 1,
+                ..FrameDrawReport::default()
+            }
+        );
+
+        for invalid_positions in [
+            [
+                ViewportPosition {
+                    x: 0.0,
+                    y: 0.0,
+                    z_ndc: f32::NAN,
+                },
+                viewport_point(1.0, 0.0),
+                viewport_point(0.0, 1.0),
+            ],
+            [
+                viewport_point(0.0, 0.0),
+                viewport_point(f32::MAX, 0.0),
+                viewport_point(0.0, 1.0),
+            ],
+            [
+                viewport_point(0.0, 0.0),
+                viewport_point(20_000_000.0, 0.0),
+                viewport_point(0.0, 20_000_000.0),
+            ],
+        ] {
+            let mut report = FrameDrawReport::default();
+            submit_triangle(
+                &mut target,
+                false,
+                CullMode::None,
+                WindingDebugMode::VertexColor,
+                generated,
+                invalid_positions,
+                &mut report,
+            );
+            assert_eq!(
+                report,
+                FrameDrawReport {
+                    invalid_triangles: 1,
+                    ..FrameDrawReport::default()
+                }
+            );
+        }
+
         for vertex in &mut fixture_vertices {
             vertex.clip_pos.0 = Vec4::new(0.0, 0.0, -0.5, 1.0);
         }
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::None,
@@ -1808,7 +2085,7 @@ mod tests {
             vertex.clip_pos.0 = Vec4::ZERO;
         }
         assert_eq!(
-            draw_mesh_wireframe(
+            draw_mesh(
                 &mut target,
                 true,
                 CullMode::None,
