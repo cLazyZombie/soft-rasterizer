@@ -47,6 +47,7 @@ function rendererStats(renderer) {
     textureUploadSuccesses: renderer.stats_texture_upload_successes(),
     textureUploadFailures: renderer.stats_texture_upload_failures(),
     activeTextureId: renderer.stats_active_texture_id(),
+    textureSamples: renderer.stats_texture_samples(),
   };
 }
 
@@ -93,6 +94,10 @@ async function bootstrap() {
   const textureFileInput = document.querySelector("#texture-file");
   const textureDebugCheckbox = document.querySelector("#texture-debug");
   const textureStatusOutput = document.querySelector("#texture-status");
+  const textureSamplingCheckbox = document.querySelector("#texture-sampling");
+  const textureFilterSelect = document.querySelector("#texture-filter");
+  const textureAddressUSelect = document.querySelector("#texture-address-u");
+  const textureAddressVSelect = document.querySelector("#texture-address-v");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -127,6 +132,12 @@ async function bootstrap() {
       attributeInterpolationModeSelect.value === "1"
         ? "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)"
         : "affine attribute 비교 경로 (Rust)";
+    document.querySelector("#texture-sampler").textContent =
+      `${textureFilterSelect.options[textureFilterSelect.selectedIndex].text} · ` +
+      `U ${textureAddressUSelect.options[textureAddressUSelect.selectedIndex].text} · ` +
+      `V ${textureAddressVSelect.options[textureAddressVSelect.selectedIndex].text} · Rust fragment sampling`;
+    document.querySelector("#texture-sample-stats").textContent =
+      `${renderer.stats_texture_samples()} sampled after depth`;
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#pipeline-algorithm").textContent =
@@ -270,6 +281,26 @@ async function bootstrap() {
   const setTextureDebugEnabled = (enabled) => {
     renderer.set_texture_debug_enabled(enabled);
     textureDebugCheckbox.checked = enabled;
+    if (enabled) {
+      renderer.set_texture_sampling_enabled(false);
+      textureSamplingCheckbox.checked = false;
+    }
+  };
+
+  const setTextureSamplingEnabled = (enabled) => {
+    renderer.set_texture_sampling_enabled(enabled);
+    textureSamplingCheckbox.checked = enabled;
+    if (enabled) {
+      renderer.set_texture_debug_enabled(false);
+      textureDebugCheckbox.checked = false;
+    }
+  };
+
+  const setSamplerState = (filter, addressU, addressV) => {
+    renderer.set_sampler_state(filter, addressU, addressV);
+    textureFilterSelect.value = String(filter);
+    textureAddressUSelect.value = String(addressU);
+    textureAddressVSelect.value = String(addressV);
   };
 
   const uploadTextureRgba = (width, height, pixels) => {
@@ -300,6 +331,12 @@ async function bootstrap() {
   setDepthOrderReversed(depthOrderReversedCheckbox.checked);
   setPipelineDebugMode(Number(pipelineDebugModeSelect.value));
   setTextureDebugEnabled(textureDebugCheckbox.checked);
+  setSamplerState(
+    Number(textureFilterSelect.value),
+    Number(textureAddressUSelect.value),
+    Number(textureAddressVSelect.value),
+  );
+  setTextureSamplingEnabled(textureSamplingCheckbox.checked);
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
@@ -353,6 +390,24 @@ async function bootstrap() {
     setTextureDebugEnabled(textureDebugCheckbox.checked);
     renderFrame(0);
   });
+  textureSamplingCheckbox.addEventListener("change", () => {
+    setTextureSamplingEnabled(textureSamplingCheckbox.checked);
+    renderFrame(0);
+  });
+  for (const select of [
+    textureFilterSelect,
+    textureAddressUSelect,
+    textureAddressVSelect,
+  ]) {
+    select.addEventListener("change", () => {
+      setSamplerState(
+        Number(textureFilterSelect.value),
+        Number(textureAddressUSelect.value),
+        Number(textureAddressVSelect.value),
+      );
+      renderFrame(0);
+    });
+  }
   const decodeAndUploadTextureFile = async (file, decode = decodeImageFileToRgba) => {
     const generation = ++textureDecodeGeneration;
     textureStatusText = `디코딩 중 · ${file.name}`;
@@ -445,6 +500,12 @@ async function bootstrap() {
     depthOrderReversed: depthOrderReversedCheckbox.checked,
     depthDebugMode: Number(depthDebugModeSelect.value),
     textureDebugEnabled: textureDebugCheckbox.checked,
+    textureSamplingEnabled: textureSamplingCheckbox.checked,
+    samplerState: {
+      filter: renderer.sampler_filter_mode(),
+      addressU: renderer.sampler_address_u(),
+      addressV: renderer.sampler_address_v(),
+    },
     textureStatus: {
       activeId: renderer.active_texture_id(),
       width: renderer.active_texture_width(),
@@ -488,6 +549,12 @@ async function bootstrap() {
         setDepthOrderReversed,
         setDepthDebugMode,
         setTextureDebugEnabled,
+        setTextureSamplingEnabled,
+        setSamplerState(filter, addressU, addressV) {
+          setSamplerState(filter, addressU, addressV);
+          renderFrame(0);
+          return snapshot();
+        },
         uploadTextureRgba(width, height, pixelValues) {
           const pixels = Uint8Array.from(pixelValues);
           const result = uploadTextureRgba(width, height, pixels);

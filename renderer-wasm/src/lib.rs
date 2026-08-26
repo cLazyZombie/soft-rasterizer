@@ -6,7 +6,7 @@ use renderer_core::{
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
-    texture::{TextureColorSpace, TextureId},
+    texture::{AddressMode, FilterMode, SamplerState, TextureColorSpace, TextureId},
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -177,6 +177,59 @@ impl Renderer {
 
     pub fn texture_debug_enabled(&self) -> bool {
         self.core.texture_debug_enabled()
+    }
+
+    pub fn set_texture_sampling_enabled(&mut self, enabled: bool) {
+        self.core.set_texture_sampling_enabled(enabled);
+    }
+
+    pub fn texture_sampling_enabled(&self) -> bool {
+        self.core.texture_sampling_enabled()
+    }
+
+    pub fn set_sampler_state(
+        &mut self,
+        filter: u32,
+        address_u: u32,
+        address_v: u32,
+    ) -> Result<(), String> {
+        let filter = match filter {
+            0 => FilterMode::Nearest,
+            1 => FilterMode::Bilinear,
+            _ => return Err(format!("알 수 없는 texture filter mode입니다: {filter}")),
+        };
+        let address = |value| match value {
+            0 => Ok(AddressMode::Repeat),
+            1 => Ok(AddressMode::ClampToEdge),
+            _ => Err(format!("알 수 없는 texture address mode입니다: {value}")),
+        };
+        self.core.set_sampler_state(SamplerState {
+            filter,
+            address_u: address(address_u)?,
+            address_v: address(address_v)?,
+        });
+        Ok(())
+    }
+
+    pub fn sampler_filter_mode(&self) -> u32 {
+        match self.core.sampler_state().filter {
+            FilterMode::Nearest => 0,
+            FilterMode::Bilinear => 1,
+        }
+    }
+
+    pub fn sampler_address_u(&self) -> u32 {
+        match self.core.sampler_state().address_u {
+            AddressMode::Repeat => 0,
+            AddressMode::ClampToEdge => 1,
+        }
+    }
+
+    pub fn sampler_address_v(&self) -> u32 {
+        match self.core.sampler_state().address_v {
+            AddressMode::Repeat => 0,
+            AddressMode::ClampToEdge => 1,
+        }
     }
 
     pub fn active_texture_id(&self) -> u32 {
@@ -353,6 +406,10 @@ impl Renderer {
 
     pub fn stats_active_texture_id(&self) -> u32 {
         self.stats().active_texture_id
+    }
+
+    pub fn stats_texture_samples(&self) -> u32 {
+        self.stats().texture_samples
     }
 }
 
@@ -1054,5 +1111,55 @@ mod tests {
         assert_eq!(renderer.active_texture_id(), 0);
         renderer.set_texture_debug_enabled(false);
         assert!(!renderer.texture_debug_enabled());
+    }
+
+    #[test]
+    fn adapter_maps_chapter_seventeen_sampler_state_and_stats() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer
+            .upload_texture_rgba(
+                2,
+                2,
+                &[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                ],
+            )
+            .unwrap();
+        assert!(!renderer.texture_sampling_enabled());
+        renderer.set_texture_sampling_enabled(true);
+        assert!(renderer.texture_sampling_enabled());
+        renderer.set_sampler_state(1, 1, 0).unwrap();
+        assert_eq!(renderer.sampler_filter_mode(), 1);
+        assert_eq!(renderer.sampler_address_u(), 1);
+        assert_eq!(renderer.sampler_address_v(), 0);
+        renderer.update_and_render(0.0, 0);
+        assert!(renderer.stats_texture_samples() > 0);
+        assert_eq!(
+            renderer.stats_texture_samples(),
+            renderer.stats_shaded_samples()
+        );
+
+        assert!(
+            renderer
+                .set_sampler_state(2, 0, 0)
+                .unwrap_err()
+                .contains("filter")
+        );
+        assert!(
+            renderer
+                .set_sampler_state(0, 2, 0)
+                .unwrap_err()
+                .contains("address")
+        );
+        assert!(
+            renderer
+                .set_sampler_state(0, 0, 2)
+                .unwrap_err()
+                .contains("address")
+        );
+        renderer.set_sampler_state(0, 0, 1).unwrap();
+        assert_eq!(renderer.sampler_filter_mode(), 0);
+        assert_eq!(renderer.sampler_address_u(), 0);
+        assert_eq!(renderer.sampler_address_v(), 1);
     }
 }

@@ -1685,3 +1685,76 @@ test("texture_upload: 브라우저 RGBA8 디코드와 Rust 소유 texture debug 
     oversizedDecode: oversized,
   });
 });
+
+test("texture_sampling: perspective UV로 nearest/bilinear와 repeat/clamp를 비교한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "texture_sampling" },
+    { type: "steps", description: "16" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page);
+
+  await page.evaluate(() => {
+    window.__softRasterizer.uploadTextureRgba(2, 2, [
+      255, 32, 16, 255, 16, 255, 32, 255, 32, 16, 255, 255, 240, 240, 240, 255,
+    ]);
+    window.__softRasterizer.setModelRotationY(0.35);
+  });
+  await page.locator("#texture-sampling").check();
+  const nearest = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(nearest).toMatchObject({
+    textureDebugEnabled: false,
+    textureSamplingEnabled: true,
+    samplerState: { filter: 0, addressU: 0, addressV: 0 },
+  });
+  expect(nearest.stats.textureSamples).toBe(nearest.stats.shadedSamples);
+  expect(nearest.stats.textureSamples).toBeGreaterThan(0);
+  expect(nearest.pixelHash).toBe("fa577bc7");
+
+  await page.locator("#texture-filter").selectOption("1");
+  const bilinearRepeat = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(bilinearRepeat.samplerState).toEqual({ filter: 1, addressU: 0, addressV: 0 });
+  expect(bilinearRepeat.pixelHash).toBe("ed0594e1");
+  expect(bilinearRepeat.stats.textureSamples).toBe(bilinearRepeat.stats.shadedSamples);
+
+  await page.locator("#texture-address-u").selectOption("1");
+  await page.locator("#texture-address-v").selectOption("1");
+  const bilinearClamp = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(bilinearClamp.samplerState).toEqual({ filter: 1, addressU: 1, addressV: 1 });
+  expect(bilinearClamp.pixelHash).toBe("37cd1d98");
+  await expect(page.locator("#texture-sampler")).toContainText(
+    "Bilinear · U Clamp · V Clamp",
+  );
+
+  await page.locator("#texture-debug").check();
+  const disabled = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(disabled.textureDebugEnabled).toBe(true);
+  expect(disabled.textureSamplingEnabled).toBe(false);
+  expect(disabled.stats.textureSamples).toBe(0);
+  expect(disabled.pixelHash).not.toBe(bilinearClamp.pixelHash);
+  await page.locator("#texture-sampling").check();
+  const restored = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(restored.textureDebugEnabled).toBe(false);
+  expect(restored.textureSamplingEnabled).toBe(true);
+  expect(restored.pixelHash).toBe(bilinearClamp.pixelHash);
+
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter17-texture-sampling.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter17-texture-sampling", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    nearestHash: nearest.pixelHash,
+    bilinearRepeatHash: bilinearRepeat.pixelHash,
+    bilinearClampHash: bilinearClamp.pixelHash,
+  });
+});

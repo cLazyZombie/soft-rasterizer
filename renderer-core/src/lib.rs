@@ -1,7 +1,8 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 16장까지 homogeneous clipping 뒤 scalar cube pipeline과 브라우저에서 한 번
-//! 업로드한 RGBA8 texture의 검증된 소유/debug 경로를 조립한다.
+//! 17장까지 homogeneous clipping 뒤 scalar cube pipeline과 브라우저에서 한 번
+//! 업로드한 RGBA8 texture의 검증된 소유/debug 경로, perspective-correct UV
+//! sampler를 조립한다.
 
 pub mod camera;
 pub mod clip;
@@ -25,7 +26,9 @@ use raster::{
     PipelineDebugMode, ScreenVertex, TriangleDisposition, TriangleSetup, TriangleSetupError,
     WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
-use texture::{Texture, TextureColorSpace, TextureError, TextureId, TextureStore};
+use texture::{
+    Material, SamplerState, Texture, TextureColorSpace, TextureError, TextureId, TextureStore,
+};
 #[cfg(test)]
 use transform::CoordinateSpace;
 use transform::{
@@ -386,6 +389,7 @@ pub struct FrameStats {
     pub texture_upload_successes: u32,
     pub texture_upload_failures: u32,
     pub active_texture_id: u32,
+    pub texture_samples: u32,
 }
 
 impl FrameStats {
@@ -642,6 +646,14 @@ enum ActiveScene {
     Depth,
 }
 
+fn material_for_id(materials: &[Material], id: MaterialId) -> Option<&Material> {
+    materials.get(id.0 as usize)
+}
+
+fn material_for_id_mut(materials: &mut [Material], id: MaterialId) -> Option<&mut Material> {
+    materials.get_mut(id.0 as usize)
+}
+
 /// 렌더 타깃과 3-16장 scalar cube pipeline/texture debug scene 상태를 소유한다.
 #[derive(Debug)]
 pub struct Renderer {
@@ -661,6 +673,7 @@ pub struct Renderer {
     active_texture_id: TextureId,
     texture_upload_successes: u32,
     texture_upload_failures: u32,
+    materials: Vec<Material>,
     mesh: Mesh,
     draw_item: DrawItem,
     mesh_scene: MeshScene,
@@ -742,6 +755,7 @@ impl Renderer {
             active_texture_id,
             texture_upload_successes: 0,
             texture_upload_failures: 0,
+            materials: vec![Material::default()],
             mesh,
             draw_item,
             mesh_scene,
@@ -758,7 +772,12 @@ impl Renderer {
             depth_debug_scene,
             clipper: TriangleClipper::default(),
         };
-        let draw_options = FrameDrawOptions::from_renderer(&renderer);
+        let draw_options = FrameDrawOptions {
+            debug_lines_enabled: renderer.debug_lines_enabled,
+            pipeline_state: renderer.pipeline_state,
+            uv_checker_enabled: renderer.perspective_debug_enabled,
+            sampled_texture: None,
+        };
         draw_frame(
             &mut renderer.target,
             draw_options,
@@ -824,7 +843,26 @@ impl Renderer {
                 DEPTH_DEBUG_SELECTED_VERTEX_INDEX,
             ),
         };
-        let draw_options = FrameDrawOptions::from_renderer(self);
+        let sampled_texture = if matches!(self.active_scene(), ActiveScene::Cube) {
+            let material = material_for_id(&self.materials, self.draw_item.material_id)
+                .expect("DrawItem material ID는 저장소에 존재해야 한다");
+            material.base_color_texture.map(|texture_id| {
+                (
+                    self.textures
+                        .get(texture_id)
+                        .expect("Material texture ID는 저장소에 존재해야 한다"),
+                    material.sampler,
+                )
+            })
+        } else {
+            None
+        };
+        let draw_options = FrameDrawOptions {
+            debug_lines_enabled: self.debug_lines_enabled,
+            pipeline_state: self.pipeline_state,
+            uv_checker_enabled: self.perspective_debug_enabled,
+            sampled_texture,
+        };
         if self.texture_debug_enabled {
             let texture = self
                 .textures
@@ -940,6 +978,20 @@ impl Renderer {
                 self.target.render_texture_nearest(texture),
             )
         } else {
+            let sampled_texture = if matches!(self.active_scene(), ActiveScene::Cube) {
+                let material = material_for_id(&self.materials, self.draw_item.material_id)
+                    .expect("DrawItem material ID는 저장소에 존재해야 한다");
+                material.base_color_texture.map(|texture_id| {
+                    (
+                        self.textures
+                            .get(texture_id)
+                            .expect("Material texture ID는 저장소에 존재해야 한다"),
+                        material.sampler,
+                    )
+                })
+            } else {
+                None
+            };
             (
                 draw_frame(
                     &mut self.target,
@@ -947,6 +999,7 @@ impl Renderer {
                         debug_lines_enabled: self.debug_lines_enabled,
                         pipeline_state: self.pipeline_state,
                         uv_checker_enabled: self.perspective_debug_enabled,
+                        sampled_texture,
                     },
                     mesh,
                     &mut self.clipper,
@@ -1010,6 +1063,7 @@ impl Renderer {
             texture_upload_successes: self.texture_upload_successes,
             texture_upload_failures: self.texture_upload_failures,
             active_texture_id: self.active_texture_id.0,
+            texture_samples: draw_report.texture_samples,
         };
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
@@ -1113,6 +1167,31 @@ impl Renderer {
         self.texture_debug_enabled = enabled;
     }
 
+    pub fn set_texture_sampling_enabled(&mut self, enabled: bool) {
+        let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        material.base_color_texture = enabled.then_some(self.active_texture_id);
+    }
+
+    pub fn texture_sampling_enabled(&self) -> bool {
+        material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .base_color_texture
+            .is_some()
+    }
+
+    pub fn set_sampler_state(&mut self, sampler_state: SamplerState) {
+        material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .sampler = sampler_state;
+    }
+
+    pub fn sampler_state(&self) -> SamplerState {
+        material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .sampler
+    }
+
     pub const fn texture_debug_enabled(&self) -> bool {
         self.texture_debug_enabled
     }
@@ -1130,6 +1209,11 @@ impl Renderer {
         {
             Ok(id) => {
                 self.active_texture_id = id;
+                let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+                    .expect("DrawItem material ID는 저장소에 존재해야 한다");
+                if material.base_color_texture.is_some() {
+                    material.base_color_texture = Some(id);
+                }
                 self.texture_upload_successes = self.texture_upload_successes.saturating_add(1);
                 Ok(id)
             }
@@ -1143,6 +1227,11 @@ impl Renderer {
     pub fn set_active_texture(&mut self, id: TextureId) -> Result<(), TextureError> {
         self.textures.get(id)?;
         self.active_texture_id = id;
+        let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        if material.base_color_texture.is_some() {
+            material.base_color_texture = Some(id);
+        }
         Ok(())
     }
 
@@ -1449,41 +1538,37 @@ struct FrameDrawReport {
     sample_counter_overflow: bool,
     debug_pixels: u32,
     invalid_values: u32,
+    texture_samples: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct FrameDrawOptions {
+struct FrameDrawOptions<'a> {
     debug_lines_enabled: bool,
     pipeline_state: PipelineState,
     uv_checker_enabled: bool,
+    sampled_texture: Option<(&'a Texture, SamplerState)>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct RasterDrawOptions {
+struct RasterDrawOptions<'a> {
     pipeline_state: PipelineState,
     uv_checker_enabled: bool,
+    sampled_texture: Option<(&'a Texture, SamplerState)>,
 }
 
-impl FrameDrawOptions {
-    const fn from_renderer(renderer: &Renderer) -> Self {
-        Self {
-            debug_lines_enabled: renderer.debug_lines_enabled,
-            pipeline_state: renderer.pipeline_state,
-            uv_checker_enabled: renderer.perspective_debug_enabled,
-        }
-    }
-
-    const fn raster(self) -> RasterDrawOptions {
+impl<'a> FrameDrawOptions<'a> {
+    const fn raster(self) -> RasterDrawOptions<'a> {
         RasterDrawOptions {
             pipeline_state: self.pipeline_state,
             uv_checker_enabled: self.uv_checker_enabled,
+            sampled_texture: self.sampled_texture,
         }
     }
 }
 
 fn draw_frame(
     target: &mut RenderTarget,
-    options: FrameDrawOptions,
+    options: FrameDrawOptions<'_>,
     mesh: &Mesh,
     clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
@@ -1511,7 +1596,7 @@ fn draw_frame(
 
 fn draw_debug_scene(
     target: &mut RenderTarget,
-    options: FrameDrawOptions,
+    options: FrameDrawOptions<'_>,
     mesh: &Mesh,
     clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
@@ -1614,7 +1699,7 @@ fn project_inside_clip(
 fn draw_mesh(
     target: &mut RenderTarget,
     draw_enabled: bool,
-    options: RasterDrawOptions,
+    options: RasterDrawOptions<'_>,
     mesh: &Mesh,
     clipper: &mut TriangleClipper,
     clip_vertices: &[ClipVertex],
@@ -1677,7 +1762,7 @@ fn draw_mesh(
 fn submit_triangle(
     target: &mut RenderTarget,
     draw_enabled: bool,
-    options: RasterDrawOptions,
+    options: RasterDrawOptions<'_>,
     generated: [ClipVertex; 3],
     positions: [ViewportPosition; 3],
     triangle_id: u32,
@@ -1747,6 +1832,7 @@ fn submit_triangle(
     let mut min_interpolated_inv_w = 0.0_f32;
     let mut max_interpolated_inv_w = 0.0_f32;
     let mut invalid_values = 0_u32;
+    let mut texture_samples = 0_u32;
     let mut sample_counter_overflow = false;
     setup.rasterize(|sample| {
         increment_sample_counter(&mut covered_samples, &mut sample_counter_overflow);
@@ -1793,7 +1879,17 @@ fn submit_triangle(
             PipelineDebugMode::Solid if options.uv_checker_enabled => {
                 uv_checker_color(fragment.uv())
             }
-            PipelineDebugMode::Solid => debug_color(fragment.color()),
+            PipelineDebugMode::Solid => {
+                if let Some((texture, sampler)) = options.sampled_texture {
+                    let texture_color = sampler
+                        .sample(texture, fragment.uv())
+                        .expect("FragmentInput은 유한한 UV를 보장해야 한다");
+                    increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
+                    debug_color(modulate_color(texture_color, fragment.color()))
+                } else {
+                    debug_color(fragment.color())
+                }
+            }
             PipelineDebugMode::Wireframe => wireframe_fragment_color(fragment.barycentric()),
             PipelineDebugMode::TriangleId => triangle_id_color(triangle_id),
             PipelineDebugMode::Barycentric => debug_color(fragment.barycentric().debug_color()),
@@ -1861,6 +1957,11 @@ fn submit_triangle(
     add_sample_counter(
         &mut report.invalid_interpolation_samples,
         invalid_interpolation_samples,
+        &mut report.sample_counter_overflow,
+    );
+    add_sample_counter(
+        &mut report.texture_samples,
+        texture_samples,
         &mut report.sample_counter_overflow,
     );
     report.invalid_values = report.invalid_values.saturating_add(invalid_values);
@@ -1952,6 +2053,15 @@ fn debug_color(color: Vec4) -> Color {
         normalized_channel_to_u8(color.x),
         normalized_channel_to_u8(color.y),
         normalized_channel_to_u8(color.z),
+    )
+}
+
+fn modulate_color(first: Vec4, second: Vec4) -> Vec4 {
+    Vec4::new(
+        first.x * second.x,
+        first.y * second.y,
+        first.z * second.z,
+        first.w * second.w,
     )
 }
 
@@ -2047,6 +2157,7 @@ mod tests {
                     debug_mode: PipelineDebugMode::Solid,
                 },
                 uv_checker_enabled: true,
+                sampled_texture: None,
             },
             &mesh,
             &mut clipper,
@@ -2062,7 +2173,7 @@ mod tests {
     const fn raster_options(
         cull_mode: CullMode,
         winding_debug_mode: WindingDebugMode,
-    ) -> RasterDrawOptions {
+    ) -> RasterDrawOptions<'static> {
         RasterDrawOptions {
             pipeline_state: PipelineState {
                 cull_mode,
@@ -2074,6 +2185,7 @@ mod tests {
                 },
             },
             uv_checker_enabled: false,
+            sampled_texture: None,
         }
     }
 
@@ -4232,5 +4344,162 @@ mod tests {
                 .input_triangles
                 > 0
         );
+    }
+
+    #[test]
+    fn chapter_seventeen_textured_cube_samples_after_depth_and_changes_filter_output() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer
+            .upload_texture_rgba8(
+                2,
+                2,
+                &[
+                    255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+                ],
+                TextureColorSpace::Srgb,
+            )
+            .unwrap();
+        renderer.set_texture_sampling_enabled(true);
+        assert!(renderer.texture_sampling_enabled());
+        renderer.set_sampler_state(texture::SamplerState {
+            address_u: texture::AddressMode::Repeat,
+            address_v: texture::AddressMode::Repeat,
+            filter: texture::FilterMode::Nearest,
+        });
+        let nearest = renderer.update_and_render(0.0, InputSnapshot::default());
+        let nearest_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(nearest.texture_samples, nearest.shaded_samples);
+        assert!(nearest.texture_samples > 0);
+        assert!(nearest.pipeline_relations_hold());
+        assert_eq!(
+            renderer.sampler_state().filter,
+            texture::FilterMode::Nearest
+        );
+
+        renderer.set_sampler_state(texture::SamplerState {
+            filter: texture::FilterMode::Bilinear,
+            ..renderer.sampler_state()
+        });
+        let bilinear = renderer.update_and_render(0.0, InputSnapshot::default());
+        let bilinear_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(bilinear.texture_samples, bilinear.shaded_samples);
+        assert_ne!(bilinear_hash, nearest_hash);
+        renderer.resize(65, 65).unwrap();
+        let resized = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(resized.texture_samples, resized.shaded_samples);
+        assert!(resized.texture_samples > 0);
+        renderer.set_texture_sampling_enabled(false);
+        assert!(!renderer.texture_sampling_enabled());
+        assert_eq!(
+            renderer
+                .update_and_render(0.0, InputSnapshot::default())
+                .texture_samples,
+            0
+        );
+    }
+
+    #[test]
+    fn chapter_seventeen_draw_item_resolves_its_own_material_sampler_and_texture() {
+        let mut renderer = Renderer::new(32, 32).unwrap();
+        renderer.materials.push(Material {
+            base_color_texture: Some(TextureId(0)),
+            sampler: texture::SamplerState {
+                address_u: texture::AddressMode::ClampToEdge,
+                address_v: texture::AddressMode::Repeat,
+                filter: texture::FilterMode::Bilinear,
+            },
+        });
+        renderer.draw_item.material_id = MaterialId(1);
+
+        assert!(renderer.texture_sampling_enabled());
+        assert_eq!(renderer.sampler_state(), renderer.materials[1].sampler);
+        assert_eq!(renderer.materials[0], Material::default());
+        let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(stats.texture_samples, stats.shaded_samples);
+        assert!(stats.texture_samples > 0);
+
+        let uploaded = renderer
+            .upload_texture_rgba8(1, 1, &[12, 34, 56, 255], TextureColorSpace::Linear)
+            .unwrap();
+        assert_eq!(renderer.materials[1].base_color_texture, Some(uploaded));
+        renderer.set_active_texture(TextureId(0)).unwrap();
+        assert_eq!(renderer.materials[1].base_color_texture, Some(TextureId(0)));
+        assert_eq!(material_for_id(&renderer.materials, MaterialId(99)), None);
+    }
+
+    #[test]
+    fn chapter_seventeen_perspective_texture_is_seam_free_across_quad_diagonals() {
+        let texture = Texture::from_rgba8(
+            2,
+            2,
+            &[
+                255, 32, 16, 255, 16, 255, 32, 255, 32, 16, 255, 255, 240, 240, 240, 255,
+            ],
+            TextureColorSpace::Srgb,
+        )
+        .unwrap();
+        let sampler = texture::SamplerState {
+            address_u: texture::AddressMode::ClampToEdge,
+            address_v: texture::AddressMode::ClampToEdge,
+            filter: texture::FilterMode::Bilinear,
+        };
+        let render = |alternate_diagonal| {
+            let mesh = perspective_debug_fixture(alternate_diagonal);
+            let scene = MeshScene::new_perspective_debug(&mesh, 64, 64);
+            let mut target = RenderTarget::new(64, 64).unwrap();
+            target.clear_color(Color::rgb(0, 0, 0));
+            let report = draw_mesh(
+                &mut target,
+                false,
+                RasterDrawOptions {
+                    pipeline_state: PipelineState::default(),
+                    uv_checker_enabled: false,
+                    sampled_texture: Some((&texture, sampler)),
+                },
+                &mesh,
+                &mut TriangleClipper::default(),
+                &scene.clip_vertices,
+            );
+            (target, report)
+        };
+        let (first, first_report) = render(false);
+        let (second, second_report) = render(true);
+        let mut differing_pixels = 0_u32;
+        let mut max_channel_difference = 0_u8;
+        for (first, second) in first
+            .color()
+            .chunks_exact(4)
+            .zip(second.color().chunks_exact(4))
+        {
+            if first != second {
+                differing_pixels += 1;
+            }
+            for (&first, &second) in first.iter().zip(second) {
+                max_channel_difference = max_channel_difference.max(first.abs_diff(second));
+            }
+        }
+        let max_depth_difference = first
+            .depth()
+            .iter()
+            .zip(second.depth())
+            .filter_map(|(first, second)| {
+                if first.is_infinite() && second.is_infinite() {
+                    None
+                } else {
+                    Some((first - second).abs())
+                }
+            })
+            .fold(0.0_f32, f32::max);
+        assert!(
+            differing_pixels <= 64,
+            "differing pixels: {differing_pixels}"
+        );
+        assert!(
+            max_channel_difference <= 1,
+            "max diff: {max_channel_difference}"
+        );
+        assert!(max_depth_difference <= DEPTH_RANGE_EPSILON);
+        assert_eq!(first_report.texture_samples, first_report.shaded_samples);
+        assert_eq!(second_report.texture_samples, second_report.shaded_samples);
     }
 }

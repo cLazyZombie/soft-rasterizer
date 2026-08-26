@@ -1,7 +1,10 @@
-//! 16장의 브라우저 디코드 결과를 소유하는 RGBA8 texture 저장소.
+//! 16장의 브라우저 디코드 결과를 소유하고 17장의 UV 주소화와 filtering을
+//! 수행하는 RGBA8 texture 저장소.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
+
+use crate::math::{Vec2, Vec4};
 
 /// 한 texture가 소유할 수 있는 최대 texel 수다.
 pub const MAX_TEXTURE_PIXEL_COUNT: usize = 16_777_216;
@@ -10,6 +13,97 @@ pub const MAX_TEXTURE_PIXEL_COUNT: usize = 16_777_216;
 pub enum TextureColorSpace {
     Srgb,
     Linear,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum AddressMode {
+    #[default]
+    Repeat,
+    ClampToEdge,
+}
+
+impl AddressMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Repeat => "repeat",
+            Self::ClampToEdge => "clamp-to-edge",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum FilterMode {
+    #[default]
+    Nearest,
+    Bilinear,
+}
+
+impl FilterMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Nearest => "nearest",
+            Self::Bilinear => "bilinear",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct SamplerState {
+    pub address_u: AddressMode,
+    pub address_v: AddressMode,
+    pub filter: FilterMode,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct Material {
+    pub base_color_texture: Option<TextureId>,
+    pub sampler: SamplerState,
+}
+
+impl SamplerState {
+    pub fn sample(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+        if !uv.x.is_finite() || !uv.y.is_finite() {
+            return None;
+        }
+        match self.filter {
+            FilterMode::Nearest => self.sample_nearest(texture, uv),
+            FilterMode::Bilinear => self.sample_bilinear(texture, uv),
+        }
+    }
+
+    fn sample_nearest(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+        let u = address_normalized(uv.x, self.address_u);
+        let v = address_normalized(uv.y, self.address_v);
+        let x = ((u * texture.width as f32).floor() as usize).min(texture.width - 1);
+        let y = ((v * texture.height as f32).floor() as usize).min(texture.height - 1);
+        texture.fetch(x, y)
+    }
+
+    fn sample_bilinear(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+        let u = address_normalized(uv.x, self.address_u);
+        let v = address_normalized(uv.y, self.address_v);
+        let x = u * texture.width as f32 - 0.5;
+        let y = v * texture.height as f32 - 0.5;
+        let x0 = x.floor() as i64;
+        let y0 = y.floor() as i64;
+        let fraction_x = x - x.floor();
+        let fraction_y = y - y.floor();
+        let x0_index = address_texel(x0, texture.width, self.address_u);
+        let x1_index = address_texel(x0 + 1, texture.width, self.address_u);
+        let y0_index = address_texel(y0, texture.height, self.address_v);
+        let y1_index = address_texel(y0 + 1, texture.height, self.address_v);
+        let top = lerp_vec4(
+            texture.fetch(x0_index, y0_index)?,
+            texture.fetch(x1_index, y0_index)?,
+            fraction_x,
+        );
+        let bottom = lerp_vec4(
+            texture.fetch(x0_index, y1_index)?,
+            texture.fetch(x1_index, y1_index)?,
+            fraction_x,
+        );
+        Some(lerp_vec4(top, bottom, fraction_y))
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -101,6 +195,17 @@ impl Texture {
         let byte_index = 4 * (y * self.width + x);
         Some(self.pixels[byte_index..byte_index + 4].try_into().unwrap())
     }
+
+    pub fn fetch(&self, x: usize, y: usize) -> Option<Vec4> {
+        self.texel_rgba8(x, y).map(|rgba| {
+            Vec4::new(
+                f32::from(rgba[0]) / 255.0,
+                f32::from(rgba[1]) / 255.0,
+                f32::from(rgba[2]) / 255.0,
+                f32::from(rgba[3]) / 255.0,
+            )
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -186,6 +291,25 @@ fn texture_id_for_len(texture_count: usize) -> Result<TextureId, TextureError> {
         .map_err(|_| TextureError::TextureIdExhausted)
 }
 
+fn address_normalized(value: f32, mode: AddressMode) -> f32 {
+    match mode {
+        AddressMode::Repeat => value - value.floor(),
+        AddressMode::ClampToEdge => value.clamp(0.0, 1.0),
+    }
+}
+
+fn address_texel(index: i64, extent: usize, mode: AddressMode) -> usize {
+    let extent = extent as i64;
+    match mode {
+        AddressMode::Repeat => index.rem_euclid(extent) as usize,
+        AddressMode::ClampToEdge => index.clamp(0, extent - 1) as usize,
+    }
+}
+
+fn lerp_vec4(first: Vec4, second: Vec4, amount: f32) -> Vec4 {
+    first * (1.0 - amount) + second * amount
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,6 +334,8 @@ mod tests {
         assert_eq!(texture.texel_rgba8(1, 1), Some([255, 255, 255, 0]));
         assert_eq!(texture.texel_rgba8(2, 0), None);
         assert_eq!(texture.texel_rgba8(0, 2), None);
+        assert_eq!(texture.fetch(0, 0), Some(Vec4::new(1.0, 0.0, 0.0, 1.0)));
+        assert_eq!(texture.fetch(2, 0), None);
     }
 
     #[test]
@@ -313,5 +439,131 @@ mod tests {
             texture_id_for_len(too_many),
             Err(TextureError::TextureIdExhausted)
         );
+    }
+
+    fn sampler(filter: FilterMode, address_u: AddressMode, address_v: AddressMode) -> SamplerState {
+        SamplerState {
+            address_u,
+            address_v,
+            filter,
+        }
+    }
+
+    fn corner_texture() -> Texture {
+        Texture::from_rgba8(2, 2, &CORNERS, TextureColorSpace::Srgb).unwrap()
+    }
+
+    fn assert_vec4_close(actual: Vec4, expected: Vec4) {
+        for (actual, expected) in [
+            (actual.x, expected.x),
+            (actual.y, expected.y),
+            (actual.z, expected.z),
+            (actual.w, expected.w),
+        ] {
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn nearest_sampling_fixes_corners_negative_repeat_and_large_clamp() {
+        let texture = corner_texture();
+        let repeat = sampler(
+            FilterMode::Nearest,
+            AddressMode::Repeat,
+            AddressMode::Repeat,
+        );
+        let clamp = sampler(
+            FilterMode::Nearest,
+            AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge,
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(0.0, 0.0)).unwrap(),
+            texture.fetch(0, 0).unwrap(),
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(0.75, 0.25)).unwrap(),
+            texture.fetch(1, 0).unwrap(),
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(-0.25, 0.25)).unwrap(),
+            texture.fetch(1, 0).unwrap(),
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(0.25, 0.75)).unwrap(),
+            texture.fetch(0, 1).unwrap(),
+        );
+        assert_vec4_close(
+            clamp.sample(&texture, Vec2::new(1.0, 1.0)).unwrap(),
+            texture.fetch(1, 1).unwrap(),
+        );
+        assert_vec4_close(
+            clamp.sample(&texture, Vec2::new(1.0e20, -1.0e20)).unwrap(),
+            texture.fetch(1, 0).unwrap(),
+        );
+        assert_eq!(repeat.sample(&texture, Vec2::new(f32::NAN, 0.0)), None);
+        assert_eq!(repeat.sample(&texture, Vec2::new(0.0, f32::INFINITY)), None);
+    }
+
+    #[test]
+    fn bilinear_center_is_four_texel_average_and_edges_obey_address_modes() {
+        let texture = Texture::from_rgba8(
+            2,
+            2,
+            &[
+                255, 0, 0, 255, 0, 255, 0, 255, 0, 0, 255, 255, 255, 255, 255, 255,
+            ],
+            TextureColorSpace::Srgb,
+        )
+        .unwrap();
+        let repeat = sampler(
+            FilterMode::Bilinear,
+            AddressMode::Repeat,
+            AddressMode::Repeat,
+        );
+        let clamp = sampler(
+            FilterMode::Bilinear,
+            AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge,
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(0.5, 0.5)).unwrap(),
+            Vec4::new(0.5, 0.5, 0.5, 1.0),
+        );
+        assert_vec4_close(
+            clamp.sample(&texture, Vec2::new(0.0, 0.0)).unwrap(),
+            Vec4::new(1.0, 0.0, 0.0, 1.0),
+        );
+        assert_vec4_close(
+            repeat.sample(&texture, Vec2::new(0.0, 0.0)).unwrap(),
+            Vec4::new(0.5, 0.5, 0.5, 1.0),
+        );
+    }
+
+    #[test]
+    fn one_by_one_and_non_power_of_two_textures_are_safe_for_every_sampler() {
+        let one = Texture::from_rgba8(1, 1, &[12, 34, 56, 78], TextureColorSpace::Linear).unwrap();
+        let non_power = Texture::from_rgba8(3, 2, &[128; 24], TextureColorSpace::Linear).unwrap();
+        let expected = one.fetch(0, 0).unwrap();
+        for filter in [FilterMode::Nearest, FilterMode::Bilinear] {
+            for address in [AddressMode::Repeat, AddressMode::ClampToEdge] {
+                let state = sampler(filter, address, address);
+                assert_vec4_close(
+                    state.sample(&one, Vec2::new(-99.25, 123.75)).unwrap(),
+                    expected,
+                );
+                assert_vec4_close(
+                    state.sample(&non_power, Vec2::new(0.37, 0.61)).unwrap(),
+                    Vec4::new(128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0, 128.0 / 255.0),
+                );
+            }
+        }
+        assert_eq!(AddressMode::Repeat.label(), "repeat");
+        assert_eq!(AddressMode::ClampToEdge.label(), "clamp-to-edge");
+        assert_eq!(FilterMode::Nearest.label(), "nearest");
+        assert_eq!(FilterMode::Bilinear.label(), "bilinear");
     }
 }
