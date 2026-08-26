@@ -1,10 +1,11 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 18장까지 homogeneous clipping 뒤 scalar cube pipeline, perspective-correct
-//! texture sampler와 inverse-transpose normal/Lambert 조명 경로를 조립한다.
+//! 19장까지 homogeneous clipping 뒤 scalar cube pipeline, linear texture sampling,
+//! inverse-transpose normal과 Unlit/Lambert/Blinn-Phong 조명 경로를 조립한다.
 
 pub mod camera;
 pub mod clip;
+pub mod color;
 pub mod math;
 pub mod mesh;
 pub mod raster;
@@ -18,6 +19,7 @@ use camera::{
     NdcPosition, ViewportPosition, look_at_lh, perspective_divide, perspective_lh_zo, viewport,
 };
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
+use color::{srgb_decode_channel, srgb_decode_rgba, srgb_encode_rgba};
 use math::{Mat4, Vec2, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
 use raster::{
@@ -26,8 +28,8 @@ use raster::{
     WindingDebugMode, classify_triangle, normalized_channel_to_u8,
 };
 use texture::{
-    Material, NormalMode, SamplerState, Texture, TextureColorSpace, TextureError, TextureId,
-    TextureStore,
+    Material, NormalMode, SamplerState, ShaderMode, Texture, TextureColorSpace, TextureError,
+    TextureId, TextureStore,
 };
 #[cfg(test)]
 use transform::CoordinateSpace;
@@ -498,6 +500,27 @@ impl Display for LightingError {
 
 impl Error for LightingError {}
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum MaterialError {
+    InvalidSpecularColor,
+    InvalidShininess,
+}
+
+impl Display for MaterialError {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidSpecularColor => {
+                formatter.write_str("specular color는 유한한 0..1 sRGB 값이어야 합니다")
+            }
+            Self::InvalidShininess => {
+                formatter.write_str("shininess는 유한한 0보다 큰 값이어야 합니다")
+            }
+        }
+    }
+}
+
+impl Error for MaterialError {}
+
 impl DirectionalLight {
     pub fn new(surface_to_light: Vec3, color: Vec3, intensity: f32) -> Result<Self, LightingError> {
         let surface_to_light = surface_to_light
@@ -542,6 +565,7 @@ struct MeshScene {
     diagnostics: CoordinateDiagnostics,
     projection_failures: u32,
     aspect: f32,
+    camera_world: Vec3,
 }
 
 impl MeshScene {
@@ -555,6 +579,7 @@ impl MeshScene {
             diagnostics: CoordinateDiagnostics::from_traces(&[]),
             projection_failures: 0,
             aspect: 1.0,
+            camera_world: Vec3::ZERO,
         }
     }
 
@@ -589,6 +614,7 @@ impl MeshScene {
         width: usize,
         height: usize,
     ) {
+        self.camera_world = eye;
         let aspect = width as f32 / height as f32;
         let view = look_at_lh(eye, target, CAMERA_WORLD_UP)
             .expect("cube camera view 계약은 항상 유효해야 한다");
@@ -599,6 +625,7 @@ impl MeshScene {
     }
 
     fn rebuild_identity_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
+        self.camera_world = Vec3::ZERO;
         let identity = Mat4::identity();
         self.rebuild_with_pipeline(
             mesh,
@@ -609,6 +636,7 @@ impl MeshScene {
     }
 
     fn rebuild_perspective_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
+        self.camera_world = Vec3::ZERO;
         let aspect = width as f32 / height as f32;
         let identity = Mat4::identity();
         let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
@@ -863,6 +891,7 @@ impl Renderer {
             sampled_texture: None,
             material: Material::default(),
             light: renderer.directional_light,
+            camera_world: renderer.mesh_scene.camera_world,
         };
         draw_frame(
             &mut renderer.target,
@@ -958,6 +987,11 @@ impl Renderer {
             sampled_texture,
             material,
             light: self.directional_light,
+            camera_world: if matches!(self.active_scene(), ActiveScene::Cube) {
+                replacement_scene.camera_world
+            } else {
+                Vec3::ZERO
+            },
         };
         if self.texture_debug_enabled {
             let texture = self
@@ -1106,6 +1140,7 @@ impl Renderer {
                         sampled_texture,
                         material,
                         light: self.directional_light,
+                        camera_world: scene.camera_world,
                     },
                     mesh,
                     &mut self.clipper,
@@ -1300,15 +1335,56 @@ impl Renderer {
     }
 
     pub fn set_lighting_enabled(&mut self, enabled: bool) {
-        material_for_id_mut(&mut self.materials, self.draw_item.material_id)
-            .expect("DrawItem material ID는 저장소에 존재해야 한다")
-            .lighting_enabled = enabled;
+        let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        material.shader_mode = match (enabled, material.shader_mode) {
+            (false, _) => ShaderMode::Unlit,
+            (true, ShaderMode::Unlit) => ShaderMode::Lambert,
+            (true, mode) => mode,
+        };
     }
 
     pub fn lighting_enabled(&self) -> bool {
+        self.shader_mode() != ShaderMode::Unlit
+    }
+
+    pub fn set_shader_mode(&mut self, shader_mode: ShaderMode) {
+        material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다")
+            .shader_mode = shader_mode;
+    }
+
+    pub fn shader_mode(&self) -> ShaderMode {
         material_for_id(&self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다")
-            .lighting_enabled
+            .shader_mode
+    }
+
+    pub fn set_material_specular(
+        &mut self,
+        specular_color: Vec3,
+        shininess: f32,
+    ) -> Result<(), MaterialError> {
+        if ![specular_color.x, specular_color.y, specular_color.z]
+            .into_iter()
+            .all(|channel| channel.is_finite() && (0.0..=1.0).contains(&channel))
+        {
+            return Err(MaterialError::InvalidSpecularColor);
+        }
+        if !shininess.is_finite() || shininess <= 0.0 {
+            return Err(MaterialError::InvalidShininess);
+        }
+        let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        material.specular_color = specular_color;
+        material.shininess = shininess;
+        Ok(())
+    }
+
+    pub fn material_specular(&self) -> (Vec3, f32) {
+        let material = material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        (material.specular_color, material.shininess)
     }
 
     pub fn set_normal_mode(&mut self, normal_mode: NormalMode) {
@@ -1509,7 +1585,10 @@ impl Renderer {
                 | PipelineDebugMode::Depth
                 | PipelineDebugMode::DepthHeatmap
                 | PipelineDebugMode::Normal
-                | PipelineDebugMode::NdotL => WindingDebugMode::VertexColor,
+                | PipelineDebugMode::NdotL
+                | PipelineDebugMode::Diffuse
+                | PipelineDebugMode::Specular
+                | PipelineDebugMode::ColorSpaceComparison => WindingDebugMode::VertexColor,
             },
             clip_debug_enabled: self.clip_debug_enabled,
             coverage_debug_enabled: self.coverage_debug_enabled,
@@ -1527,7 +1606,10 @@ impl Renderer {
                 | PipelineDebugMode::Barycentric
                 | PipelineDebugMode::FrontBack
                 | PipelineDebugMode::Normal
-                | PipelineDebugMode::NdotL => DepthDebugMode::Off,
+                | PipelineDebugMode::NdotL
+                | PipelineDebugMode::Diffuse
+                | PipelineDebugMode::Specular
+                | PipelineDebugMode::ColorSpaceComparison => DepthDebugMode::Off,
             },
             frame_stats: self.stats,
         }
@@ -1702,6 +1784,26 @@ struct FrameDrawOptions<'a> {
     sampled_texture: Option<(&'a Texture, SamplerState)>,
     material: Material,
     light: DirectionalLight,
+    camera_world: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LinearMaterial {
+    base_color: Vec4,
+    specular_color: Vec3,
+}
+
+impl LinearMaterial {
+    fn from_srgb(material: Material) -> Self {
+        Self {
+            base_color: srgb_decode_rgba(material.base_color),
+            specular_color: Vec3::new(
+                srgb_decode_channel(material.specular_color.x),
+                srgb_decode_channel(material.specular_color.y),
+                srgb_decode_channel(material.specular_color.z),
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1710,17 +1812,21 @@ struct RasterDrawOptions<'a> {
     uv_checker_enabled: bool,
     sampled_texture: Option<(&'a Texture, SamplerState)>,
     material: Material,
+    linear_material: LinearMaterial,
     light: DirectionalLight,
+    camera_world: Vec3,
 }
 
 impl<'a> FrameDrawOptions<'a> {
-    const fn raster(self) -> RasterDrawOptions<'a> {
+    fn raster(self) -> RasterDrawOptions<'a> {
         RasterDrawOptions {
             pipeline_state: self.pipeline_state,
             uv_checker_enabled: self.uv_checker_enabled,
             sampled_texture: self.sampled_texture,
             material: self.material,
+            linear_material: LinearMaterial::from_srgb(self.material),
             light: self.light,
+            camera_world: self.camera_world,
         }
     }
 }
@@ -1743,7 +1849,10 @@ fn draw_frame(
         | PipelineDebugMode::Barycentric
         | PipelineDebugMode::FrontBack
         | PipelineDebugMode::Normal
-        | PipelineDebugMode::NdotL => target.render_gradient_checker(),
+        | PipelineDebugMode::NdotL
+        | PipelineDebugMode::Diffuse
+        | PipelineDebugMode::Specular
+        | PipelineDebugMode::ColorSpaceComparison => target.render_gradient_checker(),
     }
     draw_debug_scene(
         target,
@@ -2062,26 +2171,75 @@ fn submit_triangle(
                 uv_checker_color(fragment.uv())
             }
             PipelineDebugMode::Solid => {
-                let albedo = if let Some((texture, sampler)) = options.sampled_texture {
-                    let texture_color = sampler
-                        .sample(texture, fragment.uv())
-                        .expect("FragmentInput은 유한한 UV를 보장해야 한다");
+                let albedo = fragment_albedo_linear(fragment, options);
+                if options.sampled_texture.is_some() {
                     increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
-                    modulate_color(texture_color, fragment.color())
-                } else {
-                    fragment.color()
-                };
-                let albedo = modulate_color(albedo, options.material.base_color);
-                if options.material.lighting_enabled {
+                }
+                if options.material.shader_mode != ShaderMode::Unlit {
                     increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
-                    debug_color(lambert_color(
-                        albedo,
-                        shading_normal,
-                        options.material,
-                        options.light,
-                    ))
+                }
+                linear_display_color(shade_material_linear(
+                    albedo,
+                    shading_normal,
+                    fragment.world_position(),
+                    options.material,
+                    options.linear_material,
+                    options.light,
+                    options.camera_world,
+                ))
+            }
+            PipelineDebugMode::Diffuse => {
+                let albedo = fragment_albedo_linear(fragment, options);
+                if options.sampled_texture.is_some() {
+                    increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
+                }
+                increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
+                let terms = lighting_terms_linear(LightingInput {
+                    albedo,
+                    normal_world: shading_normal,
+                    fragment_world: fragment.world_position(),
+                    material: options.material,
+                    linear_material: options.linear_material,
+                    light: options.light,
+                    camera_world: options.camera_world,
+                    compute_specular: false,
+                });
+                linear_display_color(Vec4::new(
+                    terms.diffuse.x,
+                    terms.diffuse.y,
+                    terms.diffuse.z,
+                    albedo.w,
+                ))
+            }
+            PipelineDebugMode::Specular => {
+                increment_sample_counter(&mut lighting_samples, &mut sample_counter_overflow);
+                let terms = lighting_terms_linear(LightingInput {
+                    albedo: Vec4::new(1.0, 1.0, 1.0, 1.0),
+                    normal_world: shading_normal,
+                    fragment_world: fragment.world_position(),
+                    material: options.material,
+                    linear_material: options.linear_material,
+                    light: options.light,
+                    camera_world: options.camera_world,
+                    compute_specular: true,
+                });
+                linear_display_color(Vec4::new(
+                    terms.specular.x,
+                    terms.specular.y,
+                    terms.specular.z,
+                    1.0,
+                ))
+            }
+            PipelineDebugMode::ColorSpaceComparison => {
+                let correct = fragment_albedo_linear(fragment, options);
+                let wrong = fragment_albedo_encoded_wrong_way(fragment, options);
+                if options.sampled_texture.is_some() {
+                    increment_sample_counter(&mut texture_samples, &mut sample_counter_overflow);
+                }
+                if point.x < target.width() as i32 / 2 {
+                    linear_display_color(correct)
                 } else {
-                    debug_color(albedo)
+                    debug_color(wrong)
                 }
             }
             PipelineDebugMode::Wireframe => wireframe_fragment_color(fragment.barycentric()),
@@ -2191,7 +2349,10 @@ fn submit_triangle(
         | PipelineDebugMode::Depth
         | PipelineDebugMode::DepthHeatmap
         | PipelineDebugMode::Normal
-        | PipelineDebugMode::NdotL => {
+        | PipelineDebugMode::NdotL
+        | PipelineDebugMode::Diffuse
+        | PipelineDebugMode::Specular
+        | PipelineDebugMode::ColorSpaceComparison => {
             // 제출 geometry는 positive winding이지만, 기존 Bresenham 방향과 edge
             // 덮어쓰기 순서를 보존하기 위해 vertex-color wireframe은 원본 순서로 그린다.
             let colors = generated.map(|vertex| debug_color(vertex.color));
@@ -2272,21 +2433,157 @@ fn modulate_color(first: Vec4, second: Vec4) -> Vec4 {
     )
 }
 
+fn fragment_albedo_linear(fragment: FragmentInput, options: RasterDrawOptions<'_>) -> Vec4 {
+    let texture = options
+        .sampled_texture
+        .map(|(texture, sampler)| {
+            sampler
+                .sample(texture, fragment.uv())
+                .expect("FragmentInput은 유한한 UV를 보장해야 한다")
+        })
+        .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
+    modulate_color(
+        modulate_color(texture, fragment.color()),
+        options.linear_material.base_color,
+    )
+}
+
+fn fragment_albedo_encoded_wrong_way(
+    fragment: FragmentInput,
+    options: RasterDrawOptions<'_>,
+) -> Vec4 {
+    let texture = options
+        .sampled_texture
+        .map(|(texture, sampler)| {
+            sampler
+                .sample_encoded(texture, fragment.uv())
+                .expect("FragmentInput은 유한한 UV를 보장해야 한다")
+        })
+        .unwrap_or(Vec4::new(1.0, 1.0, 1.0, 1.0));
+    modulate_color(
+        modulate_color(texture, fragment.color()),
+        options.material.base_color,
+    )
+}
+
+fn linear_display_color(linear: Vec4) -> Color {
+    debug_color(srgb_encode_rgba(linear))
+}
+
 pub fn lambert_ndotl(normal_world: Vec3, light: DirectionalLight) -> f32 {
     normal_world.dot(light.surface_to_light).max(0.0)
 }
 
-fn lambert_color(
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LightingTerms {
+    ambient: Vec3,
+    diffuse: Vec3,
+    specular: Vec3,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LightingInput {
     albedo: Vec4,
     normal_world: Vec3,
+    fragment_world: Vec3,
     material: Material,
+    linear_material: LinearMaterial,
     light: DirectionalLight,
+    camera_world: Vec3,
+    compute_specular: bool,
+}
+
+pub fn blinn_phong_specular_factor(
+    normal_world: Vec3,
+    surface_to_light: Vec3,
+    surface_to_camera: Vec3,
+    shininess: f32,
+) -> f32 {
+    let ndotl = normal_world.dot(surface_to_light).max(0.0);
+    if ndotl <= 0.0 || !shininess.is_finite() || shininess <= 0.0 {
+        return 0.0;
+    }
+    let Some(half_vector) = (surface_to_light + surface_to_camera).normalized() else {
+        return 0.0;
+    };
+    normal_world.dot(half_vector).max(0.0).powf(shininess)
+}
+
+fn lighting_terms_linear(input: LightingInput) -> LightingTerms {
+    let ndotl = lambert_ndotl(input.normal_world, input.light);
+    let specular_factor = if input.compute_specular {
+        (input.camera_world - input.fragment_world)
+            .normalized()
+            .map_or(0.0, |surface_to_camera| {
+                blinn_phong_specular_factor(
+                    input.normal_world,
+                    input.light.surface_to_light,
+                    surface_to_camera,
+                    input.material.shininess,
+                )
+            })
+    } else {
+        0.0
+    };
+    LightingTerms {
+        ambient: Vec3::new(
+            input.albedo.x * input.material.ambient,
+            input.albedo.y * input.material.ambient,
+            input.albedo.z * input.material.ambient,
+        ),
+        diffuse: Vec3::new(
+            input.albedo.x * input.light.color.x * input.light.intensity * ndotl,
+            input.albedo.y * input.light.color.y * input.light.intensity * ndotl,
+            input.albedo.z * input.light.color.z * input.light.intensity * ndotl,
+        ),
+        specular: Vec3::new(
+            input.linear_material.specular_color.x
+                * input.light.color.x
+                * input.light.intensity
+                * specular_factor,
+            input.linear_material.specular_color.y
+                * input.light.color.y
+                * input.light.intensity
+                * specular_factor,
+            input.linear_material.specular_color.z
+                * input.light.color.z
+                * input.light.intensity
+                * specular_factor,
+        ),
+    }
+}
+
+fn shade_material_linear(
+    albedo: Vec4,
+    normal_world: Vec3,
+    fragment_world: Vec3,
+    material: Material,
+    linear_material: LinearMaterial,
+    light: DirectionalLight,
+    camera_world: Vec3,
 ) -> Vec4 {
-    let ndotl = lambert_ndotl(normal_world, light);
+    if material.shader_mode == ShaderMode::Unlit {
+        return albedo;
+    }
+    let terms = lighting_terms_linear(LightingInput {
+        albedo,
+        normal_world,
+        fragment_world,
+        material,
+        linear_material,
+        light,
+        camera_world,
+        compute_specular: material.shader_mode == ShaderMode::BlinnPhong,
+    });
+    let specular = if material.shader_mode == ShaderMode::BlinnPhong {
+        terms.specular
+    } else {
+        Vec3::ZERO
+    };
     Vec4::new(
-        albedo.x * (material.ambient + light.color.x * light.intensity * ndotl),
-        albedo.y * (material.ambient + light.color.y * light.intensity * ndotl),
-        albedo.z * (material.ambient + light.color.z * light.intensity * ndotl),
+        terms.ambient.x + terms.diffuse.x + specular.x,
+        terms.ambient.y + terms.diffuse.y + specular.y,
+        terms.ambient.z + terms.diffuse.z + specular.z,
         albedo.w,
     )
 }
@@ -2394,7 +2691,9 @@ mod tests {
                 uv_checker_enabled: true,
                 sampled_texture: None,
                 material: Material::default(),
+                linear_material: LinearMaterial::from_srgb(Material::default()),
                 light: DirectionalLight::default(),
+                camera_world: Vec3::ZERO,
             },
             &mesh,
             &mut clipper,
@@ -2424,7 +2723,9 @@ mod tests {
             uv_checker_enabled: false,
             sampled_texture: None,
             material: Material::default(),
+            linear_material: LinearMaterial::from_srgb(Material::default()),
             light: DirectionalLight::default(),
+            camera_world: Vec3::ZERO,
         }
     }
 
@@ -2797,7 +3098,7 @@ mod tests {
         assert_eq!(renderer.depth_buffer().as_ptr(), depth_pointer);
 
         let mut tiny = Renderer::new(1, 1).expect("tiny renderer should be valid");
-        assert_eq!(tiny.color_buffer(), [255, 89, 64, 255]);
+        assert_eq!(tiny.color_buffer(), [255, 160, 137, 255]);
         tiny.set_debug_lines_enabled(true);
         assert!(
             tiny.update_and_render(0.0, InputSnapshot::default())
@@ -2811,7 +3112,7 @@ mod tests {
                 .debug_pixels,
             0
         );
-        assert_eq!(tiny.color_buffer(), [255, 89, 64, 255]);
+        assert_eq!(tiny.color_buffer(), [255, 160, 137, 255]);
     }
 
     #[test]
@@ -2819,13 +3120,13 @@ mod tests {
         let mut renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
         renderer.set_cull_mode(CullMode::None);
         renderer.update_and_render(0.0, InputSnapshot::default());
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x186c_d1de);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf8d0_50be);
     }
 
     #[test]
     fn chapter_eleven_backface_culled_flat_coverage_matches_64_by_64_golden_hash() {
         let renderer = Renderer::new(64, 64).expect("golden renderer should be valid");
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x186c_d1de);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf8d0_50be);
     }
 
     #[test]
@@ -2887,7 +3188,7 @@ mod tests {
         assert_eq!(snapshot.mesh_indices, 3);
         assert_eq!(snapshot.mesh_triangles, 1);
         assert_eq!(snapshot.rotation_y_radians, 0.0);
-        assert_eq!(fnv1a(renderer.color_buffer()), 0xb7bd_5d28);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xb646_3359);
 
         renderer
             .resize(128, 64)
@@ -2930,8 +3231,8 @@ mod tests {
             32 * 32
         );
 
-        let orange = [255, 89, 38, 255];
-        let cyan = [38, 191, 255, 255];
+        let orange = [255, 160, 108, 255];
+        let cyan = [108, 225, 255, 255];
         let orange_count = renderer
             .color_buffer()
             .chunks_exact(4)
@@ -2944,7 +3245,7 @@ mod tests {
             .count();
         assert_eq!((orange_count, cyan_count), (528, 496));
         assert_eq!(orange_count + cyan_count, stats.shaded_samples as usize);
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x1d6a_3195);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf618_1515);
 
         let snapshot = renderer.coordinate_debug_snapshot();
         assert!(!snapshot.clip_debug_enabled);
@@ -3031,14 +3332,14 @@ mod tests {
         assert_eq!(
             [near_red, near_green, near_blue, centroid],
             [
-                [234, 7, 14, 255],
-                [7, 234, 14, 255],
-                [7, 13, 235, 255],
-                [81, 87, 88, 255],
+                [245, 46, 67, 255],
+                [46, 245, 67, 255],
+                [46, 64, 246, 255],
+                [152, 158, 158, 255],
             ]
         );
         let affine_hash = fnv1a(renderer.color_buffer());
-        assert_eq!(affine_hash, 0xdb7e_9eb4);
+        assert_eq!(affine_hash, 0x768d_4242);
 
         renderer.set_winding_debug_mode(WindingDebugMode::Barycentric);
         let barycentric = renderer.update_and_render(0.0, InputSnapshot::default());
@@ -3048,7 +3349,9 @@ mod tests {
             affine.rasterized_triangles
         );
         assert_eq!(barycentric.shaded_samples, affine.shaded_samples);
-        assert_eq!(fnv1a(renderer.color_buffer()), affine_hash);
+        let barycentric_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(barycentric_hash, 0xdb7e_9eb4);
+        assert_ne!(barycentric_hash, affine_hash);
 
         let snapshot = renderer.coordinate_debug_snapshot();
         assert!(snapshot.interpolation_debug_enabled);
@@ -3261,13 +3564,13 @@ mod tests {
                 1_199,
                 202,
                 1_401,
-                0x373e_c577,
+                0x98e6_cc1c,
                 0x52eb_59c7,
                 0x5cbf_6a73,
                 [
-                    [255, 51, 38, 255],
-                    [38, 89, 255, 255],
-                    [255, 51, 38, 255],
+                    [255, 124, 108, 255],
+                    [108, 160, 255, 255],
+                    [255, 124, 108, 255],
                     [0, 0, 220, 255],
                 ],
                 [
@@ -3762,7 +4065,7 @@ mod tests {
             ),
             (facing.submitted_triangles, facing.culled_triangles)
         );
-        assert_eq!(fnv1a(renderer.color_buffer()), 0x186c_d1de);
+        assert_eq!(fnv1a(renderer.color_buffer()), 0xf8d0_50be);
     }
 
     #[test]
@@ -3770,7 +4073,7 @@ mod tests {
         let mut renderer = Renderer::new(64, 64).expect("debug renderer should be valid");
         renderer.set_debug_lines_enabled(true);
         renderer.update_and_render(0.0, InputSnapshot::default());
-        for expected in [[238, 244, 255, 255], [255, 89, 64, 255]] {
+        for expected in [[238, 244, 255, 255], [255, 160, 137, 255]] {
             assert!(
                 renderer
                     .color_buffer()
@@ -4472,7 +4775,7 @@ mod tests {
                 fnv1a(previous.color()),
                 fnv1a(chapter_fifteen.color()),
             ),
-            (640, 215, Some((16, 15, 47, 45)), 0x02e7_136f, 0x186c_d1de,)
+            (640, 215, Some((16, 15, 47, 45)), 0xe59c_1789, 0xf8d0_50be,)
         );
     }
 
@@ -4698,7 +5001,9 @@ mod tests {
                     uv_checker_enabled: false,
                     sampled_texture: Some((&texture, sampler)),
                     material: Material::default(),
+                    linear_material: LinearMaterial::from_srgb(Material::default()),
                     light: DirectionalLight::default(),
+                    camera_world: Vec3::ZERO,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -4753,14 +5058,19 @@ mod tests {
         assert_eq!(lambert_ndotl(Vec3::Z, light), 1.0);
         assert_eq!(lambert_ndotl(Vec3::X, light), 0.0);
         assert_eq!(lambert_ndotl(Vec3::new(0.0, 0.0, -1.0), light), 0.0);
-        let lit = lambert_color(
+        let material = Material {
+            ambient: 0.1,
+            shader_mode: ShaderMode::Lambert,
+            ..Material::default()
+        };
+        let lit = shade_material_linear(
             Vec4::new(0.5, 0.5, 0.5, 0.75),
             Vec3::Z,
-            Material {
-                ambient: 0.1,
-                ..Material::default()
-            },
+            Vec3::ZERO,
+            material,
+            LinearMaterial::from_srgb(material),
             light,
+            Vec3::new(0.0, 0.0, 1.0),
         );
         assert_eq!(lit, Vec4::new(1.05, 0.55, 0.3, 0.75));
         assert_eq!(
@@ -4930,5 +5240,174 @@ mod tests {
         assert_eq!(report.invalid_triangles, 1);
         assert_eq!(report.submitted_triangles, 0);
         assert_eq!(report.shaded_samples, 0);
+    }
+
+    #[test]
+    fn chapter_nineteen_blinn_phong_endpoints_camera_dependence_and_material_validation() {
+        assert_eq!(
+            linear_display_color(Vec4::new(0.5, 0.5, 0.5, 1.0)).rgba(),
+            [188, 188, 188, 255],
+            "vertex color varying은 linear에서 보간한 뒤 한 번만 encode해야 한다"
+        );
+        let authored = Material {
+            base_color: Vec4::new(0.5, 0.5, 0.5, 1.0),
+            specular_color: Vec3::new(0.5, 0.5, 0.5),
+            ..Material::default()
+        };
+        let decoded = LinearMaterial::from_srgb(authored);
+        assert!((decoded.base_color.x - 0.214_041_14).abs() <= 1.0e-7);
+        assert!((decoded.specular_color.x - 0.214_041_14).abs() <= 1.0e-7);
+
+        assert_eq!(
+            blinn_phong_specular_factor(Vec3::Z, Vec3::Z, Vec3::Z, 32.0),
+            1.0
+        );
+        assert_eq!(
+            blinn_phong_specular_factor(Vec3::Z, Vec3::new(0.0, 0.0, -1.0), Vec3::Z, 32.0,),
+            0.0
+        );
+        assert_eq!(
+            blinn_phong_specular_factor(Vec3::Z, Vec3::Z, Vec3::new(0.0, 0.0, -1.0), 32.0,),
+            0.0
+        );
+        assert_eq!(
+            blinn_phong_specular_factor(Vec3::Z, Vec3::Z, Vec3::Z, f32::NAN),
+            0.0
+        );
+
+        let light = DirectionalLight::new(Vec3::Z, Vec3::new(1.0, 1.0, 1.0), 1.0).unwrap();
+        let albedo = Vec4::new(0.25, 0.25, 0.25, 1.0);
+        let lambert = Material {
+            ambient: 0.0,
+            shader_mode: ShaderMode::Lambert,
+            ..Material::default()
+        };
+        let blinn_phong = Material {
+            shader_mode: ShaderMode::BlinnPhong,
+            ..lambert
+        };
+        let camera_center = Vec3::new(0.0, 0.0, 2.0);
+        let camera_side = Vec3::new(2.0, 0.0, 2.0);
+        assert_eq!(
+            shade_material_linear(
+                albedo,
+                Vec3::Z,
+                Vec3::ZERO,
+                lambert,
+                LinearMaterial::from_srgb(lambert),
+                light,
+                camera_center,
+            ),
+            shade_material_linear(
+                albedo,
+                Vec3::Z,
+                Vec3::ZERO,
+                lambert,
+                LinearMaterial::from_srgb(lambert),
+                light,
+                camera_side,
+            )
+        );
+        let centered = shade_material_linear(
+            albedo,
+            Vec3::Z,
+            Vec3::ZERO,
+            blinn_phong,
+            LinearMaterial::from_srgb(blinn_phong),
+            light,
+            camera_center,
+        );
+        let side = shade_material_linear(
+            albedo,
+            Vec3::Z,
+            Vec3::ZERO,
+            blinn_phong,
+            LinearMaterial::from_srgb(blinn_phong),
+            light,
+            camera_side,
+        );
+        assert!(centered.x > side.x);
+
+        let cube = unit_cube_mesh();
+        let cube_scene = MeshScene::new(&cube, Transform::IDENTITY, 32, 32);
+        assert_eq!(cube_scene.camera_world, CAMERA_EYE);
+        let debug_mesh = interpolation_debug_fixture();
+        let identity_scene = MeshScene::new_identity_debug(&debug_mesh, 32, 32);
+        let perspective_scene = MeshScene::new_perspective_debug(&debug_mesh, 32, 32);
+        assert_eq!(identity_scene.camera_world, Vec3::ZERO);
+        assert_eq!(perspective_scene.camera_world, Vec3::ZERO);
+
+        let mut renderer = Renderer::new(8, 8).unwrap();
+        renderer.set_shader_mode(ShaderMode::BlinnPhong);
+        assert_eq!(renderer.shader_mode(), ShaderMode::BlinnPhong);
+        renderer.set_lighting_enabled(true);
+        assert_eq!(renderer.shader_mode(), ShaderMode::BlinnPhong);
+        renderer
+            .set_material_specular(Vec3::new(0.25, 0.5, 1.0), 64.0)
+            .unwrap();
+        let approved = renderer.material_specular();
+        assert_eq!(approved, (Vec3::new(0.25, 0.5, 1.0), 64.0));
+        assert_eq!(
+            renderer.set_material_specular(Vec3::new(-1.0, 0.5, 1.0), 8.0),
+            Err(MaterialError::InvalidSpecularColor)
+        );
+        assert_eq!(renderer.material_specular(), approved);
+        assert_eq!(
+            renderer.set_material_specular(Vec3::new(1.0, 1.0, 1.0), 0.0),
+            Err(MaterialError::InvalidShininess)
+        );
+        assert_eq!(renderer.material_specular(), approved);
+        for error in [
+            MaterialError::InvalidSpecularColor,
+            MaterialError::InvalidShininess,
+        ] {
+            assert!(!error.to_string().is_empty());
+        }
+    }
+
+    #[test]
+    fn chapter_nineteen_shader_and_color_space_debug_views_share_geometry_and_depth() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer
+            .upload_texture_rgba8(
+                2,
+                1,
+                &[0, 0, 0, 255, 255, 255, 255, 255],
+                TextureColorSpace::Srgb,
+            )
+            .unwrap();
+        renderer.set_texture_sampling_enabled(true);
+        renderer.set_sampler_state(SamplerState {
+            address_u: texture::AddressMode::ClampToEdge,
+            address_v: texture::AddressMode::ClampToEdge,
+            filter: texture::FilterMode::Bilinear,
+        });
+        renderer.set_shader_mode(ShaderMode::Lambert);
+        let lambert = renderer.update_and_render(0.0, InputSnapshot::default());
+        let lambert_hash = fnv1a(renderer.color_buffer());
+        assert_eq!(lambert.texture_samples, lambert.shaded_samples);
+        assert_eq!(lambert.lighting_samples, lambert.shaded_samples);
+
+        renderer.set_shader_mode(ShaderMode::BlinnPhong);
+        let blinn = renderer.update_and_render(0.0, InputSnapshot::default());
+        let blinn_hash = fnv1a(renderer.color_buffer());
+        assert_ne!(blinn_hash, lambert_hash);
+        assert_eq!(blinn.covered_samples, lambert.covered_samples);
+
+        let mut hashes = Vec::new();
+        for mode in [
+            PipelineDebugMode::Diffuse,
+            PipelineDebugMode::Specular,
+            PipelineDebugMode::ColorSpaceComparison,
+        ] {
+            renderer.set_pipeline_debug_mode(mode);
+            let stats = renderer.update_and_render(0.0, InputSnapshot::default());
+            assert_eq!(stats.covered_samples, lambert.covered_samples);
+            assert_eq!(stats.depth_passed_samples, lambert.depth_passed_samples);
+            hashes.push(fnv1a(renderer.color_buffer()));
+        }
+        assert_ne!(hashes[0], hashes[1]);
+        assert_ne!(hashes[1], hashes[2]);
+        assert_ne!(hashes[0], hashes[2]);
     }
 }

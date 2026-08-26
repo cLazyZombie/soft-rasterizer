@@ -11,6 +11,7 @@ pub struct Vertex {
     pub position_object: Vec3,
     pub normal_object: Vec3,
     pub uv: Vec2,
+    /// clipping과 perspective 보간을 포함한 모든 계산에서 사용하는 linear RGBA다.
     pub color: Vec4,
 }
 

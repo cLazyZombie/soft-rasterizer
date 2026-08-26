@@ -100,11 +100,14 @@ async function bootstrap() {
   const textureAddressUSelect = document.querySelector("#texture-address-u");
   const textureAddressVSelect = document.querySelector("#texture-address-v");
   const lightingEnabledCheckbox = document.querySelector("#lighting-enabled");
+  const shaderModeSelect = document.querySelector("#shader-mode");
   const normalModeSelect = document.querySelector("#normal-mode");
   const lightXInput = document.querySelector("#light-x");
   const lightYInput = document.querySelector("#light-y");
   const lightZInput = document.querySelector("#light-z");
   const lightIntensityInput = document.querySelector("#light-intensity");
+  const specularColorInput = document.querySelector("#specular-color");
+  const shininessInput = document.querySelector("#shininess");
   const context = canvas.getContext("2d", { alpha: false });
   if (context === null) {
     throw new Error("Canvas 2D context를 만들 수 없습니다.");
@@ -146,14 +149,15 @@ async function bootstrap() {
     document.querySelector("#texture-sample-stats").textContent =
       `${renderer.stats_texture_samples()} sampled after depth`;
     document.querySelector("#lighting-status").textContent =
-      `${lightingEnabledCheckbox.checked ? "Lambert 켬" : "Lambert 끔"} · ` +
+      `${lightingEnabledCheckbox.checked ? `${shaderModeSelect.options[shaderModeSelect.selectedIndex].text} 켬` : "Unlit"} · ` +
       `${normalModeSelect.options[normalModeSelect.selectedIndex].text} normal · ` +
       `surface→light (${renderer.light_surface_to_light_x().toFixed(3)}, ` +
       `${renderer.light_surface_to_light_y().toFixed(3)}, ` +
       `${renderer.light_surface_to_light_z().toFixed(3)}) · ` +
-      `intensity ${renderer.light_intensity().toFixed(2)}`;
+      `intensity ${renderer.light_intensity().toFixed(2)} · ` +
+      `specular ${specularColorInput.value} · shininess ${renderer.material_shininess().toFixed(1)}`;
     document.querySelector("#lighting-sample-stats").textContent =
-      `${renderer.stats_lighting_samples()} Lambert evaluations after depth`;
+      `${renderer.stats_lighting_samples()} lighting evaluations after depth`;
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
     document.querySelector("#pipeline-algorithm").textContent =
@@ -320,8 +324,43 @@ async function bootstrap() {
   };
 
   const setLightingEnabled = (enabled) => {
-    renderer.set_lighting_enabled(enabled);
+    renderer.set_shader_mode(enabled ? Number(shaderModeSelect.value) : 0);
     lightingEnabledCheckbox.checked = enabled;
+  };
+
+  const setShaderMode = (mode) => {
+    renderer.set_shader_mode(mode);
+    if (mode !== 0) {
+      shaderModeSelect.value = String(mode);
+    }
+    lightingEnabledCheckbox.checked = mode !== 0;
+  };
+
+  const parseSrgbHex = (hex) => {
+    const channels = /^#([0-9a-f]{2})([0-9a-f]{2})([0-9a-f]{2})$/i.exec(hex);
+    if (channels === null) {
+      throw new Error("specular color는 #RRGGBB sRGB 형식이어야 합니다");
+    }
+    return channels.slice(1).map((channel) => Number.parseInt(channel, 16) / 255);
+  };
+
+  const materialSpecularHex = () => {
+    const byteHex = (channel) =>
+      Math.round(Math.min(Math.max(channel, 0), 1) * 255)
+        .toString(16)
+        .padStart(2, "0");
+    return `#${byteHex(renderer.material_specular_red())}${byteHex(renderer.material_specular_green())}${byteHex(renderer.material_specular_blue())}`;
+  };
+
+  const setMaterialSpecular = (red, green, blue, shininess) => {
+    renderer.set_material_specular(red, green, blue, shininess);
+    specularColorInput.value = materialSpecularHex();
+    shininessInput.value = String(renderer.material_shininess());
+  };
+
+  const restoreMaterialSpecularInputs = () => {
+    specularColorInput.value = materialSpecularHex();
+    shininessInput.value = String(renderer.material_shininess());
   };
 
   const setNormalMode = (mode) => {
@@ -390,6 +429,15 @@ async function bootstrap() {
   setTextureSamplingEnabled(textureSamplingCheckbox.checked);
   setLightingEnabled(lightingEnabledCheckbox.checked);
   setNormalMode(Number(normalModeSelect.value));
+  try {
+    setMaterialSpecular(
+      ...parseSrgbHex(specularColorInput.value),
+      Number(shininessInput.value),
+    );
+  } catch (error) {
+    errorOutput.textContent = error instanceof Error ? error.message : String(error);
+    restoreMaterialSpecularInputs();
+  }
   try {
     setDirectionalLight(
       Number(lightXInput.value),
@@ -476,6 +524,28 @@ async function bootstrap() {
     setLightingEnabled(lightingEnabledCheckbox.checked);
     renderFrame(0);
   });
+  shaderModeSelect.addEventListener("change", () => {
+    if (lightingEnabledCheckbox.checked) {
+      setShaderMode(Number(shaderModeSelect.value));
+      renderFrame(0);
+    }
+  });
+  for (const input of [specularColorInput, shininessInput]) {
+    input.addEventListener("change", () => {
+      try {
+        setMaterialSpecular(
+          ...parseSrgbHex(specularColorInput.value),
+          Number(shininessInput.value),
+        );
+        errorOutput.textContent = "";
+        renderFrame(0);
+      } catch (error) {
+        errorOutput.textContent = error instanceof Error ? error.message : String(error);
+        restoreMaterialSpecularInputs();
+        updateStatus();
+      }
+    });
+  }
   normalModeSelect.addEventListener("change", () => {
     setNormalMode(Number(normalModeSelect.value));
     renderFrame(0);
@@ -597,7 +667,16 @@ async function bootstrap() {
       addressV: renderer.sampler_address_v(),
     },
     lightingEnabled: lightingEnabledCheckbox.checked,
+    shaderMode: renderer.shader_mode(),
     normalMode: renderer.normal_mode(),
+    materialSpecular: {
+      color: [
+        renderer.material_specular_red(),
+        renderer.material_specular_green(),
+        renderer.material_specular_blue(),
+      ],
+      shininess: renderer.material_shininess(),
+    },
     directionalLight: {
       surfaceToLight: [
         renderer.light_surface_to_light_x(),
@@ -656,7 +735,13 @@ async function bootstrap() {
           return snapshot();
         },
         setLightingEnabled,
+        setShaderMode,
         setNormalMode,
+        setMaterialSpecular(red, green, blue, shininess) {
+          setMaterialSpecular(red, green, blue, shininess);
+          renderFrame(0);
+          return snapshot();
+        },
         setDirectionalLight(x, y, z, intensity) {
           setDirectionalLight(x, y, z, intensity);
           renderFrame(0);

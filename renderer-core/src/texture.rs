@@ -1,10 +1,12 @@
-//! 16장의 브라우저 디코드 결과를 소유하고 17장의 UV sampler와 18장의
-//! material normal/Lambert 상태를 묶는 RGBA8 texture 저장소.
+//! RGBA8 저장 색과 19장의 linear sampling/material shader 상태를 묶는 texture 저장소.
 
 use std::error::Error;
 use std::fmt::{Display, Formatter};
 
-use crate::math::{Vec2, Vec4};
+use crate::{
+    color::srgb_decode_rgba,
+    math::{Vec2, Vec3, Vec4},
+};
 
 /// 한 texture가 소유할 수 있는 최대 texel 수다.
 pub const MAX_TEXTURE_PIXEL_COUNT: usize = 16_777_216;
@@ -13,6 +15,15 @@ pub const MAX_TEXTURE_PIXEL_COUNT: usize = 16_777_216;
 pub enum TextureColorSpace {
     Srgb,
     Linear,
+}
+
+impl TextureColorSpace {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Srgb => "sRGB base color",
+            Self::Linear => "linear data",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -61,6 +72,24 @@ pub enum NormalMode {
     Flat,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ShaderMode {
+    #[default]
+    Unlit,
+    Lambert,
+    BlinnPhong,
+}
+
+impl ShaderMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Unlit => "unlit",
+            Self::Lambert => "Lambert",
+            Self::BlinnPhong => "Blinn-Phong",
+        }
+    }
+}
+
 impl NormalMode {
     pub const fn label(self) -> &'static str {
         match self {
@@ -76,8 +105,10 @@ pub struct Material {
     pub sampler: SamplerState,
     pub base_color: Vec4,
     pub ambient: f32,
-    pub lighting_enabled: bool,
+    pub shader_mode: ShaderMode,
     pub normal_mode: NormalMode,
+    pub specular_color: Vec3,
+    pub shininess: f32,
 }
 
 impl Default for Material {
@@ -87,32 +118,43 @@ impl Default for Material {
             sampler: SamplerState::default(),
             base_color: Vec4::new(1.0, 1.0, 1.0, 1.0),
             ambient: 0.18,
-            lighting_enabled: false,
+            shader_mode: ShaderMode::Unlit,
             normal_mode: NormalMode::Smooth,
+            specular_color: Vec3::new(1.0, 1.0, 1.0),
+            shininess: 32.0,
         }
     }
 }
 
 impl SamplerState {
     pub fn sample(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+        self.sample_with_decode(texture, uv, true)
+    }
+
+    /// 잘못된 "encoded 값 filter" 비교 view에서만 사용하는 교육용 경로다.
+    pub fn sample_encoded(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+        self.sample_with_decode(texture, uv, false)
+    }
+
+    fn sample_with_decode(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
         if !uv.x.is_finite() || !uv.y.is_finite() {
             return None;
         }
         match self.filter {
-            FilterMode::Nearest => self.sample_nearest(texture, uv),
-            FilterMode::Bilinear => self.sample_bilinear(texture, uv),
+            FilterMode::Nearest => self.sample_nearest(texture, uv, decode),
+            FilterMode::Bilinear => self.sample_bilinear(texture, uv, decode),
         }
     }
 
-    fn sample_nearest(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+    fn sample_nearest(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
         let u = address_normalized(uv.x, self.address_u);
         let v = address_normalized(uv.y, self.address_v);
         let x = ((u * texture.width as f32).floor() as usize).min(texture.width - 1);
         let y = ((v * texture.height as f32).floor() as usize).min(texture.height - 1);
-        texture.fetch(x, y)
+        texture.fetch_for_sampling(x, y, decode)
     }
 
-    fn sample_bilinear(self, texture: &Texture, uv: Vec2) -> Option<Vec4> {
+    fn sample_bilinear(self, texture: &Texture, uv: Vec2, decode: bool) -> Option<Vec4> {
         let u = address_normalized(uv.x, self.address_u);
         let v = address_normalized(uv.y, self.address_v);
         let x = u * texture.width as f32 - 0.5;
@@ -126,13 +168,13 @@ impl SamplerState {
         let y0_index = address_texel(y0, texture.height, self.address_v);
         let y1_index = address_texel(y0 + 1, texture.height, self.address_v);
         let top = lerp_vec4(
-            texture.fetch(x0_index, y0_index)?,
-            texture.fetch(x1_index, y0_index)?,
+            texture.fetch_for_sampling(x0_index, y0_index, decode)?,
+            texture.fetch_for_sampling(x1_index, y0_index, decode)?,
             fraction_x,
         );
         let bottom = lerp_vec4(
-            texture.fetch(x0_index, y1_index)?,
-            texture.fetch(x1_index, y1_index)?,
+            texture.fetch_for_sampling(x0_index, y1_index, decode)?,
+            texture.fetch_for_sampling(x1_index, y1_index, decode)?,
             fraction_x,
         );
         Some(lerp_vec4(top, bottom, fraction_y))
@@ -230,13 +272,26 @@ impl Texture {
     }
 
     pub fn fetch(&self, x: usize, y: usize) -> Option<Vec4> {
+        self.fetch_for_sampling(x, y, true)
+    }
+
+    pub fn fetch_encoded(&self, x: usize, y: usize) -> Option<Vec4> {
+        self.fetch_for_sampling(x, y, false)
+    }
+
+    fn fetch_for_sampling(&self, x: usize, y: usize, decode: bool) -> Option<Vec4> {
         self.texel_rgba8(x, y).map(|rgba| {
-            Vec4::new(
+            let encoded = Vec4::new(
                 f32::from(rgba[0]) / 255.0,
                 f32::from(rgba[1]) / 255.0,
                 f32::from(rgba[2]) / 255.0,
                 f32::from(rgba[3]) / 255.0,
-            )
+            );
+            if decode && self.color_space == TextureColorSpace::Srgb {
+                srgb_decode_rgba(encoded)
+            } else {
+                encoded
+            }
         })
     }
 }
@@ -577,6 +632,44 @@ mod tests {
     }
 
     #[test]
+    fn srgb_texels_decode_before_bilinear_filtering_while_linear_data_stays_raw() {
+        let srgb = Texture::from_rgba8(
+            2,
+            1,
+            &[0, 0, 0, 64, 255, 255, 255, 192],
+            TextureColorSpace::Srgb,
+        )
+        .unwrap();
+        let linear =
+            Texture::from_rgba8(1, 1, &[128, 64, 32, 16], TextureColorSpace::Linear).unwrap();
+        let bilinear = sampler(
+            FilterMode::Bilinear,
+            AddressMode::ClampToEdge,
+            AddressMode::ClampToEdge,
+        );
+        assert_vec4_close(
+            bilinear.sample(&srgb, Vec2::new(0.5, 0.5)).unwrap(),
+            Vec4::new(0.5, 0.5, 0.5, 128.0 / 255.0),
+        );
+        let correct_display = crate::color::srgb_encode_channel(0.5);
+        assert!((correct_display - 0.735_357).abs() <= 1.0e-6);
+        assert!((correct_display - 0.5).abs() > 0.2);
+        assert_vec4_close(
+            bilinear.sample_encoded(&srgb, Vec2::new(0.5, 0.5)).unwrap(),
+            Vec4::new(0.5, 0.5, 0.5, 128.0 / 255.0),
+        );
+        assert_vec4_close(
+            SamplerState::default()
+                .sample(&linear, Vec2::new(0.5, 0.5))
+                .unwrap(),
+            Vec4::new(128.0 / 255.0, 64.0 / 255.0, 32.0 / 255.0, 16.0 / 255.0),
+        );
+        assert_eq!(srgb.fetch_encoded(0, 0), srgb.fetch(0, 0));
+        assert_eq!(TextureColorSpace::Srgb.label(), "sRGB base color");
+        assert_eq!(TextureColorSpace::Linear.label(), "linear data");
+    }
+
+    #[test]
     fn one_by_one_and_non_power_of_two_textures_are_safe_for_every_sampler() {
         let one = Texture::from_rgba8(1, 1, &[12, 34, 56, 78], TextureColorSpace::Linear).unwrap();
         let non_power = Texture::from_rgba8(3, 2, &[128; 24], TextureColorSpace::Linear).unwrap();
@@ -601,14 +694,19 @@ mod tests {
     }
 
     #[test]
-    fn normal_mode_labels_and_material_defaults_are_stable() {
+    fn shader_normal_mode_labels_and_material_defaults_are_stable() {
         assert_eq!(NormalMode::Smooth.label(), "smooth");
         assert_eq!(NormalMode::Flat.label(), "flat");
         let material = Material::default();
         assert_eq!(material.base_color_texture, None);
         assert_eq!(material.base_color, Vec4::new(1.0, 1.0, 1.0, 1.0));
         assert_eq!(material.ambient, 0.18);
-        assert!(!material.lighting_enabled);
+        assert_eq!(ShaderMode::Unlit.label(), "unlit");
+        assert_eq!(ShaderMode::Lambert.label(), "Lambert");
+        assert_eq!(ShaderMode::BlinnPhong.label(), "Blinn-Phong");
+        assert_eq!(material.shader_mode, ShaderMode::Unlit);
         assert_eq!(material.normal_mode, NormalMode::Smooth);
+        assert_eq!(material.specular_color, Vec3::new(1.0, 1.0, 1.0));
+        assert_eq!(material.shininess, 32.0);
     }
 }

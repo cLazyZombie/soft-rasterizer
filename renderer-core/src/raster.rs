@@ -47,7 +47,7 @@ pub enum WindingDebugMode {
     Barycentric,
 }
 
-/// 18장까지 하나의 pipeline state로 통합한 fragment 표시 방식이다.
+/// 19장까지 하나의 pipeline state로 통합한 fragment 표시 방식이다.
 ///
 /// 모든 모드는 같은 transform/clip/coverage/depth 경로를 통과하고 마지막
 /// fragment 색 표현만 바꾼다.
@@ -63,6 +63,9 @@ pub enum PipelineDebugMode {
     FrontBack,
     Normal,
     NdotL,
+    Diffuse,
+    Specular,
+    ColorSpaceComparison,
 }
 
 impl PipelineDebugMode {
@@ -77,6 +80,9 @@ impl PipelineDebugMode {
             Self::FrontBack => "front green / back red",
             Self::Normal => "world normal RGB",
             Self::NdotL => "Lambert N dot L",
+            Self::Diffuse => "linear diffuse only",
+            Self::Specular => "Blinn-Phong specular only",
+            Self::ColorSpaceComparison => "linear correct / encoded wrong-way",
         }
     }
 }

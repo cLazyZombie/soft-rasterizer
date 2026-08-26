@@ -55,6 +55,9 @@ async function openReadyPage(page, initialControls = null) {
           document.querySelector("#light-y").value = ${JSON.stringify(String(initialControls.lightY ?? 0.8))};
           document.querySelector("#light-z").value = ${JSON.stringify(String(initialControls.lightZ ?? -0.45))};
           document.querySelector("#light-intensity").value = ${JSON.stringify(String(initialControls.lightIntensity ?? 0.9))};
+          document.querySelector("#shader-mode").value = ${JSON.stringify(String(initialControls.shaderMode ?? 1))};
+          document.querySelector("#specular-color").value = ${JSON.stringify(initialControls.specularColor ?? "#ffffff")};
+          document.querySelector("#shininess").value = ${JSON.stringify(String(initialControls.shininess ?? 32))};
         </script>`;
         await route.fulfill({
           response,
@@ -292,7 +295,7 @@ test("indexed_mesh: 24정점/36인덱스 큐브를 단색 coverage와 wireframe�
     rasterizedTriangles: 12,
     shadedSamples: 75292,
   });
-  expect(initial.pixelHash).toBe("77c1dc86");
+  expect(initial.pixelHash).toBe("abfcc5b8");
   const projectionColorCounts = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     const expected = [
@@ -424,7 +427,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     rasterizedTriangles: 4,
     shadedSamples: 62786,
   });
-  expect(initial.pixelHash).toBe("3e9d5550");
+  expect(initial.pixelHash).toBe("3a900c98");
   await expect(page.locator("#coordinate-debug")).toContainText(
     "winding screen y-down orient2d > 0 front · cull back · debug vertex color",
   );
@@ -432,7 +435,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     "triangle stats input 12 · submitted 4 · culled 8 · degenerate 0 · invalid 0",
   );
   await expect(page.locator(".space-legend")).toContainText(
-    "transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth < → perspective attributes → fragment color write",
+    "transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth < → perspective attributes → linear shade → sRGB write",
   );
 
   await page.locator("#cull-mode").selectOption("0");
@@ -467,7 +470,7 @@ test("winding_culling: screen-space 면 방향과 culling/debug 모드를 전환
     rasterizedTriangles: 12,
     shadedSamples: 75292,
   });
-  expect(doubleSided.snapshot.pixelHash).toBe("77c1dc86");
+  expect(doubleSided.snapshot.pixelHash).toBe("abfcc5b8");
   expect(doubleSided.differingPixels).toBe(1783);
   expect(doubleSided.maxChannelDifference).toBe(191);
 
@@ -571,7 +574,7 @@ test("triangle_pipeline: homogeneous clipping을 divide 전에 적용한다", as
     invalidValues: 0,
   });
   expect(clipped.stats.debugPixels).toBeGreaterThan(0);
-  expect(clipped.pixelHash).toBe("67de920e");
+  expect(clipped.pixelHash).toBe("504dddc4");
   await expect(page.locator("#coordinate-debug")).toContainText(
     "동차 clip fixture · identity M/V/P vertex stage · viewport aspect 1.778",
   );
@@ -601,7 +604,7 @@ test("triangle_pipeline: homogeneous clipping을 divide 전에 적용한다", as
     generatedTriangles: 12,
     maxClipPolygonVertices: 3,
   });
-  expect(cube.pixelHash).toBe("77c1dc86");
+  expect(cube.pixelHash).toBe("abfcc5b8");
   expect(cube.pixelHash).not.toBe(clipped.pixelHash);
 
   await page.locator("#clip-debug").check();
@@ -675,8 +678,8 @@ test("triangle_pipeline: fixed-point top-left quad가 각 sample을 한 번만 �
   const coveragePixels = await page.locator("#framebuffer").evaluate((canvas) => {
     const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
     const colors = [
-      [255, 89, 38, 255],
-      [38, 191, 255, 255],
+      [255, 160, 108, 255],
+      [108, 225, 255, 255],
     ];
     const counts = [0, 0];
     let coloredOutsideQuad = 0;
@@ -701,7 +704,7 @@ test("triangle_pipeline: fixed-point top-left quad가 각 sample을 한 번만 �
   expect(coveragePixels.counts.every((count) => count > 0)).toBe(true);
   expect(coveragePixels.counts[0] + coveragePixels.counts[1]).toBe(expectedSamples);
   expect(coveragePixels.coloredOutsideQuad).toBe(0);
-  expect(covered.pixelHash).toBe("5e465ac5");
+  expect(covered.pixelHash).toBe("2d9aae5d");
   await expect(page.locator("#coordinate-debug")).toContainText(
     "top-left coverage fixture · identity M/V/P vertex stage · viewport aspect 1.778",
   );
@@ -803,12 +806,12 @@ test("triangle_pipeline: barycentric 좌표로 R/G/B 정점 색을 affine 보간
   });
   expect({ sampleColors, pixelHash: affine.pixelHash }).toEqual({
     sampleColors: {
-      nearRed: [246, 1, 8, 255],
-      nearGreen: [1, 246, 8, 255],
-      nearBlue: [5, 6, 244, 255],
-      centroid: [84, 85, 86, 255],
+      nearRed: [251, 14, 50, 255],
+      nearGreen: [9, 251, 50, 255],
+      nearBlue: [39, 41, 250, 255],
+      centroid: [156, 156, 157, 255],
     },
-    pixelHash: "aabc25f9",
+    pixelHash: "8316d55d",
   });
   await expect(page.locator("#coordinate-debug")).toContainText(
     "affine RGB fixture · identity M/V/P vertex stage · viewport aspect 1.778",
@@ -831,7 +834,8 @@ test("triangle_pipeline: barycentric 좌표로 R/G/B 정점 색을 affine 보간
     rasterizedTriangles: affine.stats.rasterizedTriangles,
     shadedSamples: affine.stats.shadedSamples,
   });
-  expect(barycentric.pixelHash).toBe(affine.pixelHash);
+  expect(barycentric.pixelHash).toBe("aabc25f9");
+  expect(barycentric.pixelHash).not.toBe(affine.pixelHash);
   await expect(page.locator("#coordinate-debug")).toContainText("debug barycentric RGB");
 
   const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
@@ -955,11 +959,11 @@ test("triangle_pipeline: strict depth가 제출 순서와 무관한 가려짐과
   }).toEqual({
     nearFirstDepth: [151992, 26736, 151992],
     farFirstDepth: [178728, 0, 178728],
-    hashes: ["4dea536c", "b687761d", "0d9a6422"],
+    hashes: ["7d07efac", "b687761d", "0d9a6422"],
     baseSamples: {
-      overlapNear: [255, 51, 38, 255],
-      farOnly: [38, 89, 255, 255],
-      nearOnly: [255, 51, 38, 255],
+      overlapNear: [255, 124, 108, 255],
+      farOnly: [108, 160, 255, 255],
+      nearOnly: [255, 124, 108, 255],
       infinityBackground: [0, 0, 220, 255],
     },
     grayscaleSamples: {
@@ -1331,11 +1335,11 @@ test("triangle_pipeline: 15장 scalar 컬러 큐브가 통합 debug view를 공�
     modes: [
       {
         mode: 0,
-        pixelHash: "b198410a",
+        pixelHash: "96778118",
         samples: {
-          center: [255, 89, 64, 255],
-          upper: [255, 89, 64, 255],
-          left: [255, 89, 64, 255],
+          center: [255, 160, 137, 255],
+          upper: [255, 160, 137, 255],
+          left: [255, 160, 137, 255],
         },
       },
       {
@@ -1715,19 +1719,19 @@ test("texture_sampling: perspective UV로 nearest/bilinear와 repeat/clamp를 �
   });
   expect(nearest.stats.textureSamples).toBe(nearest.stats.shadedSamples);
   expect(nearest.stats.textureSamples).toBeGreaterThan(0);
-  expect(nearest.pixelHash).toBe("fa577bc7");
+  expect(nearest.pixelHash).toBe("a7612563");
 
   await page.locator("#texture-filter").selectOption("1");
   const bilinearRepeat = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
   expect(bilinearRepeat.samplerState).toEqual({ filter: 1, addressU: 0, addressV: 0 });
-  expect(bilinearRepeat.pixelHash).toBe("ed0594e1");
+  expect(bilinearRepeat.pixelHash).toBe("08fe46a3");
   expect(bilinearRepeat.stats.textureSamples).toBe(bilinearRepeat.stats.shadedSamples);
 
   await page.locator("#texture-address-u").selectOption("1");
   await page.locator("#texture-address-v").selectOption("1");
   const bilinearClamp = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
   expect(bilinearClamp.samplerState).toEqual({ filter: 1, addressU: 1, addressV: 1 });
-  expect(bilinearClamp.pixelHash).toBe("37cd1d98");
+  expect(bilinearClamp.pixelHash).toBe("96665871");
   await expect(page.locator("#texture-sampler")).toContainText(
     "Bilinear · U Clamp · V Clamp",
   );
@@ -1803,7 +1807,7 @@ test("lambert_lighting: normal matrix와 world-space 방향광 debug를 검증�
   });
   expect(lit.stats.textureSamples).toBe(lit.stats.shadedSamples);
   expect(lit.stats.lightingSamples).toBe(lit.stats.shadedSamples);
-  expect(lit.pixelHash).toBe("32be8b00");
+  expect(lit.pixelHash).toBe("ad175728");
 
   await page.locator("#pipeline-debug-mode").selectOption("7");
   const normal = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
@@ -1841,12 +1845,12 @@ test("lambert_lighting: normal matrix와 world-space 방향광 debug를 검증�
   await page.locator("#pipeline-debug-mode").selectOption("0");
   const movedLightLit = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
   expect(movedLightLit.stats.lightingSamples).toBe(movedLightLit.stats.shadedSamples);
-  expect(movedLightLit.pixelHash).toBe("ad4cc1f1");
+  expect(movedLightLit.pixelHash).toBe("4a0f8fdf");
   await page.locator("#light-intensity").fill("0.25");
   await page.locator("#light-intensity").press("Enter");
   const lowIntensity = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
   expect(lowIntensity.directionalLight.intensity).toBe(0.25);
-  expect(lowIntensity.pixelHash).toBe("6fdc64fd");
+  expect(lowIntensity.pixelHash).toBe("8d93438c");
   await page.locator("#light-intensity").fill("-1");
   await page.locator("#light-intensity").press("Enter");
   await expect(page.locator("#error")).toContainText("intensity");
@@ -1909,5 +1913,145 @@ test("lambert_lighting: normal matrix와 world-space 방향광 debug를 검증�
     movedLightHash: movedLight.pixelHash,
     movedLightLitHash: movedLightLit.pixelHash,
     lowIntensityHash: lowIntensity.pixelHash,
+  });
+});
+
+test("blinn_phong_color_space: linear shading과 sRGB wrong-way를 비교한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "blinn_phong_color_space" },
+    { type: "steps", description: "34" },
+  );
+  const browserLog = observeBrowserLog(page);
+  await openReadyPage(page, { cullMode: 1, shaderMode: 2, shininess: -1 });
+  const recoveredBoot = await page.evaluate(() => window.__softRasterizer.snapshot());
+  expect(recoveredBoot.materialSpecular.shininess).toBe(32);
+  await expect(page.locator("#shininess")).toHaveValue("32");
+
+  await page.evaluate(() => {
+    window.__softRasterizer.setMaterialSpecular(1, 1, 1, 32);
+    window.__softRasterizer.uploadTextureRgba(2, 2, [
+      0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 255,
+    ]);
+    window.__softRasterizer.setModelRotationY(0.35);
+  });
+  await page.locator("#texture-sampling").check();
+  await page.locator("#texture-filter").selectOption("1");
+  await page.locator("#texture-address-u").selectOption("1");
+  await page.locator("#texture-address-v").selectOption("1");
+  await page.locator("#lighting-enabled").check();
+  const blinn = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(blinn).toMatchObject({
+    shaderMode: 2,
+    lightingEnabled: true,
+    textureSamplingEnabled: true,
+  });
+  expect(blinn.stats.textureSamples).toBe(blinn.stats.shadedSamples);
+  expect(blinn.stats.lightingSamples).toBe(blinn.stats.shadedSamples);
+  expect(blinn.pixelHash).toBe("bce6586a");
+
+  await page.locator("#shader-mode").selectOption("1");
+  const lambert = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(lambert.shaderMode).toBe(1);
+  expect(lambert.pixelHash).toBe("c66de251");
+  expect(lambert.stats.coveredSamples).toBe(blinn.stats.coveredSamples);
+
+  await page.locator("#shader-mode").selectOption("2");
+  await page.locator("#pipeline-debug-mode").selectOption("9");
+  const diffuse = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(diffuse.pipelineDebugMode).toBe(9);
+  expect(diffuse.pixelHash).toBe("6aba03d3");
+  expect(diffuse.stats.depthPassedSamples).toBe(blinn.stats.depthPassedSamples);
+
+  await page.locator("#pipeline-debug-mode").selectOption("10");
+  const specular = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(specular.pipelineDebugMode).toBe(10);
+  expect(specular.pixelHash).toBe("89c0fae2");
+  expect(specular.stats.lightingSamples).toBe(specular.stats.shadedSamples);
+
+  await page.locator("#pipeline-debug-mode").selectOption("0");
+  await page.locator("#lighting-enabled").uncheck();
+  const correctUnlit = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(correctUnlit.shaderMode).toBe(0);
+  expect(correctUnlit.pixelHash).toBe("0e2dbc20");
+  await page.locator("#pipeline-debug-mode").selectOption("11");
+  const comparison = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(comparison.pipelineDebugMode).toBe(11);
+  expect(comparison.pixelHash).toBe("3fa65fa9");
+  expect(comparison.stats.textureSamples).toBe(comparison.stats.shadedSamples);
+  expect(comparison.stats.depthPassedSamples).toBe(blinn.stats.depthPassedSamples);
+  const screenshotDirectory = path.resolve("artifacts/e2e/screenshots");
+  await mkdir(screenshotDirectory, { recursive: true });
+  const comparisonScreenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter19-srgb-comparison.png`,
+  );
+  await page.locator("main").screenshot({ path: comparisonScreenshotPath });
+  await testInfo.attach("chapter19-srgb-comparison", {
+    path: comparisonScreenshotPath,
+    contentType: "image/png",
+  });
+
+  await page.locator("#pipeline-debug-mode").selectOption("10");
+  await page.locator("#lighting-enabled").check();
+  await page.locator("#shininess").fill("4");
+  await page.locator("#shininess").press("Enter");
+  const broadHighlight = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(broadHighlight.materialSpecular.shininess).toBe(4);
+  expect(broadHighlight.pixelHash).toBe("3828192b");
+  await page.locator("#shininess").fill("128");
+  await page.locator("#shininess").press("Enter");
+  const tightHighlight = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(tightHighlight.materialSpecular.shininess).toBe(128);
+  expect(tightHighlight.pixelHash).toBe("8f7be926");
+
+  await page.locator("#specular-color").fill("#ff2020");
+  await page.locator("#specular-color").press("Enter");
+  const redHighlight = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(redHighlight.materialSpecular.color[0]).toBe(1);
+  expect(redHighlight.materialSpecular.color[1]).toBeCloseTo(32 / 255, 6);
+  expect(redHighlight.pixelHash).toBe("23f3ada1");
+  await page.locator("#shininess").evaluate((input) => {
+    input.value = "-1";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await expect(page.locator("#error")).toContainText("shininess");
+  const afterInvalid = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(afterInvalid.materialSpecular.shininess).toBe(128);
+  expect(afterInvalid.pixelHash).toBe(redHighlight.pixelHash);
+
+  await page.locator("#specular-color").fill("#ffffff");
+  await page.locator("#shininess").evaluate((input) => {
+    input.value = "32";
+    input.dispatchEvent(new Event("change", { bubbles: true }));
+  });
+  await page.locator("#pipeline-debug-mode").selectOption("0");
+  const restored = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  await expect(page.locator("#lighting-status")).toContainText("Blinn-Phong 켬");
+  expect(restored.shaderMode).toBe(2);
+  expect(restored.pixelHash).toBe(blinn.pixelHash);
+
+  const screenshotPath = path.join(
+    screenshotDirectory,
+    `${EXECUTION_MODE}-${testInfo.project.name}-chapter19-blinn-phong-color-space.png`,
+  );
+  await page.locator("main").screenshot({ path: screenshotPath });
+  await testInfo.attach("chapter19-blinn-phong-color-space", {
+    path: screenshotPath,
+    contentType: "image/png",
+  });
+  expect(browserLog.errors).toEqual([]);
+  recordEvidence(testInfo, restored, 0, browserLog, screenshotPath, {
+    blinnHash: blinn.pixelHash,
+    lambertHash: lambert.pixelHash,
+    diffuseHash: diffuse.pixelHash,
+    specularHash: specular.pixelHash,
+    correctUnlitHash: correctUnlit.pixelHash,
+    comparisonHash: comparison.pixelHash,
+    broadHighlightHash: broadHighlight.pixelHash,
+    tightHighlightHash: tightHighlight.pixelHash,
+    redHighlightHash: redHighlight.pixelHash,
+    comparisonScreenshotPath,
   });
 });

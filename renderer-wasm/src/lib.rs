@@ -2,11 +2,13 @@
 
 use renderer_core::{
     CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
-    math::Vec4,
+    math::{Vec3, Vec4},
     raster::{
         AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
     },
-    texture::{AddressMode, FilterMode, NormalMode, SamplerState, TextureColorSpace, TextureId},
+    texture::{
+        AddressMode, FilterMode, NormalMode, SamplerState, ShaderMode, TextureColorSpace, TextureId,
+    },
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -134,6 +136,9 @@ impl Renderer {
             6 => PipelineDebugMode::FrontBack,
             7 => PipelineDebugMode::Normal,
             8 => PipelineDebugMode::NdotL,
+            9 => PipelineDebugMode::Diffuse,
+            10 => PipelineDebugMode::Specular,
+            11 => PipelineDebugMode::ColorSpaceComparison,
             _ => return Err(format!("알 수 없는 pipeline debug mode입니다: {mode}")),
         };
         self.core.set_pipeline_debug_mode(mode);
@@ -240,6 +245,53 @@ impl Renderer {
 
     pub fn lighting_enabled(&self) -> bool {
         self.core.lighting_enabled()
+    }
+
+    pub fn set_shader_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => ShaderMode::Unlit,
+            1 => ShaderMode::Lambert,
+            2 => ShaderMode::BlinnPhong,
+            _ => return Err(format!("알 수 없는 shader mode입니다: {mode}")),
+        };
+        self.core.set_shader_mode(mode);
+        Ok(())
+    }
+
+    pub fn shader_mode(&self) -> u32 {
+        match self.core.shader_mode() {
+            ShaderMode::Unlit => 0,
+            ShaderMode::Lambert => 1,
+            ShaderMode::BlinnPhong => 2,
+        }
+    }
+
+    pub fn set_material_specular(
+        &mut self,
+        red: f32,
+        green: f32,
+        blue: f32,
+        shininess: f32,
+    ) -> Result<(), String> {
+        self.core
+            .set_material_specular(Vec3::new(red, green, blue), shininess)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn material_specular_red(&self) -> f32 {
+        self.core.material_specular().0.x
+    }
+
+    pub fn material_specular_green(&self) -> f32 {
+        self.core.material_specular().0.y
+    }
+
+    pub fn material_specular_blue(&self) -> f32 {
+        self.core.material_specular().0.z
+    }
+
+    pub fn material_shininess(&self) -> f32 {
+        self.core.material_specular().1
     }
 
     pub fn set_normal_mode(&mut self, mode: u32) -> Result<(), String> {
@@ -1044,7 +1096,7 @@ mod tests {
     }
 
     #[test]
-    fn adapter_maps_all_pipeline_debug_modes_through_chapter_eighteen() {
+    fn adapter_maps_all_pipeline_debug_modes_through_chapter_nineteen() {
         let mut renderer = Renderer::new(64, 64).unwrap();
         renderer.set_debug_lines_enabled(true);
         let expected_labels = [
@@ -1057,6 +1109,9 @@ mod tests {
             "front green / back red",
             "world normal RGB",
             "Lambert N dot L",
+            "linear diffuse only",
+            "Blinn-Phong specular only",
+            "linear correct / encoded wrong-way",
         ];
         let mut reference_counts = None;
         for (mode, expected_label) in expected_labels.into_iter().enumerate() {
@@ -1080,7 +1135,7 @@ mod tests {
         }
         assert!(
             renderer
-                .set_pipeline_debug_mode(9)
+                .set_pipeline_debug_mode(12)
                 .unwrap_err()
                 .contains("pipeline debug mode")
         );
@@ -1271,5 +1326,45 @@ mod tests {
                 .unwrap_err()
                 .contains("intensity")
         );
+    }
+
+    #[test]
+    fn adapter_maps_chapter_nineteen_shader_and_specular_material_atomically() {
+        let mut renderer = Renderer::new(32, 32).unwrap();
+        assert_eq!(renderer.shader_mode(), 0);
+        renderer.set_shader_mode(1).unwrap();
+        assert_eq!(renderer.shader_mode(), 1);
+        renderer.set_shader_mode(2).unwrap();
+        assert_eq!(renderer.shader_mode(), 2);
+        renderer.set_shader_mode(0).unwrap();
+        assert_eq!(renderer.shader_mode(), 0);
+        assert!(
+            renderer
+                .set_shader_mode(3)
+                .unwrap_err()
+                .contains("shader mode")
+        );
+
+        renderer
+            .set_material_specular(0.25, 0.5, 0.75, 48.0)
+            .unwrap();
+        assert_eq!(renderer.material_specular_red(), 0.25);
+        assert_eq!(renderer.material_specular_green(), 0.5);
+        assert_eq!(renderer.material_specular_blue(), 0.75);
+        assert_eq!(renderer.material_shininess(), 48.0);
+        assert!(
+            renderer
+                .set_material_specular(1.1, 0.5, 0.75, 48.0)
+                .unwrap_err()
+                .contains("specular color")
+        );
+        assert_eq!(renderer.material_specular_red(), 0.25);
+        assert!(
+            renderer
+                .set_material_specular(0.25, 0.5, 0.75, f32::NAN)
+                .unwrap_err()
+                .contains("shininess")
+        );
+        assert_eq!(renderer.material_shininess(), 48.0);
     }
 }
