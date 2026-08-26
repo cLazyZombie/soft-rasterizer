@@ -47,6 +47,36 @@ pub enum WindingDebugMode {
     Barycentric,
 }
 
+/// 15장에서 하나의 pipeline state로 통합한 fragment 표시 방식이다.
+///
+/// 모든 모드는 같은 transform/clip/coverage/depth 경로를 통과하고 마지막
+/// fragment 색 표현만 바꾼다.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum PipelineDebugMode {
+    #[default]
+    Solid,
+    Wireframe,
+    TriangleId,
+    Barycentric,
+    Depth,
+    DepthHeatmap,
+    FrontBack,
+}
+
+impl PipelineDebugMode {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Solid => "solid vertex color",
+            Self::Wireframe => "wireframe",
+            Self::TriangleId => "triangle ID",
+            Self::Barycentric => "barycentric RGB",
+            Self::Depth => "depth grayscale",
+            Self::DepthHeatmap => "depth range heatmap",
+            Self::FrontBack => "front green / back red",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum DepthDebugMode {
     #[default]
@@ -884,6 +914,20 @@ mod tests {
         assert_eq!(WindingDebugMode::VertexColor.label(), "vertex color");
         assert_eq!(WindingDebugMode::Facing.label(), "front green / back red");
         assert_eq!(WindingDebugMode::Barycentric.label(), "barycentric RGB");
+        assert_eq!(PipelineDebugMode::Solid.label(), "solid vertex color");
+        assert_eq!(PipelineDebugMode::Wireframe.label(), "wireframe");
+        assert_eq!(PipelineDebugMode::TriangleId.label(), "triangle ID");
+        assert_eq!(PipelineDebugMode::Barycentric.label(), "barycentric RGB");
+        assert_eq!(PipelineDebugMode::Depth.label(), "depth grayscale");
+        assert_eq!(
+            PipelineDebugMode::DepthHeatmap.label(),
+            "depth range heatmap"
+        );
+        assert_eq!(
+            PipelineDebugMode::FrontBack.label(),
+            "front green / back red"
+        );
+        assert_eq!(PipelineDebugMode::default(), PipelineDebugMode::Solid);
         assert_eq!(DepthDebugMode::Off.label(), "off");
         assert_eq!(DepthDebugMode::Grayscale.label(), "grayscale");
         assert_eq!(DepthDebugMode::Heatmap.label(), "range heatmap");

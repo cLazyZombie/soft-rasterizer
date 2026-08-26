@@ -29,6 +29,7 @@ function rendererStats(renderer) {
     generatedTriangles: renderer.stats_generated_triangles(),
     maxClipPolygonVertices: renderer.stats_max_clip_polygon_vertices(),
     rasterizedTriangles: renderer.stats_rasterized_triangles(),
+    coveredSamples: renderer.stats_covered_samples(),
     shadedSamples: renderer.stats_shaded_samples(),
     depthPassedSamples: renderer.stats_depth_passed_samples(),
     depthFailedSamples: renderer.stats_depth_failed_samples(),
@@ -38,6 +39,7 @@ function rendererStats(renderer) {
     invalidInterpolationSamples: renderer.stats_invalid_interpolation_samples(),
     minInterpolatedInvW: renderer.stats_min_interpolated_inv_w(),
     maxInterpolatedInvW: renderer.stats_max_interpolated_inv_w(),
+    sampleCounterOverflow: renderer.stats_sample_counter_overflow(),
     debugPixels: renderer.stats_debug_pixels(),
     invalidValues: renderer.stats_invalid_values(),
   };
@@ -70,6 +72,7 @@ async function bootstrap() {
   const canvas = document.querySelector("#framebuffer");
   const errorOutput = document.querySelector("#error");
   const cullModeSelect = document.querySelector("#cull-mode");
+  const pipelineDebugModeSelect = document.querySelector("#pipeline-debug-mode");
   const windingDebugCheckbox = document.querySelector("#winding-debug");
   const barycentricDebugCheckbox = document.querySelector("#barycentric-debug");
   const clipDebugCheckbox = document.querySelector("#clip-debug");
@@ -116,6 +119,8 @@ async function bootstrap() {
         : "affine attribute 비교 경로 (Rust)";
     document.querySelector("#depth-algorithm").textContent =
       "affine z_ndc · strict < · +infinity clear (Rust)";
+    document.querySelector("#pipeline-algorithm").textContent =
+      `${pipelineDebugModeSelect.options[pipelineDebugModeSelect.selectedIndex].text} · 같은 Rust coverage/depth 경로`;
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
@@ -170,10 +175,16 @@ async function bootstrap() {
     cullModeSelect.value = String(mode);
   };
 
+  const setPipelineDebugMode = (mode) => {
+    renderer.set_pipeline_debug_mode(mode);
+    pipelineDebugModeSelect.value = String(mode);
+    windingDebugCheckbox.checked = mode === 6;
+    barycentricDebugCheckbox.checked = mode === 3;
+    depthDebugModeSelect.value = String(mode === 4 ? 1 : mode === 5 ? 2 : 0);
+  };
+
   const setWindingDebugMode = (mode) => {
-    renderer.set_winding_debug_mode(mode);
-    windingDebugCheckbox.checked = mode === 1;
-    barycentricDebugCheckbox.checked = mode === 2;
+    setPipelineDebugMode(mode === 1 ? 6 : mode === 2 ? 3 : 0);
   };
 
   const setClipDebugEnabled = (enabled) => {
@@ -242,15 +253,11 @@ async function bootstrap() {
   };
 
   const setDepthDebugMode = (mode) => {
-    renderer.set_depth_debug_mode(mode);
-    depthDebugModeSelect.value = String(mode);
+    setPipelineDebugMode(mode === 1 ? 4 : mode === 2 ? 5 : 0);
   };
 
   // Reload/history restoration can preserve form values independently of the newly created Wasm state.
   setCullMode(Number(cullModeSelect.value));
-  setWindingDebugMode(
-    barycentricDebugCheckbox.checked ? 2 : windingDebugCheckbox.checked ? 1 : 0,
-  );
   setClipDebugEnabled(clipDebugCheckbox.checked);
   setCoverageDebugEnabled(coverageDebugCheckbox.checked);
   setInterpolationDebugEnabled(interpolationDebugCheckbox.checked);
@@ -258,10 +265,14 @@ async function bootstrap() {
   setAttributeInterpolationMode(Number(attributeInterpolationModeSelect.value));
   setDepthDebugEnabled(depthDebugCheckbox.checked);
   setDepthOrderReversed(depthOrderReversedCheckbox.checked);
-  setDepthDebugMode(Number(depthDebugModeSelect.value));
+  setPipelineDebugMode(Number(pipelineDebugModeSelect.value));
 
   cullModeSelect.addEventListener("change", () => {
     setCullMode(Number(cullModeSelect.value));
+    renderFrame(0);
+  });
+  pipelineDebugModeSelect.addEventListener("change", () => {
+    setPipelineDebugMode(Number(pipelineDebugModeSelect.value));
     renderFrame(0);
   });
   windingDebugCheckbox.addEventListener("change", () => {
@@ -349,6 +360,7 @@ async function bootstrap() {
     resizeEvents,
     contextKind: "2d",
     cullMode: Number(cullModeSelect.value),
+    pipelineDebugMode: Number(pipelineDebugModeSelect.value),
     windingDebugMode: barycentricDebugCheckbox.checked
       ? 2
       : windingDebugCheckbox.checked
@@ -386,6 +398,7 @@ async function bootstrap() {
           renderer.set_debug_lines_enabled(enabled);
         },
         setCullMode,
+        setPipelineDebugMode,
         setWindingDebugMode,
         setClipDebugEnabled,
         setCoverageDebugEnabled,

@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 14장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling, 여섯 평면 homogeneous clipping, 고정소수점 coverage, strict 깊이 검사와 perspective-correct 속성 보간을 구현했습니다. clipping 뒤 `ScreenVertex`에서 만든 `1/w`와 `attribute/w`를 같은 barycentric과 분모로 복원하며 normal은 다시 정규화하고, `z_ndc`만 screen-affine 보간을 유지합니다. 두 삼각형 quad, R/G/B triangle, near/far overlap fixture와 기울어진 procedural UV checker의 affine/perspective 비교를 실제 Rust-Wasm-Canvas 2D 경로에서 확인할 수 있습니다.
+현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 따라 장별로 구현합니다. 15장까지 Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, screen-space winding/culling, 여섯 평면 homogeneous clipping, 고정소수점 coverage, strict 깊이 검사와 perspective-correct 속성 보간을 구현하고 하나의 scalar 컬러 큐브 pipeline으로 조립했습니다. `PipelineState`는 culling, 속성 보간과 solid/wireframe/triangle ID/barycentric/depth/front-back 표시를 한곳에서 관리하며 모든 debug view는 같은 Rust coverage/depth 경로를 사용합니다. 두 삼각형 quad, R/G/B triangle, near/far overlap, 기울어진 procedural UV checker와 회전 컬러 큐브를 실제 Rust-Wasm-Canvas 2D 경로에서 확인할 수 있습니다.
 
 ## 실행 방법
 

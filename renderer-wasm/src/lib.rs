@@ -3,7 +3,9 @@
 use renderer_core::{
     CoordinateDebugSnapshot, FrameStats, InputSnapshot, Renderer as CoreRenderer,
     math::Vec4,
-    raster::{AttributeInterpolationMode, CullMode, DepthDebugMode, WindingDebugMode},
+    raster::{
+        AttributeInterpolationMode, CullMode, DepthDebugMode, PipelineDebugMode, WindingDebugMode,
+    },
     transform::CoordinateSpace,
 };
 use wasm_bindgen::prelude::*;
@@ -120,6 +122,21 @@ impl Renderer {
         Ok(())
     }
 
+    pub fn set_pipeline_debug_mode(&mut self, mode: u32) -> Result<(), String> {
+        let mode = match mode {
+            0 => PipelineDebugMode::Solid,
+            1 => PipelineDebugMode::Wireframe,
+            2 => PipelineDebugMode::TriangleId,
+            3 => PipelineDebugMode::Barycentric,
+            4 => PipelineDebugMode::Depth,
+            5 => PipelineDebugMode::DepthHeatmap,
+            6 => PipelineDebugMode::FrontBack,
+            _ => return Err(format!("알 수 없는 pipeline debug mode입니다: {mode}")),
+        };
+        self.core.set_pipeline_debug_mode(mode);
+        Ok(())
+    }
+
     pub fn set_model_rotation_y(&mut self, rotation_y_radians: f32) {
         self.core.set_model_rotation_y(rotation_y_radians);
     }
@@ -212,6 +229,10 @@ impl Renderer {
         self.stats().rasterized_triangles
     }
 
+    pub fn stats_covered_samples(&self) -> u32 {
+        self.stats().covered_samples
+    }
+
     pub fn stats_shaded_samples(&self) -> u32 {
         self.stats().shaded_samples
     }
@@ -246,6 +267,10 @@ impl Renderer {
 
     pub fn stats_max_interpolated_inv_w(&self) -> f32 {
         self.stats().max_interpolated_inv_w
+    }
+
+    pub fn stats_sample_counter_overflow(&self) -> bool {
+        self.stats().sample_counter_overflow
     }
 
     pub fn stats_debug_pixels(&self) -> u32 {
@@ -381,13 +406,14 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         "{}\n\
          {}\n\
          winding screen y-down orient2d > 0 front · cull {} · debug {}\n\
+         pipeline state debug {} · strict depth test/write · material {}\n\
          triangle stats input {} · submitted {} · culled {} · degenerate {} · invalid {}\n\
          clip stats fully clipped {} · clip invalid {} · generated {} · max polygon vertices {}\n\
-         coverage stats rasterized {} · shaded samples {} · S=256 pixel center/top-left\n\
+         coverage stats rasterized {} · covered {} · shaded samples {} · counter overflow {} · S=256 pixel center/top-left\n\
          interpolation stats max |lambda sum - 1| {:.9} · mode {}\n\
          inv_w stats samples {} · invalid {} · q range [{:.6}, {:.6}]\n\
          depth stats passed {} · failed {} · invalid {} · strict < · clear +infinity · debug {}\n\
-         선택 정점 v{} (X-ray overlay · culling/depth 무관) · model Y {:.3} rad\n\
+         선택 정점 v{} (X-ray overlay {} · culling/depth 무관) · model Y {:.3} rad\n\
          normal ({:.3}, {:.3}, {:.3}) · UV ({:.3}, {:.3}) · color ({:.3}, {:.3}, {:.3}, {:.3})\n\
          Object {}\nWorld  {}\nView   {}\nClip   {}\n\
          w_clip {:.3} · NDC {} · Screen {}\n\
@@ -400,6 +426,8 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         scene,
         snapshot.cull_mode.label(),
         snapshot.winding_debug_mode.label(),
+        snapshot.pipeline_state.debug_mode.label(),
+        snapshot.material_id,
         snapshot.frame_stats.input_triangles,
         snapshot.frame_stats.submitted_triangles,
         snapshot.frame_stats.culled_triangles,
@@ -410,7 +438,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.generated_triangles,
         snapshot.frame_stats.max_clip_polygon_vertices,
         snapshot.frame_stats.rasterized_triangles,
+        snapshot.frame_stats.covered_samples,
         snapshot.frame_stats.shaded_samples,
+        snapshot.frame_stats.sample_counter_overflow,
         snapshot.frame_stats.max_barycentric_sum_error,
         snapshot.attribute_interpolation_mode.label(),
         snapshot.frame_stats.interpolated_inv_w_samples,
@@ -422,6 +452,11 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         snapshot.frame_stats.invalid_depth_samples,
         snapshot.depth_debug_mode.label(),
         snapshot.selected_vertex_index,
+        if snapshot.debug_lines_enabled {
+            "on"
+        } else {
+            "off"
+        },
         snapshot.rotation_y_radians,
         attributes.normal_world.x,
         attributes.normal_world.y,
@@ -500,16 +535,21 @@ mod tests {
         assert_eq!(renderer.stats_generated_triangles(), 12);
         assert_eq!(renderer.stats_max_clip_polygon_vertices(), 3);
         assert_eq!(renderer.stats_rasterized_triangles(), 4);
-        assert_eq!(renderer.stats_shaded_samples(), 0);
-        assert_eq!(renderer.stats_depth_passed_samples(), 0);
+        assert_eq!(renderer.stats_covered_samples(), 1);
+        assert_eq!(renderer.stats_shaded_samples(), 1);
+        assert_eq!(renderer.stats_depth_passed_samples(), 1);
         assert_eq!(renderer.stats_depth_failed_samples(), 0);
         assert_eq!(renderer.stats_invalid_depth_samples(), 0);
         assert_eq!(renderer.stats_max_barycentric_sum_error(), 0.0);
-        assert_eq!(renderer.stats_interpolated_inv_w_samples(), 0);
+        assert_eq!(renderer.stats_interpolated_inv_w_samples(), 1);
         assert_eq!(renderer.stats_invalid_interpolation_samples(), 0);
-        assert_eq!(renderer.stats_min_interpolated_inv_w(), 0.0);
-        assert_eq!(renderer.stats_max_interpolated_inv_w(), 0.0);
-        assert!(renderer.stats_debug_pixels() > 0);
+        assert!(renderer.stats_min_interpolated_inv_w() > 0.0);
+        assert_eq!(
+            renderer.stats_min_interpolated_inv_w(),
+            renderer.stats_max_interpolated_inv_w()
+        );
+        assert!(!renderer.stats_sample_counter_overflow());
+        assert_eq!(renderer.stats_debug_pixels(), 0);
         assert_eq!(renderer.stats_invalid_values(), 0);
     }
 
@@ -538,9 +578,19 @@ mod tests {
         renderer.set_debug_lines_enabled(false);
         renderer.update_and_render(0.0, 0);
         assert_eq!(renderer.stats_debug_pixels(), 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("X-ray overlay off · culling/depth 무관")
+        );
         renderer.set_debug_lines_enabled(true);
         renderer.update_and_render(0.0, 0);
         assert!(renderer.stats_debug_pixels() > 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("X-ray overlay on · culling/depth 무관")
+        );
     }
 
     #[test]
@@ -594,6 +644,7 @@ mod tests {
         assert_eq!(renderer.stats_generated_triangles(), 2);
         assert_eq!(renderer.stats_submitted_triangles(), 2);
         assert_eq!(renderer.stats_rasterized_triangles(), 2);
+        assert_eq!(renderer.stats_covered_samples(), 1_024);
         assert_eq!(renderer.stats_shaded_samples(), 1_024);
         assert!(renderer.stats_max_barycentric_sum_error() <= 2.0 * f32::EPSILON);
         assert_eq!(renderer.stats_debug_pixels(), 0);
@@ -605,7 +656,7 @@ mod tests {
             "coverage quad mesh · vertices 6 · indices 6 · triangles 2 · material 0 · 두 삼각형/공유 대각선"
         ));
         assert!(text.contains(
-            "coverage stats rasterized 2 · shaded samples 1024 · S=256 pixel center/top-left"
+            "coverage stats rasterized 2 · covered 1024 · shaded samples 1024 · counter overflow false · S=256 pixel center/top-left"
         ));
 
         renderer.set_clip_debug_enabled(true);
@@ -796,12 +847,53 @@ mod tests {
     }
 
     #[test]
+    fn adapter_maps_all_chapter_fifteen_pipeline_debug_modes() {
+        let mut renderer = Renderer::new(64, 64).unwrap();
+        renderer.set_debug_lines_enabled(true);
+        let expected_labels = [
+            "solid vertex color",
+            "wireframe",
+            "triangle ID",
+            "barycentric RGB",
+            "depth grayscale",
+            "depth range heatmap",
+            "front green / back red",
+        ];
+        let mut reference_counts = None;
+        for (mode, expected_label) in expected_labels.into_iter().enumerate() {
+            renderer.set_pipeline_debug_mode(mode as u32).unwrap();
+            renderer.update_and_render(0.0, 0);
+            assert!(
+                renderer
+                    .coordinate_debug_text()
+                    .contains(&format!("pipeline state debug {expected_label}"))
+            );
+            let counts = (
+                renderer.stats_generated_triangles(),
+                renderer.stats_submitted_triangles(),
+                renderer.stats_rasterized_triangles(),
+                renderer.stats_covered_samples(),
+                renderer.stats_depth_passed_samples(),
+                renderer.stats_depth_failed_samples(),
+            );
+            assert_eq!(*reference_counts.get_or_insert(counts), counts);
+            assert!(renderer.stats_debug_pixels() > 0);
+        }
+        assert!(
+            renderer
+                .set_pipeline_debug_mode(7)
+                .unwrap_err()
+                .contains("pipeline debug mode")
+        );
+    }
+
+    #[test]
     fn adapter_formats_coordinate_overlay_and_reports_invalid_rotation() {
         let mut renderer = Renderer::new(64, 64).expect("adapter should be valid");
         renderer.update_and_render(0.0, 0);
         let text = renderer.coordinate_debug_text();
         assert!(text.contains("선택 정점 v6"));
-        assert!(text.contains("X-ray overlay · culling/depth 무관"));
+        assert!(text.contains("X-ray overlay off · culling/depth 무관"));
         assert!(text.contains("indexed cube mesh · vertices 24 · indices 36 · triangles 12"));
         assert!(text.contains("winding screen y-down orient2d > 0 front · cull back"));
         assert!(text.contains(

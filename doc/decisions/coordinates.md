@@ -72,6 +72,15 @@ P rows:
 - 12장의 정점 색 affine 경로는 비교 모드로 보존한다. 14장부터 clipping과 divide/viewport가 끝난 `ScreenVertex`가 `inv_w`와 world position/normal/UV/color의 `attribute_over_w`를 소유하며, `FragmentInput`은 한 분모 `q=Σ(lambda_i/w_i)`로 모든 일반 속성을 perspective-correct 복원한다. normal은 복원 뒤 재정규화하고 `q<=1e-8`, non-finite 속성 또는 정규화 실패 fragment는 색/깊이를 쓰지 않은 채 `invalid_interpolation_samples`와 `invalid_values`에 기록한다. `max_barycentric_sum_error`, 성공 sample 수와 q 최소/최대도 작은 `FrameStats`로 관찰한다.
 - 13장의 `z_ndc`도 같은 barycentric으로 screen-space affine 보간하지만 일반 정점 속성처럼 다시 perspective 보정하지 않는다. strict depth의 동일값 tie는 먼저 통과한 sample을 보존한다. near/far overlap fixture는 triangle 제출 순서를 뒤집어도 최종 RGBA와 depth가 exact match해야 한다.
 
+## 15장 scalar pipeline 조립
+
+- 기본 컬러 큐브 pose는 `eye=(0,0,-3)`, `target=(0,0,0)`, `world_up=(0,1,0)`인 LH/+Z 카메라다. model Y 회전은 sanitize한 frame `dt`로만 갱신한다.
+- `PipelineState`는 cull mode, perspective 속성 보간 mode와 통합 debug mode를 프레임 단위로 고정한다. material은 `DrawItem`에 남고 depth는 모든 mode에서 strict `<` test/write다.
+- solid, wireframe, triangle ID, barycentric, depth, front/back은 transform부터 depth까지 같은 경로를 공유하고 fragment 색만 바꾼다. Wireframe은 barycentric edge 거리를 Rust fragment 색으로 바꾸며 Canvas line API를 사용하지 않는다.
+- 이전 장의 Bresenham X-ray 선은 기본 off인 별도 opt-in overlay다. 통합 debug mode와 15장 기본 golden에는 적용하지 않는다.
+- `FrameStats`는 sample counter overflow가 없을 때 `generated=submitted+culled+degenerate+invalid`, `rasterized=submitted`, `covered=depth_passed+depth_failed+invalid_depth+invalid_interpolation`, `shaded=depth_passed=interpolated_inv_w_samples`를 만족해야 한다. overflow는 포화된 수치와 별도 flag로 관찰한다.
+- Culling을 끈 opaque cube는 triangle 제출 순서를 뒤집어도 최종 RGBA와 depth가 exact match해야 한다. near plane 교차 pose도 invalid triangle/depth/interpolation이나 화면 전체 폭발 없이 일부 sample을 남겨야 한다.
+
 ## 카메라 입력
 
 Orbit/Fly의 yaw=0, pitch=0 world forward는 `+Z`다.

@@ -4,7 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <link rel="icon" type="image/png" href="/icon.png" />
-    <title>소프트웨어 래스터라이저 · 14장</title>
+    <title>소프트웨어 래스터라이저 · 15장</title>
     <style>
       :root {
         color: #eef4ff;
@@ -119,16 +119,28 @@
     <main>
       <div class="title">
         <img src="/icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
-        <h1>14장 · Perspective-correct 보간</h1>
+        <h1>15장 · 파이프라인 조립과 컬러 3D 큐브</h1>
       </div>
-      <p>clipping 뒤 만든 1/w와 attribute/w로 기울어진 UV를 복원하고 affine 결과와 비교합니다.</p>
-      <div class="controls" role="group" aria-label="Culling, clipping, interpolation과 depth debug 설정">
+      <p>변환부터 fragment 색 기록까지 한 scalar Rust pipeline으로 연결하고, 같은 coverage/depth 위에서 debug view만 바꿉니다.</p>
+      <div class="controls" role="group" aria-label="Pipeline, culling, fixture와 interpolation 설정">
         <label for="cull-mode">
           Culling
           <select id="cull-mode">
             <option value="0">끔 (양면)</option>
             <option value="1" selected>뒷면 제거</option>
             <option value="2">앞면 제거</option>
+          </select>
+        </label>
+        <label for="pipeline-debug-mode">
+          Pipeline view
+          <select id="pipeline-debug-mode">
+            <option value="0" selected>Solid vertex color</option>
+            <option value="1">Wireframe</option>
+            <option value="2">Triangle ID</option>
+            <option value="3">Barycentric RGB</option>
+            <option value="4">Depth grayscale</option>
+            <option value="5">Depth heatmap</option>
+            <option value="6">Front / Back</option>
           </select>
         </label>
         <label for="winding-debug">
@@ -181,7 +193,7 @@
       </div>
       <canvas id="framebuffer" width="1" height="1" aria-label="소프트웨어 래스터라이저 출력"></canvas>
       <p class="space-legend">
-        clip → fan → divide/viewport + 1/w · edge/top-left → barycentric → affine z_ndc → strict depth &lt; → attribute/w ÷ Σ(λ/w) · 선택 정점 흰색(X-ray)
+        transform → clip → fan → divide/viewport + 1/w → cull/setup → coverage → affine z_ndc → strict depth &lt; → perspective attributes → fragment color write
       </p>
       <pre id="coordinate-debug" aria-label="카메라와 선택 정점 투영 정보">좌표 계산 대기 중</pre>
       <dl aria-label="렌더러 상태">
@@ -203,6 +215,8 @@
         <dd id="interpolation-algorithm">초기화 중</dd>
         <dt>깊이 알고리즘</dt>
         <dd id="depth-algorithm">초기화 중</dd>
+        <dt>Pipeline 상태</dt>
+        <dd id="pipeline-algorithm">초기화 중</dd>
         <dt>수학 규약</dt>
         <dd id="math-convention">초기화 중</dd>
         <dt>프레임</dt>
