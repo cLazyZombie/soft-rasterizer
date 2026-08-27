@@ -15,9 +15,9 @@
 
 ## 완료 시 데모 시나리오
 
-1. 앱 시작: checker cube가 기본 장면으로 보이고 overlay에 해상도/삼각형/frame ms가 표시된다.
+1. 앱 시작: animation이 재생되는 Fox GLB가 기본 장면으로 보이고 overlay에 해상도/삼각형/frame ms가 표시된다. asset fetch가 실패하면 checker cube로 안전하게 돌아간다.
 1. 카메라: orbit/fly, resize, near plane 통과에서도 화면이 안정적이다.
-1. 에셋: 외부 model/texture를 로드하고 오류 파일은 기존 장면을 유지한 채 설명한다.
+1. 에셋: OBJ와 GLB model/texture를 로드하고 오류 파일은 기존 장면을 유지한 채 설명한다. GLB는 clip 선택, pause/seek/loop와 skinning 통계를 함께 보여 준다.
 1. 품질: unlit/Lambert/Blinn, nearest/bilinear/mip, no-AA/AA를 비교한다.
 1. 정확성: clipping fixture, quad top-left fixture, depth order fixture를 debug menu에서 재생한다.
 1. 성능: scalar와 선택한 최적화 경로의 동일 이미지와 p50/p95를 같은 조건으로 보여 준다.

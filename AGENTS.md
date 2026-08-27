@@ -5,7 +5,7 @@
 ## 기준 문서
 
 - 전체 구조와 장별 링크: `doc/00-들어가며.md`
-- 현재 작업 장의 계약: `doc/01-*.md`부터 `doc/25-*.md`
+- 현재 작업 장의 계약: `doc/01-*.md`부터 `doc/26-*.md`
 - 에이전트 작업 범위선: `doc/appendix-a-코딩-에이전트와-장별로-일하는-방법.md`
 - 핵심 데이터 구조: `doc/appendix-b-최소-공개-계약과-데이터-구조.md`
 - 수학/알고리즘 요약: `doc/appendix-c-수학과-알고리즘-빠른-참조.md`
@@ -136,7 +136,7 @@
 - 6-10장: 변환, 카메라, Mesh, winding과 homogeneous clipping을 구현한다.
 - 11-15장: edge/top-left, barycentric, depth, perspective 보간을 조립해 scalar 컬러 큐브를 완성한다.
 - 16-20장: 이미지 입력, sampler, 조명, 색 공간과 입력 카메라를 추가한다.
-- 21-25장: 외부 에셋, 투명도, AA/mipmap, 진단/프로파일링과 최적화를 추가한다.
+- 21-26장: 외부 에셋, 투명도, AA/mipmap, 진단/프로파일링, 최적화와 GLB animation/skinning을 추가한다.
 
 특히 다음 gate를 지킨다.
 
@@ -205,6 +205,7 @@ golden 변경은 자동 승인하지 않는다. 픽셀 수, 위치, 최대 채�
 - `asset_failure`: 잘못된 mesh/texture가 기존 유효 scene을 파괴하지 않는지 확인
 - `debug_views`: debug mode가 의도 없이 geometry/depth count를 바꾸지 않는지 확인
 - `determinism`: 동일 seed/input/frame sequence가 같은 `FrameStats`와 pixel hash를 만드는지 확인
+- `glb_scene`: embedded image decode, node/skin animation, pause/seek/loop, stale upload와 Fox pixel hash를 확인
 
 headless browser는 Wasm/Canvas 통합과 결정적 pixel 검증의 기본 경로다. 실제 OS window, pointer 좌표, focus, devicePixelRatio, resize 또는 headed lifecycle이 관련된 변경은 별도 headed E2E를 실행한다. headless 결과를 headed 입력/화면의 증거로 보고하지 않고 두 scenario/step 수를 구분해 보고한다.
 

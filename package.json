@@ -9,6 +9,7 @@
     "wasm:release": "wasm-pack build renderer-wasm --release --target web --out-dir ../web/pkg --out-name renderer_wasm",
     "dev": "pnpm run wasm:dev && vite --config vite.config.js",
     "build:test": "pnpm run wasm:release && vite build --config vite.config.js --mode test",
+    "check:assets": "node scripts/check_assets.mjs",
     "format:check": "cargo fmt --all -- --check",
     "check": "cargo check --workspace --all-targets && cargo check -p renderer-wasm --target wasm32-unknown-unknown",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings && eslint vite.config.js playwright.config.js eslint.config.js web tests scripts && pnpm run check:coverage-policy",

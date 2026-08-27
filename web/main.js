@@ -1,6 +1,12 @@
 import init, { Renderer } from "./pkg/renderer_wasm.js";
 import { InputCollector } from "./input.js";
 import { readObjFileBytes, validateObjFileSize } from "./mesh-upload.js";
+import {
+  hasGlbMagic,
+  prepareDecodeAndCommitGlb,
+  readGlbFileBytes,
+  validateGlbFileSize,
+} from "./glb-upload.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
 import { FrameTimingRing, summarizeFrameTimings } from "./frame-timing.js";
@@ -67,6 +73,11 @@ function rendererStats(renderer) {
     tiledRasterizedTriangles: renderer.stats_tiled_rasterized_triangles(),
     tileVisits: renderer.stats_tile_visits(),
     tileCounterOverflow: renderer.stats_tile_counter_overflow(),
+    sceneDrawItems: renderer.stats_scene_draw_items(),
+    animatedNodes: renderer.stats_animated_nodes(),
+    skinnedVertices: renderer.stats_skinned_vertices(),
+    jointMatrices: renderer.stats_joint_matrices(),
+    samplerDowngrades: renderer.stats_sampler_downgrades(),
   };
 }
 
@@ -109,6 +120,13 @@ async function bootstrap() {
   const textureFileInput = document.querySelector("#texture-file");
   const meshFileInput = document.querySelector("#mesh-file");
   const meshStatusOutput = document.querySelector("#mesh-status");
+  const glbStatusOutput = document.querySelector("#glb-status");
+  const animationStatusOutput = document.querySelector("#animation-status");
+  const animationClipSelect = document.querySelector("#animation-clip");
+  const animationPlayButton = document.querySelector("#animation-play");
+  const animationLoopCheckbox = document.querySelector("#animation-loop");
+  const animationTimeInput = document.querySelector("#animation-time");
+  const animationTimeLabel = document.querySelector("#animation-time-label");
   const textureDebugCheckbox = document.querySelector("#texture-debug");
   const textureStatusOutput = document.querySelector("#texture-status");
   const textureSamplingCheckbox = document.querySelector("#texture-sampling");
@@ -145,6 +163,8 @@ async function bootstrap() {
   canvas.width = initialSize.width;
   canvas.height = initialSize.height;
   const renderer = new Renderer(initialSize.width, initialSize.height);
+  let seekGlbAnimation = (timeSeconds) => renderer.seek_glb_animation(timeSeconds);
+  let animationTimeEditing = false;
   const inputCollector = new InputCollector(canvas);
   const presenter = new FramebufferPresenter(context, wasm.memory, renderer);
   let previousTimestamp = null;
@@ -159,6 +179,8 @@ async function bootstrap() {
   let textureStatusText = "fallback checkerboard · 2 × 2 · 2 mip levels · texture 0";
   let textureDecodeGeneration = 0;
   let meshStatusText = "내장 cube · mesh 0 · 24 vertices · 12 triangles";
+  let glbStatusText = "내장 Fox GLB를 준비하는 중";
+  let activeAssetKind = "cube";
   let meshLoadGeneration = 0;
   const rasterCapabilities = Object.freeze({
     crossOriginIsolated: globalThis.crossOriginIsolated === true,
@@ -189,9 +211,11 @@ async function bootstrap() {
         ? "Σ(λ · attribute/w) ÷ Σ(λ/w) · normal 재정규화 (Rust)"
         : "affine attribute 비교 경로 (Rust)";
     document.querySelector("#texture-sampler").textContent =
-      `${textureFilterSelect.options[textureFilterSelect.selectedIndex].text} · ` +
-      `U ${textureAddressUSelect.options[textureAddressUSelect.selectedIndex].text} · ` +
-      `V ${textureAddressVSelect.options[textureAddressVSelect.selectedIndex].text} · Rust fragment sampling`;
+      activeAssetKind === "glb"
+        ? `GLB material별 imported sampler · ${renderer.glb_sampler_downgrades()} downgrade · Rust fragment sampling`
+        : `${textureFilterSelect.options[textureFilterSelect.selectedIndex].text} · ` +
+          `U ${textureAddressUSelect.options[textureAddressUSelect.selectedIndex].text} · ` +
+          `V ${textureAddressVSelect.options[textureAddressVSelect.selectedIndex].text} · Rust fragment sampling`;
     document.querySelector("#texture-sample-stats").textContent =
       `${renderer.stats_texture_samples()} sampled after depth`;
     document.querySelector("#lighting-status").textContent =
@@ -210,13 +234,14 @@ async function bootstrap() {
       `${blendColorSpaceSelect.options[blendColorSpaceSelect.selectedIndex].text} · ` +
       `${renderer.stats_alpha_discarded_samples()} discarded · ${renderer.stats_depth_written_samples()} depth writes · ` +
       `${renderer.stats_blended_samples()} blended`;
+    const mipStatus = activeAssetKind === "glb"
+      ? `GLB texture별 mip chain · ${mipmapEnabledCheckbox.checked ? `${renderer.stats_min_mip_level()}..${renderer.stats_max_mip_level()} selected` : "base level only"}`
+      : `${renderer.texture_mip_levels()} mip levels · ${mipmapEnabledCheckbox.checked ? `${renderer.stats_min_mip_level()}..${renderer.stats_max_mip_level()} selected` : "base level only"}`;
     document.querySelector("#quality-status").textContent =
       `${qualityModeSelect.options[qualityModeSelect.selectedIndex].text} · ` +
       `render ${renderer.render_width()} × ${renderer.render_height()} · ` +
       `${renderer.stats_shaded_samples()} shaded · ${renderer.stats_resolved_pixels()} resolved · ` +
-      `${renderer.texture_mip_levels()} mip levels · ` +
-      `${mipmapEnabledCheckbox.checked ? `${renderer.stats_min_mip_level()}..${renderer.stats_max_mip_level()} selected` : "base level only"} · ` +
-      `${renderer.stats_invalid_lod_samples()} invalid LOD`;
+      `${mipStatus} · ${renderer.stats_invalid_lod_samples()} invalid LOD`;
     document.querySelector("#camera-status").textContent =
       `${cameraModeSelect.options[cameraModeSelect.selectedIndex].text} · ` +
       `eye (${renderer.camera_eye_x().toFixed(3)}, ${renderer.camera_eye_y().toFixed(3)}, ${renderer.camera_eye_z().toFixed(3)}) · ` +
@@ -229,6 +254,22 @@ async function bootstrap() {
     document.querySelector("#math-convention").textContent = "열벡터 · LH · +Z 전방";
     textureStatusOutput.textContent = textureStatusText;
     meshStatusOutput.textContent = meshStatusText;
+    const glbRuntimeError = renderer.glb_runtime_error();
+    glbStatusOutput.textContent = glbRuntimeError
+      ? `${glbStatusText} · animation paused: ${glbRuntimeError}`
+      : glbStatusText;
+    const animationTime = renderer.glb_animation_time();
+    const animationDuration = renderer.glb_animation_duration();
+    animationTimeInput.max = String(animationDuration);
+    if (!animationTimeEditing) {
+      animationTimeInput.value = String(animationTime);
+    }
+    animationPlayButton.textContent = renderer.glb_animation_playing() ? "일시정지" : "재생";
+    animationTimeLabel.textContent = `${animationTime.toFixed(3)} / ${animationDuration.toFixed(3)} s`;
+    animationStatusOutput.textContent = renderer.glb_active()
+      ? `${renderer.glb_clip_count()} clips · ${renderer.stats_animated_nodes()} animated nodes · ` +
+        `${renderer.stats_skinned_vertices()} skinned vertices · ${renderer.stats_joint_matrices()} joint matrices`
+      : "clip 없음";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
     if (lastFrameMetrics !== null) {
@@ -600,10 +641,67 @@ async function bootstrap() {
     transparencyDebugCheckbox.checked = false;
   };
 
+  const syncImportedMaterialControls = () => {
+    const imported = activeAssetKind === "glb";
+    if (imported) {
+      textureFilterSelect.value = "2";
+      textureAddressUSelect.value = "3";
+      textureAddressVSelect.value = "3";
+    } else {
+      textureFilterSelect.value = String(renderer.sampler_filter_mode());
+      textureAddressUSelect.value = String(renderer.sampler_address_u());
+      textureAddressVSelect.value = String(renderer.sampler_address_v());
+    }
+    textureFilterSelect.disabled = imported;
+    textureAddressUSelect.disabled = imported;
+    textureAddressVSelect.disabled = imported;
+    alphaModeSelect.disabled = imported;
+    alphaCutoffInput.disabled = imported;
+  };
+
+  const syncAnimationControls = (preferredClipName = null) => {
+    animationClipSelect.replaceChildren();
+    const clipCount = renderer.glb_clip_count();
+    for (let index = 0; index < clipCount; index += 1) {
+      const option = document.createElement("option");
+      option.value = String(index);
+      option.textContent = renderer.glb_clip_name(index) || `Animation ${index}`;
+      animationClipSelect.append(option);
+    }
+    const enabled = clipCount > 0;
+    animationClipSelect.disabled = !enabled;
+    animationPlayButton.disabled = !enabled;
+    animationLoopCheckbox.disabled = !enabled;
+    animationTimeInput.disabled = !enabled;
+    if (!enabled) {
+      const option = document.createElement("option");
+      option.value = "";
+      option.textContent = "clip 없음";
+      animationClipSelect.append(option);
+      return;
+    }
+    let selected = renderer.glb_selected_clip();
+    if (preferredClipName !== null) {
+      for (let index = 0; index < clipCount; index += 1) {
+        if (renderer.glb_clip_name(index) === preferredClipName) {
+          selected = index;
+          renderer.set_glb_clip(index);
+          break;
+        }
+      }
+    }
+    animationClipSelect.value = String(selected);
+    animationLoopCheckbox.checked = renderer.glb_animation_looping();
+  };
+
   const uploadObjBytes = (bytes, label = "OBJ") => {
     try {
       const id = renderer.load_obj(bytes);
+      activeAssetKind = "obj";
       syncPrimarySceneControls();
+      syncImportedMaterialControls();
+      syncAnimationControls();
+      glbStatusText = "GLB 비활성 · OBJ 단일 mesh";
       meshStatusText =
         `${label} 로드 완료 · mesh ${id} · ` +
         `${renderer.mesh_internal_vertices()} vertices · ${renderer.mesh_triangles()} triangles · ` +
@@ -617,6 +715,83 @@ async function bootstrap() {
       errorOutput.textContent = message;
       updateStatus();
       return { id: null, error: message };
+    }
+  };
+
+  const uploadGlbBytes = async (
+    bytes,
+    label = "GLB",
+    { renderNow = true, isCurrent = () => true, decodeImage } = {},
+  ) => {
+    if (!isCurrent()) {
+      return { id: null, error: null, stale: true };
+    }
+    try {
+      const pendingId = await prepareDecodeAndCommitGlb(
+        renderer,
+        bytes,
+        decodeImage === undefined ? {} : { decodeImage },
+      );
+      if (!isCurrent()) {
+        return { id: null, error: null, stale: true };
+      }
+      activeAssetKind = "glb";
+      syncPrimarySceneControls();
+      if (label === "내장 Fox") {
+        textureSamplingCheckbox.checked = true;
+      }
+      renderer.set_texture_sampling_enabled(textureSamplingCheckbox.checked);
+      setLightingEnabled(label === "내장 Fox" || lightingEnabledCheckbox.checked);
+      renderer.set_glb_animation_looping(true);
+      syncImportedMaterialControls();
+      syncAnimationControls(label === "내장 Fox" ? "Walk" : null);
+      meshStatusText =
+        `${label} 로드 완료 · ${renderer.glb_draw_items()} draw items · ` +
+        `${renderer.glb_vertices()} vertices · ${renderer.glb_triangles()} triangles`;
+      glbStatusText =
+        `GLB ${pendingId} commit · ${label} · ${renderer.glb_nodes()} nodes · ${renderer.glb_skins()} skins · ` +
+        `${renderer.glb_joints()} joints · ${renderer.glb_clip_count()} clips · ` +
+        `${renderer.glb_sampler_downgrades()} sampler downgrade`;
+      errorOutput.textContent = "";
+      if (renderNow) {
+        renderFrame(0);
+      } else {
+        updateStatus();
+      }
+      return { id: pendingId, error: null, stale: false };
+    } catch (error) {
+      if (!isCurrent()) {
+        return { id: null, error: null, stale: true };
+      }
+      const message = error instanceof Error ? error.message : String(error);
+      glbStatusText = `GLB 로드 실패 · 기존 ${activeAssetKind} scene 유지`;
+      errorOutput.textContent = message;
+      updateStatus();
+      return { id: null, error: message, stale: false };
+    }
+  };
+
+  const loadBundledFox = async (
+    { renderNow = true, fetchAsset = fetch, isCurrent = () => true, decodeImage } = {},
+  ) => {
+    const response = await fetchAsset(new URL("./assets/Fox.glb", import.meta.url));
+    if (!isCurrent()) {
+      return { id: null, error: null, stale: true };
+    }
+    if (!response.ok) {
+      throw new Error(`내장 Fox.glb를 가져오지 못했습니다: HTTP ${response.status}`);
+    }
+    const buffer = await response.arrayBuffer();
+    validateGlbFileSize(buffer.byteLength);
+    const bytes = new Uint8Array(buffer);
+    try {
+      return await uploadGlbBytes(bytes, "내장 Fox", {
+        renderNow,
+        isCurrent,
+        decodeImage,
+      });
+    } finally {
+      bytes.fill(0);
     }
   };
 
@@ -832,6 +1007,52 @@ async function bootstrap() {
     setNormalMode(Number(normalModeSelect.value));
     renderFrame(0);
   });
+  animationClipSelect.addEventListener("change", () => {
+    try {
+      renderer.set_glb_clip(Number(animationClipSelect.value));
+      animationLoopCheckbox.checked = renderer.glb_animation_looping();
+      errorOutput.textContent = "";
+    } catch (error) {
+      errorOutput.textContent = error instanceof Error ? error.message : String(error);
+      syncAnimationControls();
+    }
+    renderFrame(0);
+  });
+  animationPlayButton.addEventListener("click", () => {
+    renderer.set_glb_animation_playing(!renderer.glb_animation_playing());
+    renderFrame(0);
+  });
+  animationLoopCheckbox.addEventListener("change", () => {
+    renderer.set_glb_animation_looping(animationLoopCheckbox.checked);
+    renderFrame(0);
+  });
+  animationTimeInput.addEventListener("pointerdown", () => {
+    animationTimeEditing = true;
+  });
+  animationTimeInput.addEventListener("input", () => {
+    animationTimeEditing = true;
+    try {
+      seekGlbAnimation(Number(animationTimeInput.value));
+      errorOutput.textContent = "";
+    } catch (error) {
+      errorOutput.textContent = error instanceof Error ? error.message : String(error);
+      animationTimeInput.value = String(renderer.glb_animation_time());
+    }
+    renderFrame(0);
+  });
+  const finishAnimationTimeEditing = () => {
+    animationTimeEditing = false;
+    animationTimeInput.value = String(renderer.glb_animation_time());
+    updateStatus();
+  };
+  animationTimeInput.addEventListener("change", finishAnimationTimeEditing);
+  animationTimeInput.addEventListener("pointercancel", finishAnimationTimeEditing);
+  animationTimeInput.addEventListener("blur", finishAnimationTimeEditing);
+  window.addEventListener("pointerup", () => {
+    if (animationTimeEditing) {
+      finishAnimationTimeEditing();
+    }
+  });
   for (const input of [lightXInput, lightYInput, lightZInput, lightIntensityInput]) {
     input.addEventListener("change", () => {
       try {
@@ -883,17 +1104,34 @@ async function bootstrap() {
     }
   });
 
-  const readAndUploadObjFile = async (file, read = readObjFileBytes) => {
+  const readAndUploadAssetFile = async (
+    file,
+    { readObj = readObjFileBytes, readGlb = readGlbFileBytes, decodeGlb } = {},
+  ) => {
     const generation = ++meshLoadGeneration;
-    meshStatusText = `OBJ 읽는 중 · ${file.name}`;
+    const pendingId = renderer.glb_pending_id();
+    if (pendingId !== 0) {
+      renderer.cancel_glb(pendingId);
+    }
+    const glbByName = file.name.toLowerCase().endsWith(".glb");
+    meshStatusText = `${glbByName ? "GLB" : "OBJ"} 읽는 중 · ${file.name}`;
     updateStatus();
     try {
-      const bytes = await read(file);
+      const bytes = await (glbByName ? readGlb(file) : readObj(file));
       if (generation !== meshLoadGeneration) {
         bytes.fill(0);
         return false;
       }
-      const result = uploadObjBytes(bytes, file.name);
+      const result = glbByName || hasGlbMagic(bytes)
+          ? await uploadGlbBytes(bytes, file.name, {
+              isCurrent: () => generation === meshLoadGeneration,
+              decodeImage: decodeGlb,
+            })
+        : uploadObjBytes(bytes, file.name);
+      if (result.id === null && !result.stale) {
+        meshStatusText = `${glbByName ? "GLB" : "asset"} 로드 실패 · 기존 ${activeAssetKind} scene 유지`;
+        updateStatus();
+      }
       bytes.fill(0);
       return result.id !== null;
     } catch (error) {
@@ -901,7 +1139,7 @@ async function bootstrap() {
         return false;
       }
       const message = error instanceof Error ? error.message : String(error);
-      meshStatusText = `OBJ 로드 실패 · 기존 mesh ${renderer.active_mesh_id()} 유지`;
+      meshStatusText = `asset 로드 실패 · 기존 ${activeAssetKind} scene 유지`;
       errorOutput.textContent = message;
       updateStatus();
       return false;
@@ -914,7 +1152,7 @@ async function bootstrap() {
   meshFileInput.addEventListener("change", async () => {
     const [file] = meshFileInput.files;
     if (file !== undefined) {
-      await readAndUploadObjFile(file);
+      await readAndUploadAssetFile(file);
     }
   });
 
@@ -1077,6 +1315,31 @@ async function bootstrap() {
         renderer.mesh_source_max_z(),
       ],
       text: meshStatusText,
+    },
+    glbStatus: {
+      active: renderer.glb_active(),
+      pendingId: renderer.glb_pending_id(),
+      drawItems: renderer.glb_draw_items(),
+      nodes: renderer.glb_nodes(),
+      skins: renderer.glb_skins(),
+      joints: renderer.glb_joints(),
+      vertices: renderer.glb_vertices(),
+      triangles: renderer.glb_triangles(),
+      clips: renderer.glb_clip_count(),
+      samplerDowngrades: renderer.glb_sampler_downgrades(),
+      successes: renderer.glb_upload_successes(),
+      failures: renderer.glb_upload_failures(),
+      lastFailure: renderer.glb_last_failure(),
+      runtimeError: renderer.glb_runtime_error(),
+      text: glbStatusText,
+    },
+    animation: {
+      selectedClip: renderer.glb_selected_clip(),
+      selectedName: renderer.glb_clip_name(renderer.glb_selected_clip()),
+      timeSeconds: renderer.glb_animation_time(),
+      durationSeconds: renderer.glb_animation_duration(),
+      playing: renderer.glb_animation_playing(),
+      looping: renderer.glb_animation_looping(),
     },
     pixelHash: canvasPixelHash(context, renderer.width(), renderer.height()),
     stats: rendererStats(renderer),
@@ -1283,6 +1546,139 @@ async function bootstrap() {
           bytes.fill(0);
           return { ...result, snapshot: snapshot() };
         },
+        async loadBundledFox() {
+          try {
+            const result = await loadBundledFox();
+            return { ...result, snapshot: snapshot() };
+          } catch (error) {
+            return {
+              id: null,
+              error: error instanceof Error ? error.message : String(error),
+              snapshot: snapshot(),
+            };
+          }
+        },
+        async testBundledFoxFetchFailure() {
+          try {
+            await loadBundledFox({
+              fetchAsset: async () => new Response(null, { status: 503 }),
+            });
+            return { error: null, snapshot: snapshot() };
+          } catch (error) {
+            return {
+              error: error instanceof Error ? error.message : String(error),
+              snapshot: snapshot(),
+            };
+          }
+        },
+        async testBundledFoxDecodeFailure() {
+          const result = await loadBundledFox({
+            decodeImage: async () => {
+              throw new Error("injected Fox image decode failure");
+            },
+          });
+          return { ...result, snapshot: snapshot() };
+        },
+        async testLatestGlbSelectionWins() {
+          const response = await fetch(new URL("./assets/Fox.glb", import.meta.url));
+          if (!response.ok) {
+            throw new Error(`race fixture Fox.glb HTTP ${response.status}`);
+          }
+          const sourceBytes = new Uint8Array(await response.arrayBuffer());
+          const successesBeforeRace = renderer.glb_upload_successes();
+          let signalDecodeStarted;
+          const decodeStarted = new Promise((resolve) => {
+            signalDecodeStarted = resolve;
+          });
+          let releaseDecode;
+          const decodeGate = new Promise((resolve) => {
+            releaseDecode = resolve;
+          });
+          const first = readAndUploadAssetFile(new File([], "stale.glb"), {
+            readGlb: async () => sourceBytes.slice(),
+            decodeGlb: async (blob) => {
+              signalDecodeStarted();
+              await decodeGate;
+              return decodeImageFileToRgba(blob);
+            },
+          });
+          await decodeStarted;
+          const failuresBeforeCancel = renderer.glb_upload_failures();
+          const second = readAndUploadAssetFile(new File([], "latest.glb"), {
+            readGlb: async () => sourceBytes.slice(),
+          });
+          await second;
+          const afterSecond = snapshot();
+          releaseDecode();
+          await first;
+          sourceBytes.fill(0);
+          return {
+            successesBeforeRace,
+            failuresBeforeCancel,
+            afterSecond,
+            afterStale: snapshot(),
+          };
+        },
+        async uploadGlbBytes(byteValues, label = "automation.glb") {
+          const bytes = Uint8Array.from(byteValues);
+          try {
+            const result = await uploadGlbBytes(bytes, label);
+            return { ...result, snapshot: snapshot() };
+          } finally {
+            bytes.fill(0);
+          }
+        },
+        setGlbClip(index) {
+          renderer.set_glb_clip(index);
+          animationClipSelect.value = String(index);
+          renderFrame(0);
+          return snapshot();
+        },
+        setGlbAnimationPlaying(playing) {
+          renderer.set_glb_animation_playing(playing);
+          renderFrame(0);
+          return snapshot();
+        },
+        setGlbAnimationLooping(looping) {
+          renderer.set_glb_animation_looping(looping);
+          animationLoopCheckbox.checked = looping;
+          renderFrame(0);
+          return snapshot();
+        },
+        seekGlbAnimation(timeSeconds) {
+          renderer.seek_glb_animation(timeSeconds);
+          renderFrame(0);
+          return snapshot();
+        },
+        testGlbSeekControlFailure() {
+          const previousSeek = seekGlbAnimation;
+          animationTimeInput.focus();
+          animationTimeInput.value = String(renderer.glb_animation_duration());
+          seekGlbAnimation = () => {
+            throw new Error("injected animation seek failure");
+          };
+          try {
+            animationTimeInput.dispatchEvent(new Event("input"));
+            animationTimeInput.dispatchEvent(new Event("change"));
+          } finally {
+            seekGlbAnimation = previousSeek;
+          }
+          return {
+            inputValue: Number(animationTimeInput.value),
+            errorText: errorOutput.textContent,
+            snapshot: snapshot(),
+          };
+        },
+        validateGlbFileSize(size) {
+          try {
+            return { bytes: validateGlbFileSize(size), error: null };
+          } catch (error) {
+            return {
+              bytes: null,
+              error: error instanceof Error ? error.message : String(error),
+            };
+          }
+        },
         validateObjFileSize(size) {
           try {
             return { bytes: validateObjFileSize(size), error: null };
@@ -1321,13 +1717,13 @@ async function bootstrap() {
           const secondBytes = new Promise((resolve) => {
             resolveSecond = resolve;
           });
-          const first = readAndUploadObjFile(
+          const first = readAndUploadAssetFile(
             new File([], "first.obj", { type: "text/plain" }),
-            () => firstBytes,
+            { readObj: () => firstBytes },
           );
-          const second = readAndUploadObjFile(
+          const second = readAndUploadAssetFile(
             new File([], "second.obj", { type: "text/plain" }),
-            () => secondBytes,
+            { readObj: () => secondBytes },
           );
           resolveSecond(
             new TextEncoder().encode("v 0 0 0\nv 2 0 0\nv 0 2 0\nf 1 3 2\n"),
@@ -1425,10 +1821,37 @@ async function bootstrap() {
       });
       document.documentElement.dataset.ready = "true";
     } else {
+      document.documentElement.dataset.ready = "true";
       requestAnimationFrame(onAnimationFrame);
     }
   };
 
+  syncImportedMaterialControls();
+  syncAnimationControls();
+  if (__AUTOMATION__) {
+    glbStatusText = "test automation 시작 override · 내장 cube 유지";
+  } else {
+    const startupGeneration = ++meshLoadGeneration;
+    try {
+      const result = await loadBundledFox({
+        renderNow: false,
+        isCurrent: () => startupGeneration === meshLoadGeneration,
+      });
+      if (result.id === null && !result.stale) {
+        meshStatusText = "내장 Fox 실패 · 내장 cube fallback";
+        activeAssetKind = "cube";
+      }
+    } catch (error) {
+      if (startupGeneration === meshLoadGeneration) {
+        const message = error instanceof Error ? error.message : String(error);
+        activeAssetKind = "cube";
+        meshStatusText = "내장 Fox 실패 · 내장 cube fallback";
+        glbStatusText = "GLB startup 실패 · cube를 계속 렌더링합니다";
+        errorOutput.textContent = `${message} · 파일 선택에서 다른 .glb를 시도할 수 있습니다.`;
+        syncImportedMaterialControls();
+      }
+    }
+  }
   requestAnimationFrame(onAnimationFrame);
 }
 

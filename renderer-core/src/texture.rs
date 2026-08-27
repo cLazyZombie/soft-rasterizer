@@ -31,6 +31,7 @@ pub enum AddressMode {
     #[default]
     Repeat,
     ClampToEdge,
+    MirroredRepeat,
 }
 
 impl AddressMode {
@@ -38,6 +39,7 @@ impl AddressMode {
         match self {
             Self::Repeat => "repeat",
             Self::ClampToEdge => "clamp-to-edge",
+            Self::MirroredRepeat => "mirrored-repeat",
         }
     }
 }
@@ -389,6 +391,13 @@ impl Texture {
         self.levels.len()
     }
 
+    pub fn total_texels(&self) -> usize {
+        self.levels
+            .iter()
+            .map(|level| level.width * level.height)
+            .sum()
+    }
+
     pub fn mip_dimensions(&self, level: usize) -> Option<(usize, usize)> {
         self.level(level).map(|mip| (mip.width, mip.height))
     }
@@ -509,6 +518,25 @@ impl TextureStore {
         Ok(id)
     }
 
+    /// 이미 검증된 texture 묶음을 붙이기 전에 사용할 연속 ID를 계산한다.
+    /// 계산이 성공한 뒤 `append_validated`는 실패하지 않으므로 asset commit을
+    /// transaction처럼 구성할 수 있다.
+    pub fn planned_ids(&self, count: usize) -> Result<Vec<TextureId>, TextureError> {
+        (0..count)
+            .map(|offset| {
+                self.textures
+                    .len()
+                    .checked_add(offset)
+                    .ok_or(TextureError::TextureIdExhausted)
+                    .and_then(texture_id_for_len)
+            })
+            .collect()
+    }
+
+    pub fn append_validated(&mut self, textures: Vec<Texture>) {
+        self.textures.extend(textures);
+    }
+
     pub fn get(&self, id: TextureId) -> Result<&Texture, TextureError> {
         self.textures
             .get(id.0 as usize)
@@ -537,7 +565,7 @@ fn checked_texture_byte_len(width: usize, height: usize) -> Result<usize, Textur
             maximum: MAX_TEXTURE_PIXEL_COUNT,
         });
     }
-    let mip_texel_count = checked_mip_texel_count(width, height)?;
+    let mip_texel_count = mip_texel_count_for_dimensions(width, height)?;
     if mip_texel_count > MAX_TEXTURE_PIXEL_COUNT {
         return Err(TextureError::PixelLimitExceeded {
             requested: mip_texel_count,
@@ -549,7 +577,13 @@ fn checked_texture_byte_len(width: usize, height: usize) -> Result<usize, Textur
         .ok_or(TextureError::DimensionOverflow)
 }
 
-fn checked_mip_texel_count(mut width: usize, mut height: usize) -> Result<usize, TextureError> {
+pub fn mip_texel_count_for_dimensions(
+    mut width: usize,
+    mut height: usize,
+) -> Result<usize, TextureError> {
+    if width == 0 || height == 0 {
+        return Err(TextureError::ZeroDimension);
+    }
     let mut total = 0_usize;
     loop {
         total = total
@@ -577,6 +611,10 @@ fn address_normalized(value: f32, mode: AddressMode) -> f32 {
     match mode {
         AddressMode::Repeat => value - value.floor(),
         AddressMode::ClampToEdge => value.clamp(0.0, 1.0),
+        AddressMode::MirroredRepeat => {
+            let period = value.rem_euclid(2.0);
+            if period <= 1.0 { period } else { 2.0 - period }
+        }
     }
 }
 
@@ -585,6 +623,14 @@ fn address_texel(index: i64, extent: usize, mode: AddressMode) -> usize {
     match mode {
         AddressMode::Repeat => index.rem_euclid(extent) as usize,
         AddressMode::ClampToEdge => index.clamp(0, extent - 1) as usize,
+        AddressMode::MirroredRepeat => {
+            let mirrored = index.rem_euclid(2 * extent);
+            if mirrored < extent {
+                mirrored as usize
+            } else {
+                (2 * extent - 1 - mirrored) as usize
+            }
+        }
     }
 }
 
@@ -920,6 +966,7 @@ mod tests {
     fn chapter_twenty_three_mip_chain_reaches_one_by_one_and_handles_odd_extents() {
         let texture = Texture::from_rgba8(4, 4, &[64; 64], TextureColorSpace::Linear).unwrap();
         assert_eq!(texture.mip_level_count(), 3);
+        assert_eq!(texture.total_texels(), 21);
         assert_eq!(texture.mip_dimensions(0), Some((4, 4)));
         assert_eq!(texture.mip_dimensions(1), Some((2, 2)));
         assert_eq!(texture.mip_dimensions(2), Some((1, 1)));
@@ -995,5 +1042,47 @@ mod tests {
             vec4_to_rgba8(Vec4::new(f32::NAN, f32::INFINITY, -f32::INFINITY, 0.5,)),
             [0, 0, 0, 128]
         );
+    }
+
+    #[test]
+    fn chapter_twenty_six_mirrored_repeat_and_transactional_ids_are_deterministic() {
+        let texture = Texture::from_rgba8(
+            2,
+            1,
+            &[255, 0, 0, 255, 0, 0, 255, 255],
+            TextureColorSpace::Linear,
+        )
+        .unwrap();
+        let sampler = SamplerState {
+            address_u: AddressMode::MirroredRepeat,
+            address_v: AddressMode::MirroredRepeat,
+            filter: FilterMode::Nearest,
+        };
+        assert_eq!(
+            sampler.sample(&texture, Vec2::new(0.25, 0.0)).unwrap(),
+            Vec4::new(1.0, 0.0, 0.0, 1.0)
+        );
+        assert_eq!(
+            sampler.sample(&texture, Vec2::new(1.25, 0.0)).unwrap(),
+            Vec4::new(0.0, 0.0, 1.0, 1.0)
+        );
+        assert_eq!(
+            sampler.sample(&texture, Vec2::new(-0.25, 0.0)).unwrap(),
+            Vec4::new(1.0, 0.0, 0.0, 1.0)
+        );
+        let bilinear = SamplerState {
+            filter: FilterMode::Bilinear,
+            ..sampler
+        };
+        assert!(bilinear.sample(&texture, Vec2::new(1.0, 0.0)).is_some());
+        assert_eq!(AddressMode::MirroredRepeat.label(), "mirrored-repeat");
+
+        let mut store = TextureStore::new();
+        assert_eq!(
+            store.planned_ids(2).unwrap(),
+            vec![TextureId(1), TextureId(2)]
+        );
+        store.append_validated(vec![texture.clone(), texture]);
+        assert_eq!(store.len(), 3);
     }
 }

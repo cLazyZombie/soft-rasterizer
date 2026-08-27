@@ -2,7 +2,7 @@
 
 WebGL이나 WebGPU에 픽셀 생성을 맡기지 않고, Rust/WebAssembly가 만든 RGBA8 프레임버퍼를 Canvas 2D로 표시하는 소프트웨어 래스터라이저 프로젝트입니다.
 
-현재 저장소는 25장짜리 구현 교재와 확정된 렌더링 계약을 모두 구현합니다. Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ import, 투명도 queue, 2x SSAA, mipmap, 단계별 진단과 scalar/tiled reference를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
+현재 저장소는 26장짜리 구현 교재와 확정된 렌더링 계약을 모두 구현합니다. Rust가 소유한 RGBA8/깊이 버퍼와 수학 계층에 열벡터 MVP, LH/+Z 카메라, indexed mesh, homogeneous clipping, 고정소수점 coverage, strict 깊이, perspective-correct texture/lighting, Orbit/Fly 입력, OBJ/GLB import, node animation과 skinning, 투명도 queue, 2x SSAA, mipmap, 단계별 진단과 scalar/tiled reference를 조립했습니다. `PipelineState`의 모든 debug view와 외부 mesh는 같은 Rust coverage/depth 경로를 사용하고 Canvas 2D는 완성된 논리 해상도 framebuffer만 표시합니다.
 
 ## 실행 방법
 
@@ -43,6 +43,7 @@ pnpm exec vite preview --config vite.config.js
 
 ```bash
 pnpm run format:check
+pnpm run check:assets
 pnpm run check
 pnpm run lint
 pnpm run test
@@ -63,6 +64,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - [전체 과정 소개와 목차](doc/00-들어가며.md)
 - [좌표·카메라·깊이 결정](doc/decisions/coordinates.md)
 - [최종 Capstone 구현과 성능 보고서](doc/capstone-report.md)
+- [GLB runtime loading 구현 가이드](doc/glb-runtime-loading.md)
 - [코딩 에이전트와 장별로 일하는 방법](doc/appendix-a-코딩-에이전트와-장별로-일하는-방법.md)
 - [최소 공개 계약과 데이터 구조](doc/appendix-b-최소-공개-계약과-데이터-구조.md)
 - [수학과 알고리즘 빠른 참조](doc/appendix-c-수학과-알고리즘-빠른-참조.md)
@@ -121,6 +123,14 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - `capstone_tiled` E2E는 960×540, cull none, fixed `dt=0`에서 scalar/tiled/fallback exact pixel hash와 단계 count를 비교하고 각 경로를 warm-up 30/표본 120 frame으로 측정한다.
 - 현재 측정은 반복·교차 순서나 단계별 timing으로 재현 가능한 speedup을 입증하지 않으므로 Scalar가 기본이다. worker, SIMD와 frame-wide tile bin은 후속 범위이며 자세한 측정 계약과 한계는 [최종 Capstone 보고서](doc/capstone-report.md)에 기록했다.
 
+## 26장 GLB scene과 animation 기준선
+
+- `gltf` crate가 GLB 2.0의 scene/node/mesh/material/skin/animation을 Rust에서 검증한다. JSON `.gltf`, 외부 buffer/image URI와 morph target은 범위 밖이다.
+- embedded PNG/JPEG는 브라우저가 RGBA8로 decode한다. prepare/image supply/commit generation을 나누어 실패하거나 stale인 upload가 기존 장면을 파괴하지 않게 한다.
+- glTF 오른손 좌표는 importer에서 X reflection, winding swap, `C*M*C`와 quaternion 부호 변환으로 내부 LH/+Z 규약에 맞춘다.
+- STEP/LINEAR/CUBICSPLINE node TRS와 4-weight linear blend skinning을 frame마다 평가한다. material별 base color, sampler, double-sided, alpha와 `KHR_materials_unlit`을 기존 pipeline에 연결한다.
+- 제품 시작 장면은 attribution과 SHA-256을 고정한 animated Fox GLB다. test automation build는 1–25장 golden을 위해 cube로 시작하고 26장 scenario가 Fox를 명시적으로 로드한다.
+
 ## 교재
 
 ### 1부 · 픽셀, 메모리, 최소 수학
@@ -162,6 +172,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 23. [Antialiasing과 Mipmap](doc/23-antialiasing과-mipmap.md)
 24. [디버그 뷰, 테스트, 프로파일링](doc/24-디버그-뷰-테스트-프로파일링.md)
 25. [타일링, Worker, SIMD와 최종 Capstone](doc/25-타일링-worker-simd와-최종-capstone.md)
+26. [GLB 장면, Skinning과 Animation](doc/26-glb-장면-skinning-animation.md)
 
 ## 부록과 원본
 
@@ -171,7 +182,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - [부록 D · 화면 증상으로 찾는 오류 단계](doc/appendix-d-화면-증상으로-찾는-오류-단계.md)
 - [부록 E · 최종 Capstone 평가표](doc/appendix-e-최종-capstone-평가표.md)
 - [부록 F · 공식 참고자료](doc/appendix-f-공식-참고자료.md)
-- [교재 원본 DOCX](doc/software_rasterizer_curriculum_ko.docx)
+- [1–25장 교재 원본 DOCX](doc/software_rasterizer_curriculum_ko.docx) — 26장은 위 Markdown 장과 runtime guide로 추가했습니다.
 
 ## 권장 구현 구조
 

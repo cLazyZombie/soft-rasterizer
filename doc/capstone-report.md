@@ -46,4 +46,4 @@ pnpm run e2e
 - 현재 tiled 구현은 triangle-local tile traversal이며 frame 전체 triangle ID bin을 만들지 않는다.
 - SharedArrayBuffer/Wasm threads, dedicated rendering Worker와 SIMD path는 없다.
 - 실제 병렬 경로를 추가할 때는 shared-memory build와 COOP/COEP startup gate, worker 수별 opaque exact image, scalar fallback, tile 독점 write 증거가 먼저 필요하다.
-- 외부 모델은 21장에 명시한 OBJ subset이고 glTF runtime parser, OIT, MSAA와 trilinear filtering은 구현 범위 밖이다.
+- 25장 baseline 당시 외부 모델은 21장의 OBJ subset이었다. 26장에서 GLB scene/node/material/TRS animation과 skinning을 추가했지만 morph target, PBR, OIT, MSAA와 진짜 trilinear filtering은 여전히 구현 범위 밖이다.

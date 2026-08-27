@@ -47,5 +47,6 @@
 - 11장 전에는 texture/lighting을 구현하지 않는다. 단색 또는 barycentric 색이 기준이다.
 - 15장의 scalar 컬러 큐브가 golden을 통과하기 전 worker/SIMD를 추가하지 않는다.
 - 외부 asset parser가 생겨도 core 테스트가 파일/DOM에 의존하지 않게 한다.
+- 26장 GLB parser는 binary scene/material/TRS animation/skinning까지만 다룬다. morph/PBR/cross-fade를 편의상 함께 구현하지 않고 embedded image decode는 브라우저 장치 계층에 남긴다.
 - 성능 때문에 unsafe를 제안하면 먼저 safe reference와 pixel diff, 범위 proof를 요구한다.
 - 좌표 규약을 바꾸는 refactor는 결정 문서, 수학 테스트, 모든 golden을 한 작업에서 갱신해야 한다.

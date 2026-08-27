@@ -369,6 +369,198 @@ impl Renderer {
         }
     }
 
+    pub fn prepare_glb(&mut self, bytes: &[u8]) -> Result<u32, String> {
+        match self.core.prepare_glb(bytes) {
+            Ok(id) => {
+                self.last_error.clear();
+                Ok(id)
+            }
+            Err(error) => {
+                self.last_error = error.to_string();
+                Err(self.last_error.clone())
+            }
+        }
+    }
+
+    pub fn pending_glb_image_count(&self, id: u32) -> Result<u32, String> {
+        self.core
+            .pending_glb_image_count(id)
+            .map(|count| count as u32)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn pending_glb_image_mime(&self, id: u32, image_index: u32) -> Result<String, String> {
+        self.core
+            .pending_glb_image_mime(id, image_index as usize)
+            .map(str::to_owned)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn pending_glb_image_bytes(&self, id: u32, image_index: u32) -> Result<Vec<u8>, String> {
+        self.core
+            .pending_glb_image_bytes(id, image_index as usize)
+            .map(<[u8]>::to_vec)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn supply_glb_image_rgba(
+        &mut self,
+        id: u32,
+        image_index: u32,
+        width: u32,
+        height: u32,
+        pixels: &[u8],
+    ) -> Result<(), String> {
+        self.core
+            .supply_glb_image_rgba8(
+                id,
+                image_index as usize,
+                width as usize,
+                height as usize,
+                pixels,
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn commit_glb(&mut self, id: u32) -> Result<(), String> {
+        match self.core.commit_glb(id) {
+            Ok(()) => {
+                self.last_error.clear();
+                Ok(())
+            }
+            Err(error) => {
+                self.last_error = error.to_string();
+                Err(self.last_error.clone())
+            }
+        }
+    }
+
+    pub fn cancel_glb(&mut self, id: u32) -> Result<(), String> {
+        self.core.cancel_glb(id).map_err(|error| error.to_string())
+    }
+
+    pub fn fail_glb(&mut self, id: u32, reason: &str) -> Result<(), String> {
+        self.core
+            .fail_glb(id, reason)
+            .map_err(|error| error.to_string())
+    }
+
+    pub fn glb_active(&self) -> bool {
+        self.core.glb_asset_status().active
+    }
+    pub fn glb_pending_id(&self) -> u32 {
+        self.core.glb_asset_status().pending_id.unwrap_or(0)
+    }
+    pub fn glb_upload_successes(&self) -> u32 {
+        self.core.glb_asset_status().successful_uploads
+    }
+    pub fn glb_upload_failures(&self) -> u32 {
+        self.core.glb_asset_status().failed_uploads
+    }
+    pub fn glb_last_failure(&self) -> String {
+        self.core
+            .glb_asset_status()
+            .last_failure
+            .unwrap_or_default()
+            .to_owned()
+    }
+    pub fn glb_runtime_error(&self) -> String {
+        self.core
+            .glb_asset_status()
+            .runtime_error
+            .unwrap_or_default()
+            .to_owned()
+    }
+    pub fn glb_draw_items(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.draw_items as u32)
+    }
+    pub fn glb_nodes(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.nodes as u32)
+    }
+    pub fn glb_skins(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.skins as u32)
+    }
+    pub fn glb_joints(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.joints as u32)
+    }
+    pub fn glb_vertices(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.vertices as u32)
+    }
+    pub fn glb_triangles(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.triangles as u32)
+    }
+    pub fn glb_sampler_downgrades(&self) -> u32 {
+        self.core
+            .glb_asset_status()
+            .scene
+            .map_or(0, |stats| stats.sampler_downgrades as u32)
+    }
+
+    pub fn glb_clip_count(&self) -> u32 {
+        self.core.glb_clip_count() as u32
+    }
+    pub fn glb_clip_name(&self, index: u32) -> String {
+        self.core
+            .glb_clip_name(index as usize)
+            .unwrap_or("")
+            .to_owned()
+    }
+    pub fn glb_selected_clip(&self) -> u32 {
+        self.core
+            .glb_selected_clip()
+            .map_or(u32::MAX, |index| index as u32)
+    }
+    pub fn set_glb_clip(&mut self, index: u32) -> Result<(), String> {
+        self.core
+            .set_glb_clip(index as usize)
+            .map_err(|error| error.to_string())
+    }
+    pub fn glb_animation_time(&self) -> f32 {
+        self.core.glb_animation_time()
+    }
+    pub fn glb_animation_duration(&self) -> f32 {
+        self.core.glb_animation_duration()
+    }
+    pub fn glb_animation_playing(&self) -> bool {
+        self.core.glb_animation_playing()
+    }
+    pub fn glb_animation_looping(&self) -> bool {
+        self.core.glb_animation_looping()
+    }
+    pub fn set_glb_animation_playing(&mut self, playing: bool) -> Result<(), String> {
+        self.core
+            .set_glb_animation_playing(playing)
+            .map_err(|error| error.to_string())
+    }
+    pub fn set_glb_animation_looping(&mut self, looping: bool) -> Result<(), String> {
+        self.core
+            .set_glb_animation_looping(looping)
+            .map_err(|error| error.to_string())
+    }
+    pub fn seek_glb_animation(&mut self, time_seconds: f32) -> Result<(), String> {
+        self.core
+            .seek_glb_animation(time_seconds)
+            .map_err(|error| error.to_string())
+    }
+
     pub fn set_active_texture(&mut self, id: u32) -> Result<(), String> {
         self.core
             .set_active_texture(TextureId(id))
@@ -425,6 +617,7 @@ impl Renderer {
         let address = |value| match value {
             0 => Ok(AddressMode::Repeat),
             1 => Ok(AddressMode::ClampToEdge),
+            2 => Ok(AddressMode::MirroredRepeat),
             _ => Err(format!("알 수 없는 texture address mode입니다: {value}")),
         };
         self.core.set_sampler_state(SamplerState {
@@ -446,6 +639,7 @@ impl Renderer {
         match self.core.sampler_state().address_u {
             AddressMode::Repeat => 0,
             AddressMode::ClampToEdge => 1,
+            AddressMode::MirroredRepeat => 2,
         }
     }
 
@@ -453,6 +647,7 @@ impl Renderer {
         match self.core.sampler_state().address_v {
             AddressMode::Repeat => 0,
             AddressMode::ClampToEdge => 1,
+            AddressMode::MirroredRepeat => 2,
         }
     }
 
@@ -907,6 +1102,22 @@ impl Renderer {
     pub fn stats_tile_counter_overflow(&self) -> bool {
         self.stats().tile_counter_overflow
     }
+
+    pub fn stats_scene_draw_items(&self) -> u32 {
+        self.stats().scene_draw_items
+    }
+    pub fn stats_animated_nodes(&self) -> u32 {
+        self.stats().animated_nodes
+    }
+    pub fn stats_skinned_vertices(&self) -> u32 {
+        self.stats().skinned_vertices
+    }
+    pub fn stats_joint_matrices(&self) -> u32 {
+        self.stats().joint_matrices
+    }
+    pub fn stats_sampler_downgrades(&self) -> u32 {
+        self.stats().sampler_downgrades
+    }
 }
 
 const fn invalid_interpolation_samples(stats: FrameStats) -> u32 {
@@ -953,7 +1164,15 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
         },
     );
     let attributes = snapshot.selected_attributes;
-    let pipeline = if snapshot.transparency_debug_enabled {
+    let pipeline = if snapshot.glb_active {
+        format!(
+            "glTF RH 입력 → LH/+Z 변환 · GLB scene camera · fov {:.1}° · near {:.3} · far {:.1} · aspect {:.3}",
+            snapshot.fov_y_radians.to_degrees(),
+            snapshot.near,
+            snapshot.far,
+            snapshot.aspect
+        )
+    } else if snapshot.transparency_debug_enabled {
         format!(
             "opaque → cutout → transparent queue · identity M/V/P · viewport aspect {:.3}",
             snapshot.aspect
@@ -992,7 +1211,9 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
             snapshot.aspect
         )
     };
-    let scene_name = if snapshot.transparency_debug_enabled {
+    let scene_name = if snapshot.glb_active {
+        "GLB first draw primitive"
+    } else if snapshot.transparency_debug_enabled {
         "intersecting transparent quad mesh"
     } else if snapshot.depth_debug_enabled {
         "near/far overlap triangle mesh"
@@ -1149,6 +1370,77 @@ fn format_coordinate_debug(snapshot: CoordinateDebugSnapshot) -> String {
 mod tests {
     use super::*;
     use renderer_core::MAX_PIXEL_COUNT;
+
+    fn adapter_glb_fixture() -> Vec<u8> {
+        let mut binary = Vec::new();
+        for value in [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0] {
+            binary.extend_from_slice(&value.to_le_bytes());
+        }
+        let indices_offset = binary.len();
+        for value in [0u16, 1, 2] {
+            binary.extend_from_slice(&value.to_le_bytes());
+        }
+        while !binary.len().is_multiple_of(4) {
+            binary.push(0);
+        }
+        let image_offset = binary.len();
+        binary.extend_from_slice(&[0x89, b'P', b'N', b'G']);
+        let times_offset = binary.len();
+        for value in [0.0f32, 1.0] {
+            binary.extend_from_slice(&value.to_le_bytes());
+        }
+        let translations_offset = binary.len();
+        for value in [0.0f32, 0.0, 0.0, 0.0, 0.25, 0.0] {
+            binary.extend_from_slice(&value.to_le_bytes());
+        }
+        binary.push(0);
+        let byte_length = binary.len();
+        let json = format!(
+            r#"{{
+          "asset":{{"version":"2.0"}},"scene":0,
+          "scenes":[{{"nodes":[0]}}],"nodes":[{{"mesh":0}}],
+          "buffers":[{{"byteLength":{byte_length}}}],
+          "bufferViews":[
+            {{"buffer":0,"byteOffset":0,"byteLength":36}},
+            {{"buffer":0,"byteOffset":{indices_offset},"byteLength":6}},
+            {{"buffer":0,"byteOffset":{image_offset},"byteLength":4}},
+            {{"buffer":0,"byteOffset":{times_offset},"byteLength":8}},
+            {{"buffer":0,"byteOffset":{translations_offset},"byteLength":24}}
+          ],
+          "accessors":[
+            {{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[0,0,0],"max":[1,1,0]}},
+            {{"bufferView":1,"componentType":5123,"count":3,"type":"SCALAR"}},
+            {{"bufferView":3,"componentType":5126,"count":2,"type":"SCALAR","min":[0],"max":[1]}},
+            {{"bufferView":4,"componentType":5126,"count":2,"type":"VEC3"}}
+          ],
+          "images":[{{"bufferView":2,"mimeType":"image/png"}}],
+          "textures":[{{"source":0}}],
+          "materials":[{{"pbrMetallicRoughness":{{"baseColorTexture":{{"index":0}}}}}}],
+          "meshes":[{{"primitives":[{{"attributes":{{"POSITION":0}},"indices":1,"material":0}}]}}],
+          "animations":[{{"name":"Move","samplers":[{{"input":2,"output":3}}],
+            "channels":[{{"sampler":0,"target":{{"node":0,"path":"translation"}}}}]}}]
+        }}"#
+        );
+        let mut json = json.into_bytes();
+        while !json.len().is_multiple_of(4) {
+            json.push(b' ');
+        }
+        while !binary.len().is_multiple_of(4) {
+            binary.push(0);
+        }
+        let total = 12 + 8 + json.len() + 8 + binary.len();
+        let mut output = Vec::with_capacity(total);
+        output.extend_from_slice(b"glTF");
+        output.extend_from_slice(&2u32.to_le_bytes());
+        output.extend_from_slice(&(total as u32).to_le_bytes());
+        output.extend_from_slice(&(json.len() as u32).to_le_bytes());
+        output.extend_from_slice(&0x4e4f534au32.to_le_bytes());
+        output.extend_from_slice(&json);
+        output.extend_from_slice(&(binary.len() as u32).to_le_bytes());
+        output.extend_from_slice(&0x004e4942u32.to_le_bytes());
+        output.extend_from_slice(&binary);
+        output
+    }
 
     #[test]
     fn invalid_interpolation_counter_mapping_preserves_nonzero_values() {
@@ -1674,16 +1966,19 @@ mod tests {
         );
         assert!(
             renderer
-                .set_sampler_state(0, 2, 0)
+                .set_sampler_state(0, 3, 0)
                 .unwrap_err()
                 .contains("address")
         );
         assert!(
             renderer
-                .set_sampler_state(0, 0, 2)
+                .set_sampler_state(0, 0, 3)
                 .unwrap_err()
                 .contains("address")
         );
+        renderer.set_sampler_state(0, 2, 2).unwrap();
+        assert_eq!(renderer.sampler_address_u(), 2);
+        assert_eq!(renderer.sampler_address_v(), 2);
         renderer.set_sampler_state(0, 0, 1).unwrap();
         assert_eq!(renderer.sampler_filter_mode(), 0);
         assert_eq!(renderer.sampler_address_u(), 0);
@@ -2039,5 +2334,92 @@ mod tests {
         assert_eq!(renderer.raster_path(), 1);
         renderer.set_raster_path(0).unwrap();
         assert_eq!(renderer.raster_path(), 0);
+    }
+
+    #[test]
+    fn adapter_stages_chapter_twenty_six_glb_images_scene_and_animation() {
+        let mut renderer = Renderer::new(64, 48).unwrap();
+        assert!(!renderer.glb_active());
+        assert_eq!(renderer.glb_pending_id(), 0);
+        assert!(
+            renderer
+                .prepare_glb(b"broken")
+                .unwrap_err()
+                .contains("header")
+        );
+        assert_eq!(renderer.glb_upload_failures(), 1);
+
+        let pending = renderer.prepare_glb(&adapter_glb_fixture()).unwrap();
+        assert_eq!(renderer.glb_pending_id(), pending);
+        assert_eq!(renderer.pending_glb_image_count(pending), Ok(1));
+        assert_eq!(
+            renderer.pending_glb_image_mime(pending, 0),
+            Ok("image/png".into())
+        );
+        assert_eq!(
+            renderer.pending_glb_image_bytes(pending, 0),
+            Ok(vec![0x89, b'P', b'N', b'G'])
+        );
+        assert!(
+            renderer
+                .pending_glb_image_count(pending + 1)
+                .unwrap_err()
+                .contains("stale")
+        );
+        assert!(renderer.commit_glb(pending).unwrap_err().contains("decode"));
+        renderer
+            .supply_glb_image_rgba(pending, 0, 1, 1, &[220, 140, 70, 255])
+            .unwrap();
+        renderer.commit_glb(pending).unwrap();
+        assert!(renderer.glb_active());
+        assert_eq!(renderer.glb_pending_id(), 0);
+        assert_eq!(renderer.glb_upload_successes(), 1);
+        assert_eq!(renderer.glb_last_failure(), "");
+        assert_eq!(renderer.glb_runtime_error(), "");
+        assert_eq!(renderer.glb_draw_items(), 1);
+        assert_eq!(renderer.glb_nodes(), 1);
+        assert_eq!(renderer.glb_skins(), 0);
+        assert_eq!(renderer.glb_joints(), 0);
+        assert_eq!(renderer.glb_vertices(), 3);
+        assert_eq!(renderer.glb_triangles(), 1);
+        assert_eq!(renderer.glb_sampler_downgrades(), 0);
+        assert_eq!(renderer.glb_clip_count(), 1);
+        assert_eq!(renderer.glb_clip_name(0), "Move");
+        assert_eq!(renderer.glb_clip_name(9), "");
+        assert_eq!(renderer.glb_selected_clip(), 0);
+        renderer.set_glb_clip(0).unwrap();
+        renderer.set_glb_animation_looping(false).unwrap();
+        renderer.seek_glb_animation(0.75).unwrap();
+        assert_eq!(renderer.glb_animation_time(), 0.75);
+        assert_eq!(renderer.glb_animation_duration(), 1.0);
+        assert!(renderer.glb_animation_playing());
+        assert!(!renderer.glb_animation_looping());
+        renderer.set_glb_animation_playing(false).unwrap();
+        assert!(!renderer.glb_animation_playing());
+        renderer.update_and_render(0.0, 0);
+        assert_eq!(renderer.stats_scene_draw_items(), 1);
+        assert_eq!(renderer.stats_animated_nodes(), 1);
+        assert_eq!(renderer.stats_skinned_vertices(), 0);
+        assert_eq!(renderer.stats_joint_matrices(), 0);
+        assert_eq!(renderer.stats_sampler_downgrades(), 0);
+        assert!(
+            renderer
+                .coordinate_debug_text()
+                .contains("GLB first draw primitive · vertices 3 · indices 3 · triangles 1")
+        );
+
+        let cancelled = renderer.prepare_glb(&adapter_glb_fixture()).unwrap();
+        renderer.cancel_glb(cancelled).unwrap();
+        assert!(
+            renderer
+                .cancel_glb(cancelled)
+                .unwrap_err()
+                .contains("stale")
+        );
+        let failed = renderer.prepare_glb(&adapter_glb_fixture()).unwrap();
+        renderer.fail_glb(failed, "image decode failed").unwrap();
+        assert_eq!(renderer.glb_upload_failures(), 2);
+        assert_eq!(renderer.glb_last_failure(), "image decode failed");
+        assert!(renderer.fail_glb(failed, "stale").is_err());
     }
 }

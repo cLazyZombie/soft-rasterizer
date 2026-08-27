@@ -100,6 +100,8 @@ Fly에서 W/S는 `+forward/-forward`, D/A는 `+right/-right`다. 양의 pointer 
 - glTF는 오른손 `+Y` up, `+Z` forward, `-X` right다. 내부 축 의미를 보존하는 변환은 `C=diag(-1,1,1,1)`이다.
 - glTF position/normal/morph delta에는 C를, node/skin 행렬에는 `C*M*C`를 적용한다. triangle list는 `(i0,i1,i2)->(i0,i2,i1)`로 winding을 뒤집는다.
 - tangent는 `(C3*tangent.xyz,-tangent.w)`로 변환한다. animation rotation은 변환한 행렬이 `C*R*C`와 같은지 검증한다.
+- node TRS quaternion은 `(x,-y,-z,w)`로 변환하고 local matrix를 `T*R*S`로 만든다. LINEAR rotation은 최단 경로 slerp, CUBICSPLINE rotation은 component Hermite 뒤 normalize를 사용한다.
+- node global은 `parent_global * local`이다. skin joint palette는 `joint_global * inverse_bind_lh`이며 skinned mesh node transform은 glTF 규약에 따라 vertex에 다시 곱하지 않는다.
 - UV는 좌표 handedness 때문에 뒤집지 않는다. glTF camera를 지원하면 source eye/forward/up을 world에서 C로 변환한 뒤 내부 `look_at_lh`를 만든다.
 
 ## 필수 fixture

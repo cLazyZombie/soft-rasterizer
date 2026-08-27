@@ -77,6 +77,8 @@ JS는 File/drag-and-drop, 파일명, bytes 획득과 오류 UI를 맡는다. Rus
 - load progress와 parse 오류를 JS UI에 표시하고 기존 scene을 오류 상태로 덮어쓰지 않는다.
 - glTF는 별도 milestone로 두고 Khronos glTF 2.0 규약을 따르는 parser/library를 선택하되 전체 spec 수제 구현을 기본 과제로 만들지 않는다. 지원하는 mesh/node/animation/camera 범위마다 X reflection과 winding 보정을 한 adapter에 모은다.
 
+이 milestone의 실제 GLB 2.0 범위와 staged image/scene commit은 [26장 GLB 장면, Skinning과 Animation](26-glb-장면-skinning-animation.md)에서 구현한다.
+
 ## 검증 기준
 
 - 동일 position에 서로 다른 UV가 있는 face가 internal vertex를 분리해 texture seam을 보존해야 한다.

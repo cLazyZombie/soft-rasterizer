@@ -1,12 +1,14 @@
 //! Browser APIs에 의존하지 않는 소프트웨어 래스터라이저의 순수 Rust 코어.
 //!
-//! 25장까지 homogeneous clipping 뒤 scalar/tiled mesh pipeline, linear texture/mipmap
-//! sampling, Blinn-Phong 조명, OBJ, alpha queue와 2x SSAA resolve를 조립한다.
+//! 26장까지 homogeneous clipping 뒤 scalar/tiled mesh pipeline, linear texture/mipmap
+//! sampling, Blinn-Phong 조명, OBJ/GLB, node animation/skinning, alpha queue와 2x SSAA
+//! resolve를 조립한다.
 
 pub mod camera;
 pub mod camera_control;
 pub mod clip;
 pub mod color;
+pub mod glb;
 pub mod import;
 pub mod math;
 pub mod mesh;
@@ -23,6 +25,7 @@ use camera::{
 use camera_control::{CameraControlInput, CameraController, CameraMode};
 use clip::{ClipPlane, ClipStatus, TriangleClipper};
 use color::{srgb_decode_channel, srgb_decode_rgba, srgb_encode_rgba};
+use glb::{GlbAsset, GlbImportError, GlbScene, GlbSceneStats, import_glb};
 use import::{MeshBounds, ObjImportError, import_obj};
 use math::{Mat4, Vec2, Vec3, Vec4};
 use mesh::{ClipVertex, DrawItem, MaterialId, Mesh, MeshId, unit_cube_mesh};
@@ -33,7 +36,7 @@ use raster::{
 };
 use texture::{
     AlphaMode, Material, NormalMode, SamplerState, ShaderMode, Texture, TextureColorSpace,
-    TextureError, TextureId, TextureStore,
+    TextureError, TextureId, TextureStore, mip_texel_count_for_dimensions,
 };
 #[cfg(test)]
 use transform::CoordinateSpace;
@@ -44,7 +47,30 @@ use transform::{
 
 /// 4096 × 4096 RGBA8와 깊이 버퍼까지만 허용한다.
 pub const MAX_PIXEL_COUNT: usize = 16_777_216;
+pub const MAX_GLB_TEXTURE_TEXELS: usize = 16_777_216;
 pub const DEPTH_RANGE_EPSILON: f32 = 1.0e-6;
+
+fn checked_glb_texture_total(
+    current: usize,
+    replaced: usize,
+    incoming: usize,
+) -> Result<usize, GlbImportError> {
+    let total = current
+        .checked_sub(replaced)
+        .and_then(|remaining| remaining.checked_add(incoming))
+        .ok_or(GlbImportError::LimitExceeded {
+            kind: "decoded texture texel",
+            max: MAX_GLB_TEXTURE_TEXELS,
+        })?;
+    if total > MAX_GLB_TEXTURE_TEXELS {
+        Err(GlbImportError::LimitExceeded {
+            kind: "decoded texture texel",
+            max: MAX_GLB_TEXTURE_TEXELS,
+        })
+    } else {
+        Ok(total)
+    }
+}
 const MAX_FRAME_DT_SECONDS: f32 = 0.1;
 const MODEL_ANGULAR_SPEED_RADIANS: f32 = 0.75;
 const CUBE_SELECTED_VERTEX_INDEX: usize = 6;
@@ -620,6 +646,11 @@ pub struct FrameStats {
     pub tiled_rasterized_triangles: u32,
     pub tile_visits: u32,
     pub tile_counter_overflow: bool,
+    pub scene_draw_items: u32,
+    pub animated_nodes: u32,
+    pub skinned_vertices: u32,
+    pub joint_matrices: u32,
+    pub sampler_downgrades: u32,
 }
 
 impl FrameStats {
@@ -789,6 +820,24 @@ pub struct MeshAssetStatus {
     pub successful_uploads: u32,
     pub failed_uploads: u32,
     pub source_bounds: MeshBounds,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct GlbAssetStatus<'a> {
+    pub active: bool,
+    pub pending_id: Option<u32>,
+    pub successful_uploads: u32,
+    pub failed_uploads: u32,
+    pub last_failure: Option<&'a str>,
+    pub runtime_error: Option<&'a str>,
+    pub scene: Option<GlbSceneStats>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PendingGlbUpload {
+    id: u32,
+    asset: GlbAsset,
+    decoded_images: Vec<Option<Texture>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -1038,6 +1087,28 @@ impl MeshScene {
         self.rebuild_with_pipeline(mesh, pipeline, width, height);
     }
 
+    fn rebuild_vertices_with_camera(
+        &mut self,
+        vertices: &[mesh::Vertex],
+        eye: Vec3,
+        target: Vec3,
+        width: usize,
+        height: usize,
+    ) {
+        self.camera_world = eye;
+        let aspect = width as f32 / height as f32;
+        let view = look_at_lh(eye, target, CAMERA_WORLD_UP)
+            .expect("GLB camera view 계약은 항상 유효해야 한다");
+        let projection = perspective_lh_zo(CAMERA_FOV_Y_RADIANS, aspect, CAMERA_NEAR, CAMERA_FAR)
+            .expect("유효한 렌더 타깃의 GLB projection 계약은 항상 유효해야 한다");
+        self.rebuild_vertices_with_pipeline(
+            vertices,
+            TransformPipeline::new(Mat4::identity(), view, projection),
+            width,
+            height,
+        );
+    }
+
     fn rebuild_identity_debug(&mut self, mesh: &Mesh, width: usize, height: usize) {
         self.camera_world = Vec3::ZERO;
         let identity = Mat4::identity();
@@ -1070,12 +1141,22 @@ impl MeshScene {
         width: usize,
         height: usize,
     ) {
+        self.rebuild_vertices_with_pipeline(mesh.vertices(), pipeline, width, height);
+    }
+
+    fn rebuild_vertices_with_pipeline(
+        &mut self,
+        vertices: &[mesh::Vertex],
+        pipeline: TransformPipeline,
+        width: usize,
+        height: usize,
+    ) {
         let aspect = width as f32 / height as f32;
         self.traces.clear();
         self.clip_vertices.clear();
         self.diagnostic_ndc_positions.clear();
         self.diagnostic_viewport_positions.clear();
-        for vertex in mesh.vertices() {
+        for vertex in vertices {
             let trace = pipeline.trace(ObjectPosition(vertex.position_object));
             let normal_world = pipeline
                 .transform_model_normal(vertex.normal_object)
@@ -1129,6 +1210,7 @@ impl MeshScene {
 /// 개발 overlay가 한 번에 복사하는 선택 정점과 공간별 수치 snapshot이다.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CoordinateDebugSnapshot {
+    pub glb_active: bool,
     pub rotation_y_radians: f32,
     pub selected_vertex_index: usize,
     pub selected_vertex: VertexTrace,
@@ -1241,6 +1323,17 @@ pub struct Renderer {
     transparency_cutout_texture: Texture,
     clipper: TriangleClipper,
     transparent_scratch: Vec<PreparedTransparentTriangle>,
+    glb_scene: Option<GlbScene>,
+    pending_glb: Option<PendingGlbUpload>,
+    next_glb_upload_id: u32,
+    glb_upload_successes: u32,
+    glb_upload_failures: u32,
+    glb_last_failure: Option<String>,
+    glb_runtime_error: Option<String>,
+    glb_mesh_scenes: Vec<MeshScene>,
+    glb_transparent_scratch: Vec<PreparedGlbTransparentTriangle>,
+    glb_textures: TextureStore,
+    glb_texture_sampling_enabled: bool,
 }
 
 impl Renderer {
@@ -1379,6 +1472,17 @@ impl Renderer {
             transparency_cutout_texture,
             clipper: TriangleClipper::default(),
             transparent_scratch: Vec::new(),
+            glb_scene: None,
+            pending_glb: None,
+            next_glb_upload_id: 1,
+            glb_upload_successes: 0,
+            glb_upload_failures: 0,
+            glb_last_failure: None,
+            glb_runtime_error: None,
+            glb_mesh_scenes: Vec::new(),
+            glb_transparent_scratch: Vec::new(),
+            glb_textures: TextureStore::new(),
+            glb_texture_sampling_enabled: true,
         };
         let draw_options = FrameDrawOptions {
             debug_lines_enabled: renderer.debug_lines_enabled,
@@ -1617,6 +1721,9 @@ impl Renderer {
         self.transparency_cutout_scene = replacement_transparency_cutout_scene;
         self.transparency_blend_scene = replacement_transparency_blend_scene;
         self.framebuffer_generation = self.framebuffer_generation.wrapping_add(1);
+        if self.glb_scene.is_some() {
+            self.update_and_render(0.0, InputSnapshot::default());
+        }
         Ok(())
     }
 
@@ -1628,19 +1735,45 @@ impl Renderer {
             .is_err();
         let camera_pose = self.camera_controller.pose();
         let rotation_y = self.draw_item.model.rotation_radians.y;
-        self.draw_item.model.rotation_radians.y = if rotation_y.is_finite() {
-            (rotation_y + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
-                .rem_euclid(std::f32::consts::TAU)
-        } else {
-            rotation_y
-        };
+        if self.glb_scene.is_none() {
+            self.draw_item.model.rotation_radians.y = if rotation_y.is_finite() {
+                (rotation_y + dt_seconds * MODEL_ANGULAR_SPEED_RADIANS)
+                    .rem_euclid(std::f32::consts::TAU)
+            } else {
+                rotation_y
+            };
+        }
         let (render_width, render_height) = self
             .supersample_target
             .as_ref()
             .map_or((self.target.width(), self.target.height()), |target| {
                 (target.width(), target.height())
             });
-        if !self.texture_debug_enabled {
+        let glb_primary_active =
+            self.glb_scene.is_some() && matches!(self.active_scene(), ActiveScene::Cube);
+        let mut glb_update_error = None;
+        if !self.texture_debug_enabled && glb_primary_active {
+            let scene = self
+                .glb_scene
+                .as_mut()
+                .expect("GLB primary flag와 scene 존재가 일치해야 한다");
+            glb_update_error = scene.update(dt_seconds).err();
+            if glb_update_error.is_none() {
+                for (primitive, mesh_scene) in
+                    scene.primitives().iter().zip(&mut self.glb_mesh_scenes)
+                {
+                    mesh_scene.rebuild_vertices_with_camera(
+                        primitive.vertices(),
+                        camera_pose.eye,
+                        camera_pose.target,
+                        render_width,
+                        render_height,
+                    );
+                }
+            } else {
+                scene.set_playing(false);
+            }
+        } else if !self.texture_debug_enabled {
             match self.active_scene() {
                 ActiveScene::Cube => self.mesh_scene.rebuild_cube_with_camera(
                     &self.mesh,
@@ -1782,6 +1915,33 @@ impl Renderer {
                 ),
                 0,
             )
+        } else if glb_primary_active {
+            let scene = self
+                .glb_scene
+                .as_ref()
+                .expect("GLB primary flag와 scene 존재가 일치해야 한다");
+            (
+                draw_glb_frame(
+                    render_target,
+                    self.pipeline_state,
+                    self.debug_lines_enabled,
+                    scene,
+                    &self.glb_mesh_scenes,
+                    &self.glb_textures,
+                    self.glb_texture_sampling_enabled,
+                    self.directional_light,
+                    camera_pose.eye,
+                    self.transparent_sort_enabled,
+                    self.blend_color_space,
+                    self.mipmap_enabled,
+                    self.mip_debug_enabled,
+                    self.raster_path,
+                    &mut self.clipper,
+                    &mut self.transparent_scratch,
+                    &mut self.glb_transparent_scratch,
+                ),
+                0,
+            )
         } else {
             let cube_material = *material_for_id(&self.materials, self.draw_item.material_id)
                 .expect("DrawItem material ID는 저장소에 존재해야 한다");
@@ -1841,6 +2001,12 @@ impl Renderer {
         }
         let active_vertex_count = if self.texture_debug_enabled {
             0
+        } else if glb_primary_active {
+            self.glb_scene
+                .as_ref()
+                .expect("active GLB가 있다")
+                .stats()
+                .vertices as u32
         } else if self.transparency_debug_enabled {
             (self.transparency_opaque_mesh.vertices().len()
                 + self.transparency_cutout_mesh.vertices().len()
@@ -1850,6 +2016,11 @@ impl Renderer {
         };
         let transformed_vertex_count = if self.texture_debug_enabled {
             0
+        } else if glb_primary_active {
+            self.glb_mesh_scenes
+                .iter()
+                .map(|scene| scene.traces.len() as u32)
+                .sum()
         } else if self.transparency_debug_enabled {
             (self.transparency_opaque_scene.traces.len()
                 + self.transparency_cutout_scene.traces.len()
@@ -1859,6 +2030,12 @@ impl Renderer {
         };
         let active_triangle_count = if self.texture_debug_enabled {
             0
+        } else if glb_primary_active {
+            self.glb_scene
+                .as_ref()
+                .expect("active GLB가 있다")
+                .stats()
+                .triangles as u32
         } else if self.transparency_debug_enabled {
             (self.transparency_opaque_mesh.triangle_count()
                 + self.transparency_cutout_mesh.triangle_count()
@@ -1866,6 +2043,8 @@ impl Renderer {
         } else {
             mesh.triangle_count() as u32
         };
+        let glb_stats =
+            glb_primary_active.then(|| self.glb_scene.as_ref().expect("active GLB가 있다").stats());
         self.stats = FrameStats {
             frame_index: self.stats.frame_index.wrapping_add(1),
             dt_seconds,
@@ -1899,6 +2078,11 @@ impl Renderer {
             debug_pixels: draw_report.debug_pixels,
             invalid_values: (if self.texture_debug_enabled {
                 0
+            } else if glb_primary_active {
+                self.glb_mesh_scenes
+                    .iter()
+                    .map(|scene| scene.diagnostics.invalid_values)
+                    .sum()
             } else if self.transparency_debug_enabled {
                 self.transparency_opaque_scene
                     .diagnostics
@@ -1910,7 +2094,8 @@ impl Renderer {
             })
             .saturating_add(draw_report.invalid_values)
             .saturating_add(u32::from(invalid_dt))
-            .saturating_add(u32::from(invalid_camera_update)),
+            .saturating_add(u32::from(invalid_camera_update))
+            .saturating_add(u32::from(glb_update_error.is_some())),
             texture_debug_pixels,
             texture_upload_successes: self.texture_upload_successes,
             texture_upload_failures: self.texture_upload_failures,
@@ -1934,7 +2119,15 @@ impl Renderer {
             tiled_rasterized_triangles: draw_report.tiled_rasterized_triangles,
             tile_visits: draw_report.tile_visits,
             tile_counter_overflow: draw_report.tile_counter_overflow,
+            scene_draw_items: glb_stats.map_or(1, |stats| stats.draw_items as u32),
+            animated_nodes: glb_stats.map_or(0, |stats| stats.animated_nodes as u32),
+            skinned_vertices: glb_stats.map_or(0, |stats| stats.skinned_vertices as u32),
+            joint_matrices: glb_stats.map_or(0, |stats| stats.joint_matrices_per_frame as u32),
+            sampler_downgrades: glb_stats.map_or(0, |stats| stats.sampler_downgrades as u32),
         };
+        if let Some(error) = glb_update_error {
+            self.glb_runtime_error = Some(error.to_string().chars().take(512).collect());
+        }
         debug_assert!(
             pipeline_stats_are_consistent_or_overflowed(self.stats),
             "scalar/tiled pipeline의 단계별 FrameStats 관계식이 깨졌다: {:?}",
@@ -2155,6 +2348,13 @@ impl Renderer {
     }
 
     pub fn set_texture_sampling_enabled(&mut self, enabled: bool) {
+        if self.glb_scene.is_some() {
+            self.glb_texture_sampling_enabled = enabled;
+            if !enabled {
+                self.mip_debug_enabled = false;
+            }
+            return;
+        }
         let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다");
         material.base_color_texture = enabled.then_some(self.active_texture_id);
@@ -2164,6 +2364,9 @@ impl Renderer {
     }
 
     pub fn texture_sampling_enabled(&self) -> bool {
+        if self.glb_scene.is_some() {
+            return self.glb_texture_sampling_enabled;
+        }
         material_for_id(&self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다")
             .base_color_texture
@@ -2183,6 +2386,9 @@ impl Renderer {
     }
 
     pub fn set_lighting_enabled(&mut self, enabled: bool) {
+        if let Some(scene) = self.glb_scene.as_mut() {
+            scene.set_lighting_enabled(enabled);
+        }
         let material = material_for_id_mut(&mut self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다");
         material.shader_mode = match (enabled, material.shader_mode) {
@@ -2197,6 +2403,9 @@ impl Renderer {
     }
 
     pub fn set_shader_mode(&mut self, shader_mode: ShaderMode) {
+        if let Some(scene) = self.glb_scene.as_mut() {
+            scene.set_shader_mode(shader_mode);
+        }
         material_for_id_mut(&mut self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다")
             .shader_mode = shader_mode;
@@ -2226,6 +2435,9 @@ impl Renderer {
             .expect("DrawItem material ID는 저장소에 존재해야 한다");
         material.specular_color = specular_color;
         material.shininess = shininess;
+        if let Some(scene) = self.glb_scene.as_mut() {
+            scene.set_specular(specular_color, shininess);
+        }
         Ok(())
     }
 
@@ -2236,6 +2448,9 @@ impl Renderer {
     }
 
     pub fn set_normal_mode(&mut self, normal_mode: NormalMode) {
+        if let Some(scene) = self.glb_scene.as_mut() {
+            scene.set_normal_mode(normal_mode);
+        }
         material_for_id_mut(&mut self.materials, self.draw_item.material_id)
             .expect("DrawItem material ID는 저장소에 존재해야 한다")
             .normal_mode = normal_mode;
@@ -2320,6 +2535,7 @@ impl Renderer {
     }
 
     pub fn load_obj(&mut self, bytes: &[u8]) -> Result<MeshId, ObjImportError> {
+        self.pending_glb = None;
         let imported = match import_obj(bytes) {
             Ok(imported) => imported,
             Err(error) => {
@@ -2374,7 +2590,323 @@ impl Renderer {
         self.depth_debug_enabled = false;
         self.transparency_debug_enabled = false;
         self.texture_debug_enabled = false;
+        self.glb_scene = None;
+        self.glb_mesh_scenes.clear();
+        self.glb_textures = TextureStore::new();
+        self.glb_runtime_error = None;
         Ok(mesh_id)
+    }
+
+    /// GLB parse와 encoded image 추출만 수행한다. 활성 scene은 `commit_glb` 전까지
+    /// 바꾸지 않으며, 새 prepare는 이전 pending upload를 폐기한다.
+    pub fn prepare_glb(&mut self, bytes: &[u8]) -> Result<u32, GlbImportError> {
+        self.pending_glb = None;
+        let asset = match import_glb(bytes) {
+            Ok(asset) => asset,
+            Err(error) => {
+                self.record_glb_failure(error.to_string());
+                return Err(error);
+            }
+        };
+        let id = self.next_glb_upload_id;
+        self.next_glb_upload_id = match self.next_glb_upload_id.checked_add(1) {
+            Some(next) => next,
+            None => {
+                let error = GlbImportError::LimitExceeded {
+                    kind: "upload generation",
+                    max: u32::MAX as usize,
+                };
+                self.record_glb_failure(error.to_string());
+                return Err(error);
+            }
+        };
+        let image_count = asset.image_count();
+        self.pending_glb = Some(PendingGlbUpload {
+            id,
+            asset,
+            decoded_images: vec![None; image_count],
+        });
+        Ok(id)
+    }
+
+    fn pending_glb_for(&self, id: u32) -> Result<&PendingGlbUpload, GlbImportError> {
+        self.pending_glb
+            .as_ref()
+            .filter(|pending| pending.id == id)
+            .ok_or_else(|| {
+                GlbImportError::InvalidData(format!("stale 또는 유효하지 않은 pending GLB id {id}"))
+            })
+    }
+
+    pub fn pending_glb_image_count(&self, id: u32) -> Result<usize, GlbImportError> {
+        Ok(self.pending_glb_for(id)?.asset.image_count())
+    }
+
+    pub fn pending_glb_image_mime(
+        &self,
+        id: u32,
+        image_index: usize,
+    ) -> Result<&str, GlbImportError> {
+        self.pending_glb_for(id)?
+            .asset
+            .images()
+            .get(image_index)
+            .map(|image| image.mime_type())
+            .ok_or_else(|| {
+                GlbImportError::InvalidData(format!(
+                    "GLB image index {image_index}가 범위를 벗어났습니다"
+                ))
+            })
+    }
+
+    pub fn pending_glb_image_bytes(
+        &self,
+        id: u32,
+        image_index: usize,
+    ) -> Result<&[u8], GlbImportError> {
+        self.pending_glb_for(id)?
+            .asset
+            .images()
+            .get(image_index)
+            .map(|image| image.bytes())
+            .ok_or_else(|| {
+                GlbImportError::InvalidData(format!(
+                    "GLB image index {image_index}가 범위를 벗어났습니다"
+                ))
+            })
+    }
+
+    pub fn supply_glb_image_rgba8(
+        &mut self,
+        id: u32,
+        image_index: usize,
+        width: usize,
+        height: usize,
+        pixels: &[u8],
+    ) -> Result<(), GlbImportError> {
+        let incoming_texels = mip_texel_count_for_dimensions(width, height).map_err(|error| {
+            GlbImportError::InvalidData(format!(
+                "decode된 image {image_index} texture 크기 검증 실패: {error}"
+            ))
+        })?;
+        let pending = self.pending_glb_for(id)?;
+        let replaced_texels = pending
+            .decoded_images
+            .get(image_index)
+            .ok_or_else(|| {
+                GlbImportError::InvalidData(format!(
+                    "GLB image index {image_index}가 범위를 벗어났습니다"
+                ))
+            })?
+            .as_ref()
+            .map_or(0, Texture::total_texels);
+        let current_texels = pending
+            .decoded_images
+            .iter()
+            .filter_map(Option::as_ref)
+            .map(Texture::total_texels)
+            .sum::<usize>();
+        checked_glb_texture_total(current_texels, replaced_texels, incoming_texels)?;
+        let texture = Texture::from_rgba8(width, height, pixels, TextureColorSpace::Srgb).map_err(
+            |error| {
+                GlbImportError::InvalidData(format!(
+                    "decode된 image {image_index} texture 검증 실패: {error}"
+                ))
+            },
+        )?;
+        let pending = self
+            .pending_glb
+            .as_mut()
+            .expect("같은 호출에서 검증한 pending GLB는 유지되어야 한다");
+        debug_assert_eq!(pending.id, id);
+        pending.decoded_images[image_index] = Some(texture);
+        Ok(())
+    }
+
+    pub fn commit_glb(&mut self, id: u32) -> Result<(), GlbImportError> {
+        let pending = self.pending_glb_for(id)?;
+        if let Some(index) = pending.decoded_images.iter().position(Option::is_none) {
+            return Err(GlbImportError::InvalidData(format!(
+                "GLB image {index}가 아직 decode되지 않았습니다"
+            )));
+        }
+        let texture_sampling_enabled = self.texture_sampling_enabled();
+        let mut glb_textures = TextureStore::new();
+        let texture_ids = glb_textures
+            .planned_ids(pending.decoded_images.len())
+            .expect("GLB resource limit 안에서 texture ID 공간이 소진될 수 없다");
+        let pending = self
+            .pending_glb
+            .take()
+            .expect("id 검증 뒤 pending GLB가 존재해야 한다");
+        let textures = pending
+            .decoded_images
+            .into_iter()
+            .map(|texture| texture.expect("모든 image decode를 확인했다"))
+            .collect::<Vec<_>>();
+        let mut scene = match GlbScene::new(pending.asset, &texture_ids) {
+            Ok(scene) => scene,
+            Err(error) => {
+                self.record_glb_failure(error.to_string());
+                return Err(error);
+            }
+        };
+        let control_material = *material_for_id(&self.materials, self.draw_item.material_id)
+            .expect("DrawItem material ID는 저장소에 존재해야 한다");
+        scene.set_shader_mode(control_material.shader_mode);
+        scene.set_lighting_enabled(control_material.shader_mode != ShaderMode::Unlit);
+        scene.set_normal_mode(control_material.normal_mode);
+        scene.set_specular(control_material.specular_color, control_material.shininess);
+        let camera_controller = CameraController::default();
+        let camera_pose = camera_controller.pose();
+        let (render_width, render_height) = self.render_dimensions();
+        let mut mesh_scenes = Vec::with_capacity(scene.primitives().len());
+        for primitive in scene.primitives() {
+            let mut mesh_scene = MeshScene::with_capacity(primitive.mesh());
+            mesh_scene.rebuild_vertices_with_camera(
+                primitive.vertices(),
+                camera_pose.eye,
+                camera_pose.target,
+                render_width,
+                render_height,
+            );
+            mesh_scenes.push(mesh_scene);
+        }
+        glb_textures.append_validated(textures);
+        self.glb_scene = Some(scene);
+        self.glb_mesh_scenes = mesh_scenes;
+        self.glb_textures = glb_textures;
+        self.glb_texture_sampling_enabled = texture_sampling_enabled;
+        self.glb_upload_successes = self.glb_upload_successes.saturating_add(1);
+        self.glb_last_failure = None;
+        self.glb_runtime_error = None;
+        self.camera_controller = camera_controller;
+        self.clip_debug_enabled = false;
+        self.coverage_debug_enabled = false;
+        self.interpolation_debug_enabled = false;
+        self.perspective_debug_enabled = false;
+        self.depth_debug_enabled = false;
+        self.transparency_debug_enabled = false;
+        self.texture_debug_enabled = false;
+        Ok(())
+    }
+
+    pub fn cancel_glb(&mut self, id: u32) -> Result<(), GlbImportError> {
+        self.pending_glb_for(id)?;
+        self.pending_glb = None;
+        Ok(())
+    }
+
+    pub fn fail_glb(&mut self, id: u32, reason: &str) -> Result<(), GlbImportError> {
+        self.pending_glb_for(id)?;
+        self.pending_glb = None;
+        let reason = reason.trim();
+        let message = if reason.is_empty() {
+            "browser image decode/supply 실패".to_owned()
+        } else {
+            reason.chars().take(512).collect()
+        };
+        self.record_glb_failure(message);
+        Ok(())
+    }
+
+    fn record_glb_failure(&mut self, message: String) {
+        self.glb_upload_failures = self.glb_upload_failures.saturating_add(1);
+        self.glb_last_failure = Some(message.chars().take(512).collect());
+    }
+
+    fn finish_glb_control_change(
+        &mut self,
+        result: Result<(), GlbImportError>,
+    ) -> Result<(), GlbImportError> {
+        match result {
+            Ok(()) => {
+                self.glb_runtime_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                if let Some(scene) = self.glb_scene.as_mut() {
+                    scene.set_playing(false);
+                }
+                self.glb_runtime_error = Some(error.to_string().chars().take(512).collect());
+                Err(error)
+            }
+        }
+    }
+
+    pub fn glb_asset_status(&self) -> GlbAssetStatus<'_> {
+        GlbAssetStatus {
+            active: self.glb_scene.is_some(),
+            pending_id: self.pending_glb.as_ref().map(|pending| pending.id),
+            successful_uploads: self.glb_upload_successes,
+            failed_uploads: self.glb_upload_failures,
+            last_failure: self.glb_last_failure.as_deref(),
+            runtime_error: self.glb_runtime_error.as_deref(),
+            scene: self.glb_scene.as_ref().map(GlbScene::stats),
+        }
+    }
+
+    pub fn glb_clip_count(&self) -> usize {
+        self.glb_scene.as_ref().map_or(0, GlbScene::clip_count)
+    }
+    pub fn glb_clip_name(&self, index: usize) -> Option<&str> {
+        self.glb_scene.as_ref()?.clip_name(index)
+    }
+    pub fn glb_selected_clip(&self) -> Option<usize> {
+        self.glb_scene.as_ref()?.selected_clip()
+    }
+    pub fn glb_animation_time(&self) -> f32 {
+        self.glb_scene.as_ref().map_or(0.0, GlbScene::time_seconds)
+    }
+    pub fn glb_animation_duration(&self) -> f32 {
+        self.glb_scene
+            .as_ref()
+            .map_or(0.0, GlbScene::selected_clip_duration)
+    }
+    pub fn glb_animation_playing(&self) -> bool {
+        self.glb_scene.as_ref().is_some_and(GlbScene::playing)
+    }
+    pub fn glb_animation_looping(&self) -> bool {
+        self.glb_scene.as_ref().is_some_and(GlbScene::looping)
+    }
+
+    pub fn set_glb_clip(&mut self, index: usize) -> Result<(), GlbImportError> {
+        let result = self
+            .glb_scene
+            .as_mut()
+            .ok_or_else(|| GlbImportError::InvalidData("활성 GLB scene이 없습니다".into()))?
+            .set_clip(index);
+        self.finish_glb_control_change(result)
+    }
+
+    pub fn set_glb_animation_playing(&mut self, playing: bool) -> Result<(), GlbImportError> {
+        let scene = self
+            .glb_scene
+            .as_mut()
+            .ok_or_else(|| GlbImportError::InvalidData("활성 GLB scene이 없습니다".into()))?;
+        scene.set_playing(playing);
+        if playing {
+            self.glb_runtime_error = None;
+        }
+        Ok(())
+    }
+
+    pub fn set_glb_animation_looping(&mut self, looping: bool) -> Result<(), GlbImportError> {
+        let scene = self
+            .glb_scene
+            .as_mut()
+            .ok_or_else(|| GlbImportError::InvalidData("활성 GLB scene이 없습니다".into()))?;
+        scene.set_looping(looping);
+        Ok(())
+    }
+
+    pub fn seek_glb_animation(&mut self, time_seconds: f32) -> Result<(), GlbImportError> {
+        let result = self
+            .glb_scene
+            .as_mut()
+            .ok_or_else(|| GlbImportError::InvalidData("활성 GLB scene이 없습니다".into()))?
+            .seek(time_seconds);
+        self.finish_glb_control_change(result)
     }
 
     pub fn mesh_asset_status(&self) -> MeshAssetStatus {
@@ -2512,7 +3044,27 @@ impl Renderer {
     }
 
     pub fn coordinate_debug_snapshot(&self) -> CoordinateDebugSnapshot {
-        let (mesh, scene, selected_vertex_index, rotation_y_radians, material_id) =
+        let glb_active = self.glb_scene.is_some()
+            && matches!(self.active_scene(), ActiveScene::Cube)
+            && !self.texture_debug_enabled;
+        let (mesh, scene, selected_vertex_index, rotation_y_radians, material_id) = if glb_active {
+            let primitive = self
+                .glb_scene
+                .as_ref()
+                .and_then(|scene| scene.primitives().first())
+                .expect("active GLB에는 primitive가 있어야 한다");
+            let scene = self
+                .glb_mesh_scenes
+                .first()
+                .expect("active GLB에는 primitive별 진단 scene이 있어야 한다");
+            (
+                primitive.mesh(),
+                scene,
+                0,
+                0.0,
+                primitive.material_index() as u32,
+            )
+        } else {
             match self.active_scene() {
                 ActiveScene::Cube => (
                     &self.mesh,
@@ -2567,9 +3119,11 @@ impl Renderer {
                     0.0,
                     0,
                 ),
-            };
+            }
+        };
         let selected_vertex = scene.traces[selected_vertex_index];
         CoordinateDebugSnapshot {
+            glb_active,
             rotation_y_radians,
             selected_vertex_index,
             selected_vertex,
@@ -3015,6 +3569,8 @@ struct RasterDrawOptions<'a> {
     mipmap_enabled: bool,
     mip_debug_enabled: bool,
     raster_path: RasterPath,
+    reverse_winding: bool,
+    two_sided_lighting: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -3022,6 +3578,14 @@ struct PreparedTransparentTriangle {
     vertices: [ClipVertex; 3],
     triangle_id: u32,
     view_depth: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PreparedGlbTransparentTriangle {
+    vertices: [ClipVertex; 3],
+    triangle_id: u32,
+    view_depth: f32,
+    primitive_index: usize,
 }
 
 impl<'a> FrameDrawOptions<'a> {
@@ -3039,6 +3603,8 @@ impl<'a> FrameDrawOptions<'a> {
             mipmap_enabled: self.mipmap_enabled,
             mip_debug_enabled: self.mip_debug_enabled,
             raster_path: self.raster_path,
+            reverse_winding: false,
+            two_sided_lighting: false,
         }
     }
 }
@@ -3078,6 +3644,177 @@ fn draw_frame(
         clip_vertices,
         selected_vertex_index,
     )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_glb_frame(
+    target: &mut RenderTarget,
+    pipeline_state: PipelineState,
+    debug_lines_enabled: bool,
+    scene: &GlbScene,
+    mesh_scenes: &[MeshScene],
+    textures: &TextureStore,
+    texture_sampling_enabled: bool,
+    light: DirectionalLight,
+    camera_world: Vec3,
+    sort_transparent: bool,
+    blend_color_space: BlendColorSpace,
+    mipmap_enabled: bool,
+    mip_debug_enabled: bool,
+    raster_path: RasterPath,
+    clipper: &mut TriangleClipper,
+    transparent_scratch: &mut Vec<PreparedTransparentTriangle>,
+    glb_transparent_scratch: &mut Vec<PreparedGlbTransparentTriangle>,
+) -> FrameDrawReport {
+    match pipeline_state.debug_mode {
+        PipelineDebugMode::Depth | PipelineDebugMode::DepthHeatmap => {
+            target.clear_color(DEPTH_DEBUG_BACKGROUND)
+        }
+        _ => {
+            target.render_gradient_checker();
+        }
+    }
+    let mut report = FrameDrawReport::default();
+    let primitives = scene.primitives();
+    for (primitive_index, (primitive, mesh_scene)) in primitives.iter().zip(mesh_scenes).enumerate()
+    {
+        let runtime_material = scene.materials()[primitive.material_index()];
+        if runtime_material.material.alpha_mode == AlphaMode::Blend {
+            continue;
+        }
+        let mut primitive_pipeline = pipeline_state;
+        if runtime_material.double_sided {
+            primitive_pipeline.cull_mode = CullMode::None;
+        }
+        let sampled_texture = if texture_sampling_enabled {
+            runtime_material
+                .material
+                .base_color_texture
+                .map(|texture_id| {
+                    (
+                        textures
+                            .get(texture_id)
+                            .expect("GLB material texture ID는 commit된 store에 존재해야 한다"),
+                        runtime_material.material.sampler,
+                    )
+                })
+        } else {
+            None
+        };
+        let _ = primitive_index;
+        report.absorb(draw_mesh_with_scratch(
+            target,
+            debug_lines_enabled,
+            RasterDrawOptions {
+                pipeline_state: primitive_pipeline,
+                uv_checker_enabled: false,
+                sampled_texture,
+                material: runtime_material.material,
+                linear_material: LinearMaterial::from_srgb(runtime_material.material),
+                light,
+                camera_world,
+                sort_transparent,
+                blend_color_space,
+                mipmap_enabled,
+                mip_debug_enabled,
+                raster_path,
+                reverse_winding: primitive.winding_reversed(),
+                two_sided_lighting: runtime_material.double_sided,
+            },
+            primitive.mesh(),
+            clipper,
+            transparent_scratch,
+            &mesh_scene.clip_vertices,
+        ));
+    }
+
+    glb_transparent_scratch.clear();
+    let mut triangle_id = 0u32;
+    for (primitive_index, (primitive, mesh_scene)) in primitives.iter().zip(mesh_scenes).enumerate()
+    {
+        if scene.materials()[primitive.material_index()]
+            .material
+            .alpha_mode
+            != AlphaMode::Blend
+        {
+            continue;
+        }
+        visit_clipped_triangles(
+            primitive.mesh(),
+            clipper,
+            &mesh_scene.clip_vertices,
+            &mut report,
+            |generated, _, _| {
+                glb_transparent_scratch.push(PreparedGlbTransparentTriangle {
+                    vertices: generated,
+                    triangle_id,
+                    view_depth: generated
+                        .into_iter()
+                        .map(|vertex| vertex.view_depth)
+                        .sum::<f32>()
+                        / 3.0,
+                    primitive_index,
+                });
+                triangle_id = triangle_id.wrapping_add(1);
+            },
+        );
+    }
+    if sort_transparent {
+        glb_transparent_scratch.sort_unstable_by(|first, second| {
+            second
+                .view_depth
+                .total_cmp(&first.view_depth)
+                .then_with(|| first.primitive_index.cmp(&second.primitive_index))
+                .then_with(|| first.triangle_id.cmp(&second.triangle_id))
+        });
+    }
+    for prepared in glb_transparent_scratch.iter().copied() {
+        let primitive = &primitives[prepared.primitive_index];
+        let runtime_material = scene.materials()[primitive.material_index()];
+        let mut primitive_pipeline = pipeline_state;
+        if runtime_material.double_sided {
+            primitive_pipeline.cull_mode = CullMode::None;
+        }
+        let sampled_texture = if texture_sampling_enabled {
+            runtime_material
+                .material
+                .base_color_texture
+                .map(|texture_id| {
+                    (
+                        textures
+                            .get(texture_id)
+                            .expect("GLB material texture ID는 commit된 store에 존재해야 한다"),
+                        runtime_material.material.sampler,
+                    )
+                })
+        } else {
+            None
+        };
+        submit_generated_triangle(
+            target,
+            debug_lines_enabled,
+            RasterDrawOptions {
+                pipeline_state: primitive_pipeline,
+                uv_checker_enabled: false,
+                sampled_texture,
+                material: runtime_material.material,
+                linear_material: LinearMaterial::from_srgb(runtime_material.material),
+                light,
+                camera_world,
+                sort_transparent,
+                blend_color_space,
+                mipmap_enabled,
+                mip_debug_enabled,
+                raster_path,
+                reverse_winding: primitive.winding_reversed(),
+                two_sided_lighting: runtime_material.double_sided,
+            },
+            prepared.vertices,
+            prepared.triangle_id,
+            &mut report,
+        );
+    }
+    report
 }
 
 fn draw_debug_scene(
@@ -3254,6 +3991,8 @@ fn draw_transparency_fixture(
                 mipmap_enabled: false,
                 mip_debug_enabled: false,
                 raster_path: options.raster_path,
+                reverse_winding: false,
+                two_sided_lighting: false,
             },
             mesh,
             clipper,
@@ -3425,6 +4164,11 @@ fn submit_generated_triangle(
     triangle_id: u32,
     report: &mut FrameDrawReport,
 ) {
+    let generated = if options.reverse_winding {
+        [generated[0], generated[2], generated[1]]
+    } else {
+        generated
+    };
     let positions = generated.map(|vertex| {
         perspective_divide(vertex.clip_pos)
             .and_then(|position| viewport(position, target.width() as f32, target.height() as f32))
@@ -3636,7 +4380,11 @@ fn submit_triangle(
         } else {
             None
         };
-        let shading_normal = flat_normal.unwrap_or_else(|| fragment.normal());
+        let shading_normal = two_sided_shading_normal(
+            flat_normal.unwrap_or_else(|| fragment.normal()),
+            source_orientation,
+            options.two_sided_lighting,
+        );
         let alpha_mode = options.material.alpha_mode;
         let policy_albedo = if alpha_mode == AlphaMode::Opaque {
             None
@@ -3953,6 +4701,14 @@ fn submit_triangle(
     report.debug_pixels = report
         .debug_pixels
         .saturating_add(target.draw_wireframe_triangle(wireframe_positions, edge_colors));
+}
+
+fn two_sided_shading_normal(normal: Vec3, orientation: FaceOrientation, two_sided: bool) -> Vec3 {
+    if two_sided && orientation == FaceOrientation::Back {
+        normal * -1.0
+    } else {
+        normal
+    }
 }
 
 #[inline]
@@ -4379,6 +5135,8 @@ mod tests {
                 mipmap_enabled: false,
                 mip_debug_enabled: false,
                 raster_path: RasterPath::Scalar,
+                reverse_winding: false,
+                two_sided_lighting: false,
             },
             &mesh,
             &mut clipper,
@@ -4416,6 +5174,8 @@ mod tests {
             mipmap_enabled: false,
             mip_debug_enabled: false,
             raster_path: RasterPath::Scalar,
+            reverse_winding: false,
+            two_sided_lighting: false,
         }
     }
 
@@ -6975,6 +7735,8 @@ mod tests {
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
                     raster_path: RasterPath::Scalar,
+                    reverse_winding: false,
+                    two_sided_lighting: false,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -7600,6 +8362,8 @@ mod tests {
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
                     raster_path: RasterPath::Scalar,
+                    reverse_winding: false,
+                    two_sided_lighting: false,
                 },
                 &mask_mesh,
                 &mut TriangleClipper::default(),
@@ -7635,6 +8399,8 @@ mod tests {
                     mipmap_enabled: false,
                     mip_debug_enabled: false,
                     raster_path: RasterPath::Scalar,
+                    reverse_winding: false,
+                    two_sided_lighting: false,
                 },
                 &blend_mesh,
                 &mut TriangleClipper::default(),
@@ -7733,6 +8499,8 @@ mod tests {
                     mipmap_enabled: true,
                     mip_debug_enabled: true,
                     raster_path: RasterPath::Scalar,
+                    reverse_winding: false,
+                    two_sided_lighting: false,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -7821,6 +8589,8 @@ mod tests {
                     mipmap_enabled: true,
                     mip_debug_enabled,
                     raster_path: RasterPath::Scalar,
+                    reverse_winding: false,
+                    two_sided_lighting: false,
                 },
                 &mesh,
                 &mut TriangleClipper::default(),
@@ -8113,5 +8883,353 @@ mod tests {
         });
         assert_eq!(aggregate.tile_visits, u32::MAX);
         assert!(aggregate.tile_counter_overflow);
+    }
+
+    #[test]
+    fn chapter_twenty_six_glb_upload_is_staged_animated_atomic_and_scalar_tiled_exact() {
+        assert_eq!(
+            two_sided_shading_normal(Vec3::Z, FaceOrientation::Front, true),
+            Vec3::Z
+        );
+        assert_eq!(
+            two_sided_shading_normal(Vec3::Z, FaceOrientation::Back, true),
+            Vec3::new(0.0, 0.0, -1.0)
+        );
+        assert_eq!(
+            two_sided_shading_normal(Vec3::Z, FaceOrientation::Back, false),
+            Vec3::Z
+        );
+        assert_eq!(checked_glb_texture_total(5, 2, 3), Ok(6));
+        assert!(checked_glb_texture_total(0, 1, 0).is_err());
+        assert!(checked_glb_texture_total(0, 0, usize::MAX).is_err());
+
+        fn commit_fixture(renderer: &mut Renderer) -> u32 {
+            let bytes = crate::glb::tests::canonical_glb(true);
+            let pending = renderer.prepare_glb(&bytes).unwrap();
+            assert_eq!(renderer.pending_glb_image_count(pending), Ok(1));
+            assert_eq!(renderer.pending_glb_image_mime(pending, 0), Ok("image/png"));
+            assert_eq!(
+                renderer.pending_glb_image_bytes(pending, 0).unwrap(),
+                &[0x89, b'P', b'N', b'G']
+            );
+            assert!(renderer.pending_glb_image_mime(pending, 9).is_err());
+            assert!(renderer.pending_glb_image_bytes(pending, 9).is_err());
+            assert!(
+                renderer
+                    .supply_glb_image_rgba8(pending, 9, 1, 1, &[0; 4])
+                    .is_err()
+            );
+            assert!(
+                renderer
+                    .commit_glb(pending)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("decode")
+            );
+            assert!(
+                renderer
+                    .supply_glb_image_rgba8(pending, 0, 1, 1, &[0; 3])
+                    .is_err()
+            );
+            assert!(
+                renderer
+                    .supply_glb_image_rgba8(pending, 0, 0, 1, &[])
+                    .is_err()
+            );
+            renderer
+                .supply_glb_image_rgba8(pending, 0, 1, 1, &[220, 140, 70, 255])
+                .unwrap();
+            renderer.commit_glb(pending).unwrap();
+            pending
+        }
+
+        let mut scalar = Renderer::new(64, 48).unwrap();
+        let cube = scalar.color_buffer().to_vec();
+        assert!(scalar.prepare_glb(b"broken").is_err());
+        assert!(
+            scalar
+                .glb_asset_status()
+                .last_failure
+                .unwrap()
+                .contains("header")
+        );
+        assert_eq!(scalar.color_buffer(), cube);
+
+        let mut stale = Renderer::new(32, 32).unwrap();
+        let stale_after_failed_glb = stale
+            .prepare_glb(&crate::glb::tests::canonical_glb(true))
+            .unwrap();
+        assert!(stale.prepare_glb(b"broken").is_err());
+        assert!(
+            stale
+                .pending_glb_image_count(stale_after_failed_glb)
+                .is_err()
+        );
+        let stale_after_obj = stale
+            .prepare_glb(&crate::glb::tests::canonical_glb(true))
+            .unwrap();
+        stale
+            .load_obj(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 3 2\n")
+            .unwrap();
+        assert!(stale.pending_glb_image_count(stale_after_obj).is_err());
+        let stale_after_failed_obj = stale
+            .prepare_glb(&crate::glb::tests::canonical_glb(true))
+            .unwrap();
+        assert!(stale.load_obj(b"broken").is_err());
+        assert!(
+            stale
+                .pending_glb_image_count(stale_after_failed_obj)
+                .is_err()
+        );
+
+        let pending = commit_fixture(&mut scalar);
+        let status = scalar.glb_asset_status();
+        assert!(status.active);
+        assert_eq!(status.pending_id, None);
+        assert_eq!(status.successful_uploads, 1);
+        assert_eq!(status.failed_uploads, 1);
+        assert_eq!(status.last_failure, None);
+        assert_eq!(scalar.glb_textures.len(), 2);
+        assert_eq!(scalar.glb_clip_count(), 1);
+        assert_eq!(scalar.glb_clip_name(0), Some("Mixed"));
+        assert_eq!(scalar.glb_selected_clip(), Some(0));
+        assert!(scalar.commit_glb(pending).is_err());
+        assert!(scalar.pending_glb_image_count(pending).is_err());
+        assert!(scalar.pending_glb_image_mime(pending, 9).is_err());
+        assert!(scalar.pending_glb_image_bytes(pending, 9).is_err());
+        assert!(
+            scalar
+                .supply_glb_image_rgba8(pending, 9, 1, 1, &[0; 4])
+                .is_err()
+        );
+        assert!(scalar.cancel_glb(pending).is_err());
+        assert!(scalar.set_glb_clip(9).is_err());
+        assert!(scalar.glb_asset_status().runtime_error.is_some());
+        assert!(!scalar.glb_animation_playing());
+        scalar.set_glb_animation_playing(true).unwrap();
+        assert_eq!(scalar.glb_asset_status().runtime_error, None);
+        assert!(scalar.seek_glb_animation(f32::NAN).is_err());
+        scalar.set_glb_animation_playing(false).unwrap();
+        assert!(!scalar.glb_animation_playing());
+        scalar.set_glb_animation_looping(false).unwrap();
+        assert!(!scalar.glb_animation_looping());
+        scalar.seek_glb_animation(0.5).unwrap();
+        assert_eq!(scalar.glb_asset_status().runtime_error, None);
+        assert!((scalar.glb_animation_time() - 0.5).abs() <= 1.0e-6);
+        assert!((scalar.glb_animation_duration() - 1.0).abs() <= 1.0e-6);
+        scalar.set_texture_sampling_enabled(false);
+        assert!(!scalar.texture_sampling_enabled());
+        scalar.set_transparent_sort_enabled(false);
+        scalar.set_pipeline_debug_mode(PipelineDebugMode::Depth);
+        let unsorted_untextured = scalar.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(unsorted_untextured.scene_draw_items, 1);
+        scalar.set_pipeline_debug_mode(PipelineDebugMode::Solid);
+        scalar.set_transparent_sort_enabled(true);
+        scalar.set_texture_sampling_enabled(true);
+        scalar.set_lighting_enabled(true);
+        scalar.set_shader_mode(ShaderMode::BlinnPhong);
+        scalar.set_normal_mode(NormalMode::Flat);
+        scalar
+            .set_material_specular(Vec3::new(0.2, 0.3, 0.4), 9.0)
+            .unwrap();
+
+        let mut configured = Renderer::new(64, 48).unwrap();
+        configured.set_texture_sampling_enabled(false);
+        configured.set_shader_mode(ShaderMode::BlinnPhong);
+        configured.set_normal_mode(NormalMode::Flat);
+        configured
+            .set_material_specular(Vec3::new(0.2, 0.3, 0.4), 9.0)
+            .unwrap();
+        let configured_pending = configured
+            .prepare_glb(&crate::glb::tests::canonical_lit_opaque_glb())
+            .unwrap();
+        configured
+            .supply_glb_image_rgba8(configured_pending, 0, 1, 1, &[220, 140, 70, 255])
+            .unwrap();
+        configured.commit_glb(configured_pending).unwrap();
+        assert!(!configured.texture_sampling_enabled());
+        let imported_material = configured.glb_scene.as_ref().unwrap().materials()[0];
+        assert!(!imported_material.forced_unlit);
+        assert_eq!(
+            imported_material.material.shader_mode,
+            ShaderMode::BlinnPhong
+        );
+        assert_eq!(imported_material.material.normal_mode, NormalMode::Flat);
+        assert_eq!(
+            imported_material.material.specular_color,
+            Vec3::new(0.2, 0.3, 0.4)
+        );
+        assert_eq!(imported_material.material.shininess, 9.0);
+
+        scalar.set_raster_path(RasterPath::Scalar);
+        let scalar_stats = scalar.update_and_render(0.1, InputSnapshot::default());
+        assert_eq!(scalar_stats.scene_draw_items, 1);
+        assert_eq!(scalar_stats.animated_nodes, 2);
+        assert_eq!(scalar_stats.skinned_vertices, 3);
+        assert_eq!(scalar_stats.joint_matrices, 2);
+        assert_eq!(scalar_stats.sampler_downgrades, 1);
+        assert!(scalar_stats.pipeline_relations_hold());
+        scalar.resize(80, 60).unwrap();
+        assert_eq!((scalar.width(), scalar.height()), (80, 60));
+
+        let cancel = scalar
+            .prepare_glb(&crate::glb::tests::canonical_glb(false))
+            .unwrap();
+        assert_eq!(scalar.glb_asset_status().pending_id, Some(cancel));
+        scalar.cancel_glb(cancel).unwrap();
+        assert_eq!(scalar.glb_asset_status().pending_id, None);
+
+        let mut tiled = Renderer::new(64, 48).unwrap();
+        commit_fixture(&mut tiled);
+        tiled.set_texture_sampling_enabled(true);
+        tiled.seek_glb_animation(0.6).unwrap();
+        scalar.resize(64, 48).unwrap();
+        scalar.seek_glb_animation(0.6).unwrap();
+        scalar.set_raster_path(RasterPath::Scalar);
+        tiled.set_raster_path(RasterPath::Tiled16);
+        let scalar_stats = scalar.update_and_render(0.0, InputSnapshot::default());
+        let tiled_stats = tiled.update_and_render(0.0, InputSnapshot::default());
+        assert_eq!(scalar.color_buffer(), tiled.color_buffer());
+        assert_eq!(scalar.target.depth(), tiled.target.depth());
+        assert_eq!(scalar_stats.shaded_samples, tiled_stats.shaded_samples);
+
+        let mut opaque = Renderer::new(64, 48).unwrap();
+        let opaque_pending = opaque
+            .prepare_glb(&crate::glb::tests::canonical_opaque_glb())
+            .unwrap();
+        opaque
+            .supply_glb_image_rgba8(opaque_pending, 0, 1, 1, &[220, 140, 70, 255])
+            .unwrap();
+        opaque.commit_glb(opaque_pending).unwrap();
+        opaque.set_texture_sampling_enabled(false);
+        assert!(
+            opaque
+                .update_and_render(0.0, InputSnapshot::default())
+                .depth_written_samples
+                > 0
+        );
+        opaque.set_texture_sampling_enabled(true);
+        assert!(
+            opaque
+                .update_and_render(0.0, InputSnapshot::default())
+                .depth_written_samples
+                > 0
+        );
+
+        let mut mirrored = Renderer::new(64, 48).unwrap();
+        let mirrored_pending = mirrored
+            .prepare_glb(&crate::glb::tests::canonical_mirrored_opaque_glb())
+            .unwrap();
+        mirrored
+            .supply_glb_image_rgba8(mirrored_pending, 0, 1, 1, &[220, 140, 70, 255])
+            .unwrap();
+        mirrored.commit_glb(mirrored_pending).unwrap();
+        assert!(mirrored.glb_scene.as_ref().unwrap().primitives()[0].winding_reversed());
+        assert!(
+            mirrored
+                .update_and_render(0.0, InputSnapshot::default())
+                .depth_written_samples
+                > 0
+        );
+
+        let mut no_animation = Renderer::new(64, 48).unwrap();
+        commit_fixture(&mut no_animation);
+        no_animation
+            .glb_scene
+            .as_mut()
+            .unwrap()
+            .clear_animations_for_test();
+        assert_eq!(
+            no_animation
+                .update_and_render(0.0, InputSnapshot::default())
+                .animated_nodes,
+            0
+        );
+
+        let mut invalid_update = Renderer::new(64, 48).unwrap();
+        commit_fixture(&mut invalid_update);
+        invalid_update
+            .glb_scene
+            .as_mut()
+            .unwrap()
+            .force_update_failure_for_test();
+        let invalid_stats = invalid_update.update_and_render(0.0, InputSnapshot::default());
+        assert!(invalid_stats.invalid_values > 0);
+        assert!(!invalid_update.glb_animation_playing());
+        assert!(
+            invalid_update
+                .glb_asset_status()
+                .runtime_error
+                .unwrap()
+                .contains("joint normal")
+        );
+        invalid_update.update_and_render(0.0, InputSnapshot::default());
+        assert!(invalid_update.glb_asset_status().runtime_error.is_some());
+
+        let mut exhausted = Renderer::new(64, 48).unwrap();
+        exhausted.next_glb_upload_id = u32::MAX;
+        assert!(matches!(
+            exhausted.prepare_glb(&crate::glb::tests::canonical_glb(true)),
+            Err(GlbImportError::LimitExceeded {
+                kind: "upload generation",
+                ..
+            })
+        ));
+        assert!(exhausted.glb_asset_status().last_failure.is_some());
+
+        let mut bounded_failure = Renderer::new(32, 32).unwrap();
+        bounded_failure.record_glb_failure("가".repeat(600));
+        assert_eq!(
+            bounded_failure
+                .glb_asset_status()
+                .last_failure
+                .unwrap()
+                .chars()
+                .count(),
+            512
+        );
+
+        let mut decode_failure = Renderer::new(64, 48).unwrap();
+        let decode_pending = decode_failure
+            .prepare_glb(&crate::glb::tests::canonical_glb(true))
+            .unwrap();
+        decode_failure
+            .fail_glb(decode_pending, "  image bitmap decode failed  ")
+            .unwrap();
+        assert_eq!(decode_failure.glb_asset_status().failed_uploads, 1);
+        assert_eq!(
+            decode_failure.glb_asset_status().last_failure,
+            Some("image bitmap decode failed")
+        );
+        let empty_reason = decode_failure
+            .prepare_glb(&crate::glb::tests::canonical_glb(true))
+            .unwrap();
+        decode_failure.fail_glb(empty_reason, " ").unwrap();
+        assert_eq!(
+            decode_failure.glb_asset_status().last_failure,
+            Some("browser image decode/supply 실패")
+        );
+        assert!(decode_failure.fail_glb(empty_reason, "stale").is_err());
+
+        let mut degenerate = Renderer::new(64, 48).unwrap();
+        let degenerate_pending = degenerate
+            .prepare_glb(&crate::glb::tests::canonical_degenerate_glb())
+            .unwrap();
+        degenerate
+            .supply_glb_image_rgba8(degenerate_pending, 0, 1, 1, &[220, 140, 70, 255])
+            .unwrap();
+        assert!(degenerate.commit_glb(degenerate_pending).is_err());
+        assert!(!degenerate.glb_asset_status().active);
+
+        commit_fixture(&mut scalar);
+        assert_eq!(scalar.glb_textures.len(), 2);
+
+        scalar
+            .load_obj(b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 3 2\n")
+            .unwrap();
+        assert!(!scalar.glb_asset_status().active);
+        assert!(scalar.set_glb_animation_playing(true).is_err());
+        assert!(scalar.set_glb_animation_looping(true).is_err());
+        assert!(scalar.seek_glb_animation(0.0).is_err());
     }
 }
