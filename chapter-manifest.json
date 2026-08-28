@@ -1,0 +1,163 @@
+{
+  "schemaVersion": 1,
+  "defaultChapter": "26",
+  "chapters": [
+    {
+      "number": "01",
+      "title": "소프트웨어 래스터라이저가 하는 일",
+      "commit": "a05da7a98566a08293c3f25d783646b196d0c3f7",
+      "reproduction": "exact"
+    },
+    {
+      "number": "02",
+      "title": "Rust-Wasm 프로젝트와 역할 경계",
+      "commit": "8a981041360d9b50b89b1b6f59946e94dfa47ff2",
+      "reproduction": "exact"
+    },
+    {
+      "number": "03",
+      "title": "프레임버퍼, 색, Canvas 표시",
+      "commit": "afdee4744ebcd70ba063d01d8973d8d573a11b6e",
+      "reproduction": "integrated",
+      "note": "4장과 통합된 구현"
+    },
+    {
+      "number": "04",
+      "title": "픽셀 좌표와 선 그리기",
+      "commit": "afdee4744ebcd70ba063d01d8973d8d573a11b6e",
+      "reproduction": "exact"
+    },
+    {
+      "number": "05",
+      "title": "벡터와 행렬을 필요한 만큼만",
+      "commit": "a62b2ce710b9378b7bcc0a5573ff1f18d440eedd",
+      "reproduction": "exact"
+    },
+    {
+      "number": "06",
+      "title": "좌표 공간과 MVP 변환",
+      "commit": "156f84fe913698dbf91808e11972e020f2febdb6",
+      "reproduction": "exact"
+    },
+    {
+      "number": "07",
+      "title": "카메라, 원근 투영, 동차좌표 w",
+      "commit": "35573cefc0c9d85ec96db3ecf27145308e090d0d",
+      "reproduction": "exact"
+    },
+    {
+      "number": "08",
+      "title": "Mesh, 인덱스, 정점 속성",
+      "commit": "de242014cd311a04b1dcf5979bdbca75c4f25154",
+      "reproduction": "exact"
+    },
+    {
+      "number": "09",
+      "title": "Winding, 퇴화 삼각형, Backface Culling",
+      "commit": "0df4763c7f999cdf597cee29dbdb6b0ec34b0e73",
+      "reproduction": "exact"
+    },
+    {
+      "number": "10",
+      "title": "동차 Clip 공간에서 삼각형 자르기",
+      "commit": "036fc8ba58e0bf8b2bcd6a3ffa80a24f772398af",
+      "reproduction": "exact"
+    },
+    {
+      "number": "11",
+      "title": "Edge 함수, 픽셀 중심, Top-left 규칙",
+      "commit": "c3ed2004e9081da953f26e44396d4f4451e79272",
+      "reproduction": "exact"
+    },
+    {
+      "number": "12",
+      "title": "Barycentric 좌표와 속성 보간",
+      "commit": "9847d0d420d5ce4bc690f3a3cd556f4fd85b97f8",
+      "reproduction": "exact"
+    },
+    {
+      "number": "13",
+      "title": "깊이 버퍼와 가려짐",
+      "commit": "8c3756ef769788e8ee295f2c1d153eae62bd2913",
+      "reproduction": "exact"
+    },
+    {
+      "number": "14",
+      "title": "Perspective-correct 보간",
+      "commit": "d1fd828b3d5e6d54efc30d500aa0378db1cf9ba6",
+      "reproduction": "exact"
+    },
+    {
+      "number": "15",
+      "title": "파이프라인 조립과 컬러 3D 큐브",
+      "commit": "bc5027f92aba4a43869f8b12881b749cb420941a",
+      "reproduction": "exact"
+    },
+    {
+      "number": "16",
+      "title": "웹 이미지 입력과 Texture 메모리",
+      "commit": "65956c7551d6d8c3e0f2b2a3a6338444c827c980",
+      "reproduction": "exact"
+    },
+    {
+      "number": "17",
+      "title": "UV 주소화, Nearest, Bilinear 샘플링",
+      "commit": "8cff8f7f058b70f9f8f91f5f90db61d9d9a2b862",
+      "reproduction": "exact"
+    },
+    {
+      "number": "18",
+      "title": "법선 변환과 Lambert 조명",
+      "commit": "479dc7a8308dba34fd3c506ae455ea99005df67d",
+      "reproduction": "exact"
+    },
+    {
+      "number": "19",
+      "title": "Blinn-Phong과 sRGB/Linear 색 공간",
+      "commit": "c458b53ab307968186971b20e95776cdc89de4fc",
+      "reproduction": "exact"
+    },
+    {
+      "number": "20",
+      "title": "마우스/키보드와 Orbit/Fly 카메라",
+      "commit": "7d03d734f415c266d9b70bda4aeaf97f9d617a99",
+      "reproduction": "exact"
+    },
+    {
+      "number": "21",
+      "title": "외부 모델 로딩: OBJ 기준선과 glTF 확장",
+      "commit": "ed03f9562029d4604fdce39807244d9a140d839f",
+      "reproduction": "exact"
+    },
+    {
+      "number": "22",
+      "title": "투명도, Alpha Test, Blending 순서",
+      "commit": "45ee8fc96ae95be55ac39abc8ee03bd2adc108aa",
+      "reproduction": "exact"
+    },
+    {
+      "number": "23",
+      "title": "Antialiasing과 Mipmap",
+      "commit": "d07ed43267bb413aafcbb4c1dbd082b0952b1ff1",
+      "reproduction": "exact"
+    },
+    {
+      "number": "24",
+      "title": "디버그 뷰, 테스트, 프로파일링",
+      "commit": "4d253e243b0fcb9ba9c062482605d173b972b267",
+      "reproduction": "exact"
+    },
+    {
+      "number": "25",
+      "title": "타일링, Worker, SIMD와 최종 Capstone",
+      "commit": "fdaec22beab1f8d64fa664c85aa984c7f58ba2c7",
+      "reproduction": "exact"
+    },
+    {
+      "number": "26",
+      "title": "GLB 장면, Skinning과 Animation",
+      "commit": "84422fc39ca30f78fdb8edcf20111ef8196c91ea",
+      "reproduction": "exact"
+    }
+  ]
+}

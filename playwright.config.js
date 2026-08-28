@@ -2,6 +2,7 @@ import { defineConfig } from "@playwright/test";
 
 export default defineConfig({
   testDir: "tests/e2e",
+  testIgnore: ["gallery.spec.js", "gallery.production.spec.js"],
   fullyParallel: false,
   workers: 1,
   timeout: 30_000,
@@ -9,6 +10,7 @@ export default defineConfig({
     timeout: 5_000,
   },
   reporter: [["line"], ["./tests/e2e/reporter.js"]],
+  outputDir: "test-results/current",
   use: {
     baseURL: "http://127.0.0.1:4173",
     viewport: { width: 1000, height: 720 },

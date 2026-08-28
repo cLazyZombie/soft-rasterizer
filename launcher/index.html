@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" type="image/png" href="./icon.png" />
+    <link rel="stylesheet" href="./style.css" />
+    <title>소프트웨어 래스터라이저 · 장별 실행본</title>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div class="brand">
+          <img src="./icon.png" alt="픽셀 프레임버퍼와 CPU 칩 아이콘" />
+          <div>
+            <p class="eyebrow">Rust · WebAssembly · Canvas 2D</p>
+            <h1>소프트웨어 래스터라이저 장별 실행본</h1>
+          </div>
+        </div>
+        <p class="introduction">
+          각 장을 완성한 실제 커밋을 독립된 정적 앱으로 실행합니다. 선택한 장의 DOM과 Wasm은 아래 iframe 안에서 다른 장과 격리됩니다.
+        </p>
+      </header>
+
+      <section class="chapter-toolbar" aria-label="실행할 장 선택">
+        <label for="chapter-select">장 선택</label>
+        <select id="chapter-select" disabled>
+          <option>manifest를 읽는 중…</option>
+        </select>
+        <a id="standalone-link" href="./chapters/26/" target="_blank" rel="noopener">
+          새 탭에서 열기
+        </a>
+      </section>
+
+      <section class="chapter-metadata" aria-live="polite">
+        <div>
+          <span>현재 실행본</span>
+          <strong id="chapter-title">불러오는 중…</strong>
+        </div>
+        <div>
+          <span>commit SHA</span>
+          <code id="chapter-commit">—</code>
+        </div>
+        <p id="chapter-note" hidden></p>
+      </section>
+
+      <p id="launcher-error" role="alert" hidden></p>
+
+      <div class="frame-shell">
+        <iframe
+          id="chapter-frame"
+          src="about:blank"
+          title="소프트웨어 래스터라이저 26장"
+          allow="fullscreen"
+        ></iframe>
+      </div>
+    </main>
+    <script type="module" src="./main.js"></script>
+  </body>
+</html>

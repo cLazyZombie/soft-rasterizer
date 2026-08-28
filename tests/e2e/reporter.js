@@ -79,6 +79,8 @@ export default class ChapterReporter {
         diffSha256: candidateDiffHash(),
         cargoLockSha256: fileHash("Cargo.lock"),
         pnpmLockSha256: fileHash("pnpm-lock.yaml"),
+        chapterManifestSha256: fileHash("chapter-manifest.json"),
+        chapterBuildReportSha256: fileHash("dist-chapters-test/build-report.json"),
         rustToolchain: commandOutput("rustc", ["--version"]),
       },
       browser: "Playwright Chromium",
@@ -90,7 +92,9 @@ export default class ChapterReporter {
       stepRuns: this.results.reduce((sum, entry) => sum + entry.steps, 0),
       reports: this.results,
     };
-    const reportDirectory = path.resolve("artifacts/e2e");
+    const reportDirectory = path.resolve(
+      process.env.SOFT_RASTERIZER_E2E_REPORT_DIR ?? "artifacts/e2e",
+    );
     mkdirSync(reportDirectory, { recursive: true });
     const serializedReport = `${JSON.stringify(report, null, 2)}\n`;
     writeFileSync(path.join(reportDirectory, `report-${executionMode}.json`), serializedReport);

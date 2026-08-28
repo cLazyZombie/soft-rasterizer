@@ -3,11 +3,11 @@ import globals from "globals";
 
 export default [
   {
-    ignores: ["dist/**", "web/pkg/**", "artifacts/**", "coverage/**"],
+    ignores: ["dist/**", "dist-*/**", "web/pkg/**", "artifacts/**", "coverage/**"],
   },
   js.configs.recommended,
   {
-    files: ["web/**/*.js"],
+    files: ["launcher/**/*.js", "web/**/*.js"],
     languageOptions: {
       globals: {
         ...globals.browser,

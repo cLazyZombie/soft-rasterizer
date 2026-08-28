@@ -12,7 +12,9 @@ pnpm run check
 pnpm run lint
 pnpm run test
 pnpm run build
+pnpm run build:current
 pnpm run e2e:smoke
 pnpm run e2e
+pnpm run e2e:chapters:run
 pnpm run check:duplication
 pnpm run coverage

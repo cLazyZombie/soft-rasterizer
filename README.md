@@ -24,20 +24,30 @@ cargo install --git https://github.com/cLazyZombie/lcov_filter --force
 brew install corca-ai/tap/nose
 ```
 
-개발 서버는 dev Wasm을 빌드한 뒤 Vite를 실행합니다.
+기본 개발 명령은 1–26장의 실제 commit을 갤러리로 빌드한 뒤 포트 5173에서 서비스합니다. 첫 실행은 과거 Wasm을 모두 빌드하므로 시간이 걸립니다.
 
 ```bash
 pnpm run dev
 ```
 
-터미널에 표시된 주소(기본값 `http://127.0.0.1:5173`)를 브라우저에서 엽니다. Canvas 내부 버퍼는 물리 픽셀 수가 아니라 CSS 논리 해상도를 사용합니다. 예를 들어 화면 폭이 물리 1920px이고 `devicePixelRatio`가 2라면 내부 폭은 960px입니다. 창 크기나 화면 배율이 바뀌면 `Renderer::resize`로 색/깊이 버퍼를 함께 다시 만들고 오래된 Wasm `TypedArray` view를 버립니다.
+터미널에 표시된 주소(기본값 `http://127.0.0.1:5173`)를 브라우저에서 열고 `/?chapter=16`처럼 장을 선택합니다. 현재 HEAD의 dev Wasm과 최신 장 앱만 단독으로 실행하려면 다음 명령을 사용합니다.
 
-release Wasm과 정적 웹 파일은 다음 명령으로 `dist/`에 만듭니다.
+```bash
+pnpm run dev:current
+```
+
+두 명령은 모두 포트 5173을 사용하므로 동시에 실행하지 않습니다.
+
+최신 장 앱의 Canvas 내부 버퍼는 물리 픽셀 수가 아니라 CSS 논리 해상도를 사용합니다. 예를 들어 화면 폭이 물리 1920px이고 `devicePixelRatio`가 2라면 내부 폭은 960px입니다. 창 크기나 화면 배율이 바뀌면 `Renderer::resize`로 색/깊이 버퍼를 함께 다시 만들고 오래된 Wasm `TypedArray` view를 버립니다.
+
+1–26장의 실제 commit을 각각 release Wasm 정적 앱으로 빌드하고 iframe 런처와 함께 `dist/`에 만들려면 다음 명령을 사용합니다. 빌드는 현재 working tree를 checkout하지 않으며 각 revision의 lockfile을 사용합니다.
 
 ```bash
 pnpm run build
-pnpm exec vite preview --config vite.config.js
+pnpm exec vite preview --config vite.gallery.config.js
 ```
+
+`/?chapter=16`처럼 직접 접근할 수 있고 각 장의 standalone URL은 `/chapters/16/` 형식입니다. 현재 HEAD만 단독으로 release 빌드하려면 `pnpm run build:current`를 사용하며 출력은 `dist-current/`에 생성됩니다.
 
 주요 검증 명령은 다음과 같습니다.
 
@@ -49,13 +59,14 @@ pnpm run lint
 pnpm run test
 pnpm run e2e:smoke
 pnpm run e2e
+pnpm run e2e:chapters
 pnpm run e2e:headed
 pnpm run check:duplication
 pnpm run coverage
 pnpm run verify
 ```
 
-`pnpm run verify`는 frozen install부터 format, 전체 headless E2E, Rust 중복 검사, 마지막 clean coverage까지 저장소 표준 순서로 실행합니다. 실제 창 lifecycle과 DPR 경계를 확인할 때는 test automation 빌드까지 포함하는 `pnpm run e2e:headed`를 사용합니다.
+`pnpm run verify`는 frozen install부터 format, 최신장 전체 headless E2E, 1–26장 갤러리 E2E, Rust 중복 검사, 마지막 clean coverage까지 저장소 표준 순서로 실행합니다. 실제 창 lifecycle과 DPR 경계를 확인할 때는 test automation 빌드까지 포함하는 `pnpm run e2e:headed`를 사용합니다. 장별 빌드 구조와 3장 통합 구현 예외는 [장별 정적 실행본 결정](doc/decisions/chapter-static-gallery.md)에 기록되어 있습니다.
 
 Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source marker로만 표현합니다. 한 줄은 `LCOV_EXCL_LINE`, 최소 범위는 `LCOV_EXCL_START`/`LCOV_EXCL_STOP`, 파일 전체는 첫 번째 비어 있지 않은 줄의 `LCOV_EXCL_FILE`을 사용합니다. `LINE`, `START`, `FILE` marker에는 같은 줄의 사유가 필요합니다. 자세한 계약은 [coverage 제외 결정](doc/decisions/coverage-exclusions.md)을 따릅니다.
 
@@ -65,6 +76,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - [좌표·카메라·깊이 결정](doc/decisions/coordinates.md)
 - [최종 Capstone 구현과 성능 보고서](doc/capstone-report.md)
 - [GLB runtime loading 구현 가이드](doc/glb-runtime-loading.md)
+- [장별 정적 실행본과 iframe 런처 결정](doc/decisions/chapter-static-gallery.md)
 - [코딩 에이전트와 장별로 일하는 방법](doc/appendix-a-코딩-에이전트와-장별로-일하는-방법.md)
 - [최소 공개 계약과 데이터 구조](doc/appendix-b-최소-공개-계약과-데이터-구조.md)
 - [수학과 알고리즘 빠른 참조](doc/appendix-c-수학과-알고리즘-빠른-참조.md)

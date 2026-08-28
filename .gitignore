@@ -36,6 +36,7 @@ node_modules/
 
 # Web build and tool caches
 dist/
+dist-*/
 build/
 .cache/
 .vite/

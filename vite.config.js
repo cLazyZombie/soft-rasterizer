@@ -7,7 +7,7 @@ export default defineConfig(({ mode }) => ({
     __AUTOMATION__: JSON.stringify(mode === "test"),
   },
   build: {
-    outDir: "../dist",
+    outDir: mode === "test" ? "../dist-current-test" : "../dist-current",
     emptyOutDir: true,
   },
   server: {
