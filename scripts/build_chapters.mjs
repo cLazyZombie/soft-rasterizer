@@ -20,6 +20,8 @@ const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(SCRIPT_DIRECTORY, "..");
 const FULL_COMMIT_SHA = /^[0-9a-f]{40}$/;
 const CHAPTER_NUMBER = /^(0[1-9]|1[0-9]|2[0-6])$/;
+const UI_ID = /^[a-z][a-z0-9-]*$/;
+const UI_REGION = /^[#.][a-z][a-z0-9-]*$/;
 const GENERATED_OUTPUT_DIRECTORY = /^dist(?:-[a-z0-9][a-z0-9._-]*)?$/i;
 const ROOT_ASSET_REFERENCE = /(?:src|href)=(?:"|')\/(?!\/)/;
 
@@ -81,6 +83,72 @@ export function validateManifest(manifest) {
     fail("chapter manifest의 기본 장이 chapters에 없습니다.");
   }
   return manifest;
+}
+
+function validateUniqueStrings(values, description, pattern) {
+  if (!Array.isArray(values)) fail(`${description}는 배열이어야 합니다.`);
+  const unique = new Set();
+  for (const value of values) {
+    if (typeof value !== "string" || !pattern.test(value)) {
+      fail(`${description}에 유효하지 않은 값이 있습니다: ${String(value)}`);
+    }
+    if (unique.has(value)) fail(`${description}에 중복된 값이 있습니다: ${value}`);
+    unique.add(value);
+  }
+  return unique;
+}
+
+export function validateUiPolicy(policy) {
+  if (policy === null || typeof policy !== "object" || Array.isArray(policy)) {
+    fail("chapter UI 정책은 JSON object여야 합니다.");
+  }
+  if (policy.schemaVersion !== 1) {
+    fail("chapter UI 정책 schemaVersion은 1이어야 합니다.");
+  }
+  const knownRegions = validateUniqueStrings(policy.regions, "chapter UI 공통 regions", UI_REGION);
+  if (!Array.isArray(policy.chapters) || policy.chapters.length !== 26) {
+    fail(`chapter UI 정책은 26개 장을 가져야 합니다: ${policy.chapters?.length ?? 0}`);
+  }
+
+  const numbers = new Set();
+  for (const chapter of policy.chapters) {
+    if (chapter === null || typeof chapter !== "object" || Array.isArray(chapter)) {
+      fail("각 chapter UI 항목은 JSON object여야 합니다.");
+    }
+    if (!CHAPTER_NUMBER.test(chapter.number)) {
+      fail(`chapter UI 장 번호가 유효하지 않습니다: ${String(chapter.number)}`);
+    }
+    if (numbers.has(chapter.number)) {
+      fail(`chapter UI 장 번호가 중복되었습니다: ${chapter.number}`);
+    }
+    numbers.add(chapter.number);
+    validateUniqueStrings(chapter.controls, `${chapter.number}장 controls`, UI_ID);
+    validateUniqueStrings(chapter.stats, `${chapter.number}장 stats`, UI_ID);
+    const regions = validateUniqueStrings(
+      chapter.regions,
+      `${chapter.number}장 regions`,
+      UI_REGION,
+    );
+    for (const region of regions) {
+      if (!knownRegions.has(region)) {
+        fail(`${chapter.number}장의 알 수 없는 UI region입니다: ${region}`);
+      }
+    }
+  }
+
+  for (let number = 1; number <= 26; number += 1) {
+    const padded = String(number).padStart(2, "0");
+    if (!numbers.has(padded)) fail(`chapter UI 정책에 ${padded}장이 없습니다.`);
+  }
+  return policy;
+}
+
+function selectUiPolicy(policy, selectedNumbers) {
+  const selected = new Set(selectedNumbers);
+  return {
+    ...structuredClone(policy),
+    chapters: policy.chapters.filter((chapter) => selected.has(chapter.number)),
+  };
 }
 
 export function selectManifestChapters(manifest, requestedNumbers) {
@@ -214,6 +282,107 @@ function sha256File(file) {
   return sha256(readFileSync(file));
 }
 
+function matches(html, pattern) {
+  return [...html.matchAll(pattern)].map((match) => match[1]);
+}
+
+function validateArchivedUiId(id, chapterNumber) {
+  if (!UI_ID.test(id)) {
+    fail(`${chapterNumber}장 archive에 CSS로 안전하게 처리할 수 없는 UI id가 있습니다: ${id}`);
+  }
+  return id;
+}
+
+function regionExists(html, selector) {
+  const [prefix, name] = [selector[0], selector.slice(1)];
+  if (prefix === "#") {
+    return new RegExp(`\\bid=["']${name}["']`).test(html);
+  }
+  return matches(html, /\bclass=["']([^"']+)["']/g).some((classes) =>
+    classes.split(/\s+/).includes(name),
+  );
+}
+
+function escapeHtml(text) {
+  return text
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;");
+}
+
+export function applyChapterUiScope(sourceDirectory, chapter, uiChapter, knownRegions) {
+  const indexPath = path.join(sourceDirectory, "web", "index.html");
+  let html = readFileSync(indexPath, "utf8");
+  if (html.includes("data-chapter-ui-scope=")) {
+    fail(`${chapter.number}장 archive에 chapter UI scope가 이미 적용되어 있습니다.`);
+  }
+
+  const controlIds = new Set(
+    [
+      ...matches(html, /<label\b[^>]*\bfor=["']([^"']+)["'][^>]*>/g),
+      ...matches(html, /<button\b[^>]*\bid=["']([^"']+)["'][^>]*>/g),
+    ].map((id) => validateArchivedUiId(id, chapter.number)),
+  );
+  const statIds = new Set(
+    matches(html, /<dd\b[^>]*\bid=["']([^"']+)["'][^>]*>/g).map((id) =>
+      validateArchivedUiId(id, chapter.number),
+    ),
+  );
+  const visibleControls = new Set(uiChapter.controls);
+  const visibleStats = new Set(uiChapter.stats);
+  const visibleRegions = new Set(uiChapter.regions);
+
+  for (const id of visibleControls) {
+    if (!controlIds.has(id)) fail(`${chapter.number}장 archive에 control #${id}가 없습니다.`);
+  }
+  for (const id of visibleStats) {
+    if (!statIds.has(id)) fail(`${chapter.number}장 archive에 stat #${id}가 없습니다.`);
+  }
+  for (const selector of visibleRegions) {
+    if (!regionExists(html, selector)) {
+      fail(`${chapter.number}장 archive에 UI region ${selector}가 없습니다.`);
+    }
+  }
+
+  const hiddenSelectors = [];
+  for (const id of controlIds) {
+    if (!visibleControls.has(id)) hiddenSelectors.push(`label[for="${id}"]`, `#${id}`);
+  }
+  for (const id of statIds) {
+    if (!visibleStats.has(id)) hiddenSelectors.push(`dt:has(+ dd#${id})`, `dd#${id}`);
+  }
+  for (const selector of knownRegions) {
+    if (!visibleRegions.has(selector)) hiddenSelectors.push(selector);
+  }
+
+  const rules = [
+    "/* 현재 장의 학습 계약 밖에 있는 누적 UI만 숨긴다. DOM은 과거 JS 연결을 위해 보존한다. */",
+  ];
+  if (hiddenSelectors.length > 0) {
+    rules.push(`${hiddenSelectors.join(",\n")} {\n  display: none !important;\n}`);
+  }
+  if (visibleControls.size === 0) rules.push(".controls {\n  display: none !important;\n}");
+  if (visibleStats.size === 0) rules.push("dl {\n  display: none !important;\n}");
+  const scopedStyle = `  <style id="chapter-ui-scope">\n${rules.join("\n\n")}\n  </style>\n`;
+
+  html = html.replace("</head>", `${scopedStyle}</head>`);
+  html = html.replace(
+    /<html\b/,
+    `<html data-chapter-ui-scope="${chapter.number}"`,
+  );
+  const heading = `${Number(chapter.number)}장 · ${chapter.title}`;
+  html = html.replace(/<title>[\s\S]*?<\/title>/, `<title>${escapeHtml(heading)}</title>`);
+  html = html.replace(/<h1>[\s\S]*?<\/h1>/, `<h1>${escapeHtml(heading)}</h1>`);
+  writeFileSync(indexPath, html);
+
+  return {
+    visibleControls: [...visibleControls],
+    visibleStats: [...visibleStats],
+    visibleRegions: [...visibleRegions],
+  };
+}
+
 function filesRecursively(directory, relativeDirectory = "") {
   const absoluteDirectory = path.join(directory, relativeDirectory);
   return readdirSync(absoluteDirectory, { withFileTypes: true })
@@ -263,13 +432,17 @@ function verifyManifestCommits(manifest, repositoryRoot) {
   }
 }
 
-function prepareOutput(stageDirectory, manifest, repositoryRoot) {
+function prepareOutput(stageDirectory, manifest, uiPolicy, repositoryRoot) {
   mkdirSync(stageDirectory, { recursive: true });
   cpSync(path.join(repositoryRoot, "launcher"), stageDirectory, { recursive: true });
   copyFileSync(path.join(repositoryRoot, "web", "icon.png"), path.join(stageDirectory, "icon.png"));
   writeFileSync(
     path.join(stageDirectory, "chapter-manifest.json"),
     `${JSON.stringify(manifest, null, 2)}\n`,
+  );
+  writeFileSync(
+    path.join(stageDirectory, "chapter-ui.json"),
+    `${JSON.stringify(uiPolicy, null, 2)}\n`,
   );
   mkdirSync(path.join(stageDirectory, "chapters"), { recursive: true });
 }
@@ -358,6 +531,7 @@ export function writeBuildReport(stageDirectory, mode, chapterReports) {
     schemaVersion: 1,
     mode,
     manifestSha256: sha256File(path.join(stageDirectory, "chapter-manifest.json")),
+    uiPolicySha256: sha256File(path.join(stageDirectory, "chapter-ui.json")),
     chapterCount: chapterReports.length,
     chapters: chapterReports,
   };
@@ -369,6 +543,14 @@ export function buildChapterGallery(options = {}) {
   const manifestPath = path.join(repositoryRoot, "chapter-manifest.json");
   const sourceManifest = validateManifest(JSON.parse(readFileSync(manifestPath, "utf8")));
   const manifest = selectManifestChapters(sourceManifest, options.chapters);
+  const sourceUiPolicy = validateUiPolicy(
+    JSON.parse(readFileSync(path.join(repositoryRoot, "chapter-ui.json"), "utf8")),
+  );
+  const uiPolicy = selectUiPolicy(
+    sourceUiPolicy,
+    manifest.chapters.map((chapter) => chapter.number),
+  );
+  const uiByChapter = new Map(uiPolicy.chapters.map((chapter) => [chapter.number, chapter]));
   verifyManifestCommits(manifest, repositoryRoot);
 
   const productionTarget = assertSafeOutputDirectory(
@@ -398,8 +580,8 @@ export function buildChapterGallery(options = {}) {
   const testReports = [];
 
   try {
-    prepareOutput(productionStage, manifest, repositoryRoot);
-    if (testStage !== undefined) prepareOutput(testStage, manifest, repositoryRoot);
+    prepareOutput(productionStage, manifest, uiPolicy, repositoryRoot);
+    if (testStage !== undefined) prepareOutput(testStage, manifest, uiPolicy, repositoryRoot);
 
     for (const chapter of manifest.chapters) {
       process.stdout.write(`\n[chapter ${chapter.number}] ${chapter.commit}\n`);
@@ -407,6 +589,12 @@ export function buildChapterGallery(options = {}) {
       const archivePath = path.join(temporaryRoot, `chapter-${chapter.number}.tar`);
       extractCommit(repositoryRoot, chapter.commit, sourceDirectory, archivePath);
       assertArchivedBuildContract(sourceDirectory, chapter.number);
+      const ui = applyChapterUiScope(
+        sourceDirectory,
+        chapter,
+        uiByChapter.get(chapter.number),
+        uiPolicy.regions,
+      );
 
       const environment = {
         ...process.env,
@@ -426,6 +614,7 @@ export function buildChapterGallery(options = {}) {
         commit: chapter.commit,
         pnpmLockSha256: sha256File(path.join(sourceDirectory, "pnpm-lock.yaml")),
         cargoLockSha256: sha256File(path.join(sourceDirectory, "Cargo.lock")),
+        ui,
         output: validateBuiltChapter(productionChapterDirectory),
       });
 
@@ -437,6 +626,7 @@ export function buildChapterGallery(options = {}) {
           commit: chapter.commit,
           pnpmLockSha256: sha256File(path.join(sourceDirectory, "pnpm-lock.yaml")),
           cargoLockSha256: sha256File(path.join(sourceDirectory, "Cargo.lock")),
+          ui,
           output: validateBuiltChapter(testChapterDirectory),
         });
       }

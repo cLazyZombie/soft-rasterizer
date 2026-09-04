@@ -264,7 +264,7 @@ impl RenderTarget {
     }
 
     pub fn clear_color(&mut self, color: Color) {
-        for pixel in self.color.chunks_exact_mut(4) {
+        for pixel in self.color.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&color.rgba());
         }
         self.depth.fill(f32::INFINITY);
@@ -5201,8 +5201,10 @@ mod tests {
         assert!(
             target
                 .color()
-                .chunks_exact(4)
-                .all(|pixel| pixel == [7, 11, 13, 255])
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .all(|pixel| *pixel == [7, 11, 13, 255])
         );
         assert!(target.depth().iter().all(|depth| *depth == f32::INFINITY));
     }
@@ -5688,13 +5690,17 @@ mod tests {
         let cyan = [108, 225, 255, 255];
         let orange_count = renderer
             .color_buffer()
-            .chunks_exact(4)
-            .filter(|pixel| *pixel == orange)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| **pixel == orange)
             .count();
         let cyan_count = renderer
             .color_buffer()
-            .chunks_exact(4)
-            .filter(|pixel| *pixel == cyan)
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .filter(|pixel| **pixel == cyan)
             .count();
         assert_eq!((orange_count, cyan_count), (528, 496));
         assert_eq!(orange_count + cyan_count, stats.shaded_samples as usize);
@@ -6482,14 +6488,16 @@ mod tests {
         assert!(
             renderer
                 .color_buffer()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [72, 232, 112, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[72, 232, 112, 255])
         );
         assert!(
             !renderer
                 .color_buffer()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [255, 82, 92, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[255, 82, 92, 255])
         );
         assert!(facing.depth_failed_samples > 0);
 
@@ -6504,8 +6512,9 @@ mod tests {
         assert!(
             renderer
                 .color_buffer()
-                .chunks_exact(4)
-                .any(|pixel| pixel == [255, 82, 92, 255])
+                .as_chunks::<4>()
+                .0
+                .contains(&[255, 82, 92, 255])
         );
 
         renderer.set_cull_mode(CullMode::None);
@@ -6530,8 +6539,9 @@ mod tests {
             assert!(
                 renderer
                     .color_buffer()
-                    .chunks_exact(4)
-                    .any(|pixel| pixel == expected),
+                    .as_chunks::<4>()
+                    .0
+                    .contains(&expected),
                 "missing stage color {expected:?}"
             );
         }
@@ -7272,7 +7282,7 @@ mod tests {
     fn chapter_fifteen_cube_submission_order_keeps_visible_surface_exact() {
         let mesh = unit_cube_mesh();
         let mut reversed_indices = Vec::with_capacity(mesh.indices().len());
-        for triangle in mesh.indices().chunks_exact(3).rev() {
+        for triangle in mesh.indices().as_chunks::<3>().0.iter().rev() {
             reversed_indices.extend_from_slice(triangle);
         }
         let reversed = Mesh::new(mesh.vertices().to_vec(), reversed_indices).unwrap();
@@ -7472,8 +7482,10 @@ mod tests {
         let mut bounds = None;
         for (index, (old, new)) in previous
             .color()
-            .chunks_exact(4)
-            .zip(chapter_fifteen.color().chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(chapter_fifteen.color().as_chunks::<4>().0.iter())
             .enumerate()
         {
             let pixel_difference = old.iter().zip(new).any(|(old, new)| old != new);
@@ -7750,8 +7762,10 @@ mod tests {
         let mut max_channel_difference = 0_u8;
         for (first, second) in first
             .color()
-            .chunks_exact(4)
-            .zip(second.color().chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(second.color().as_chunks::<4>().0.iter())
         {
             if first != second {
                 differing_pixels += 1;
@@ -8736,8 +8750,10 @@ mod tests {
         assert!(
             renderer
                 .color_buffer()
-                .chunks_exact(4)
-                .any(|pixel| pixel == overdraw_debug_color(1).rgba())
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .any(|pixel| *pixel == overdraw_debug_color(1).rgba())
         );
         renderer.resize(64, 64).unwrap();
 

@@ -1,0 +1,219 @@
+{
+  "schemaVersion": 1,
+  "regions": ["#coordinate-debug", ".space-legend", "#fox-attribution"],
+  "chapters": [
+    {
+      "number": "01",
+      "controls": [],
+      "stats": ["internal-size", "css-size", "display-scale", "present-path", "frame-index"],
+      "regions": []
+    },
+    {
+      "number": "02",
+      "controls": [],
+      "stats": [
+        "frame-index",
+        "high-level-calls",
+        "wasm-boundary-calls",
+        "input-time",
+        "update-time",
+        "present-time",
+        "frame-time"
+      ],
+      "regions": []
+    },
+    {
+      "number": "03",
+      "controls": [],
+      "stats": ["internal-size", "css-size", "display-scale", "present-path", "framebuffer-mib"],
+      "regions": []
+    },
+    {
+      "number": "04",
+      "controls": [],
+      "stats": ["line-algorithm"],
+      "regions": []
+    },
+    {
+      "number": "05",
+      "controls": [],
+      "stats": ["math-convention"],
+      "regions": []
+    },
+    {
+      "number": "06",
+      "controls": [],
+      "stats": [],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "07",
+      "controls": [],
+      "stats": [],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "08",
+      "controls": [],
+      "stats": [],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "09",
+      "controls": ["cull-mode", "winding-debug"],
+      "stats": [],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "10",
+      "controls": ["clip-debug"],
+      "stats": [],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "11",
+      "controls": ["coverage-debug"],
+      "stats": ["coverage-algorithm"],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "12",
+      "controls": ["barycentric-debug", "interpolation-debug"],
+      "stats": ["interpolation-algorithm"],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "13",
+      "controls": ["depth-debug", "depth-order-reversed", "depth-debug-mode"],
+      "stats": ["depth-algorithm"],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "14",
+      "controls": ["perspective-debug", "attribute-interpolation-mode"],
+      "stats": ["interpolation-algorithm"],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "15",
+      "controls": ["pipeline-debug-mode"],
+      "stats": ["pipeline-algorithm"],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "16",
+      "controls": ["texture-file", "texture-debug"],
+      "stats": ["texture-status"],
+      "regions": []
+    },
+    {
+      "number": "17",
+      "controls": [
+        "attribute-interpolation-mode",
+        "texture-sampling",
+        "texture-filter",
+        "texture-address-u",
+        "texture-address-v"
+      ],
+      "stats": ["texture-sampler", "texture-sample-stats"],
+      "regions": []
+    },
+    {
+      "number": "18",
+      "controls": [
+        "pipeline-debug-mode",
+        "lighting-enabled",
+        "normal-mode",
+        "light-x",
+        "light-y",
+        "light-z",
+        "light-intensity"
+      ],
+      "stats": ["lighting-status", "lighting-sample-stats"],
+      "regions": []
+    },
+    {
+      "number": "19",
+      "controls": [
+        "pipeline-debug-mode",
+        "lighting-enabled",
+        "shader-mode",
+        "light-x",
+        "light-y",
+        "light-z",
+        "light-intensity",
+        "specular-color",
+        "shininess"
+      ],
+      "stats": ["lighting-status", "lighting-sample-stats"],
+      "regions": []
+    },
+    {
+      "number": "20",
+      "controls": ["camera-mode"],
+      "stats": ["camera-status"],
+      "regions": []
+    },
+    {
+      "number": "21",
+      "controls": ["mesh-file"],
+      "stats": ["mesh-status"],
+      "regions": []
+    },
+    {
+      "number": "22",
+      "controls": [
+        "alpha-mode",
+        "alpha-cutoff",
+        "transparency-debug",
+        "transparent-sort",
+        "blend-color-space"
+      ],
+      "stats": ["transparency-status"],
+      "regions": []
+    },
+    {
+      "number": "23",
+      "controls": ["texture-sampling", "quality-mode", "mipmap-enabled", "mip-debug"],
+      "stats": ["texture-sample-stats", "quality-status", "update-time", "frame-time"],
+      "regions": []
+    },
+    {
+      "number": "24",
+      "controls": ["pipeline-debug-mode"],
+      "stats": [
+        "overdraw-stats",
+        "input-time",
+        "update-time",
+        "present-time",
+        "frame-time",
+        "timing-window"
+      ],
+      "regions": ["#coordinate-debug", ".space-legend"]
+    },
+    {
+      "number": "25",
+      "controls": ["raster-path"],
+      "stats": [
+        "raster-status",
+        "parallel-capability",
+        "update-time",
+        "frame-time",
+        "timing-window"
+      ],
+      "regions": []
+    },
+    {
+      "number": "26",
+      "controls": [
+        "mesh-file",
+        "animation-clip",
+        "animation-play",
+        "animation-loop",
+        "animation-time"
+      ],
+      "stats": ["mesh-status", "glb-status", "animation-status"],
+      "regions": ["#fox-attribution"]
+    }
+  ]
+}

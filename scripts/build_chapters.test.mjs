@@ -7,6 +7,7 @@ import path from "node:path";
 import test from "node:test";
 
 import {
+  applyChapterUiScope,
   assertIndependentOutputDirectories,
   assertSafeOutputDirectory,
   cargoTargetDirectory,
@@ -16,6 +17,7 @@ import {
   selectManifestChapters,
   validateBuiltChapter,
   validateManifest,
+  validateUiPolicy,
   writeBuildReport,
 } from "./build_chapters.mjs";
 
@@ -30,6 +32,19 @@ function completeManifest() {
       title: `${index + 1}장`,
       commit: FULL_SHA,
       reproduction: "exact",
+    })),
+  };
+}
+
+function completeUiPolicy() {
+  return {
+    schemaVersion: 1,
+    regions: ["#coordinate-debug", ".space-legend", "#fox-attribution"],
+    chapters: Array.from({ length: 26 }, (_, index) => ({
+      number: String(index + 1).padStart(2, "0"),
+      controls: [],
+      stats: [],
+      regions: [],
     })),
   };
 }
@@ -74,6 +89,91 @@ test("manifest는 1–26장과 전체 SHA를 검증한다", () => {
       }),
     /note가 필요/,
   );
+});
+
+test("장별 UI 정책은 1–26장의 control, stat과 region 계약을 검증한다", () => {
+  const policy = completeUiPolicy();
+  assert.equal(validateUiPolicy(policy), policy);
+
+  assert.throws(
+    () => validateUiPolicy({ ...policy, chapters: policy.chapters.slice(1) }),
+    /26개 장/,
+  );
+  assert.throws(
+    () =>
+      validateUiPolicy({
+        ...policy,
+        chapters: policy.chapters.map((chapter, index) =>
+          index === 0 ? { ...chapter, controls: ["bad id"] } : chapter,
+        ),
+      }),
+    /유효하지 않은 값/,
+  );
+  assert.throws(
+    () =>
+      validateUiPolicy({
+        ...policy,
+        chapters: policy.chapters.map((chapter, index) =>
+          index === 0 ? { ...chapter, regions: ["#unknown"] } : chapter,
+        ),
+      }),
+    /알 수 없는 UI region/,
+  );
+});
+
+test("과거 장 archive에는 현재 장의 UI만 보이는 scope를 주입한다", () => {
+  const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "chapter-ui-scope-test-"));
+  try {
+    const webDirectory = path.join(temporaryRoot, "web");
+    mkdirSync(webDirectory);
+    writeFileSync(
+      path.join(webDirectory, "index.html"),
+      `<!doctype html>
+<html lang="ko">
+  <head><title>과거 제목</title></head>
+  <body>
+    <h1>과거 제목</h1>
+    <div class="controls">
+      <label for="current-control"><input id="current-control" /></label>
+      <label for="old-control"><input id="old-control" /></label>
+      <button id="old-button">누적 버튼</button>
+    </div>
+    <p class="space-legend">현재 범례</p>
+    <pre id="coordinate-debug">누적 진단</pre>
+    <dl><dt>현재</dt><dd id="current-stat">1</dd><dt>과거</dt><dd id="old-stat">2</dd></dl>
+  </body>
+</html>`,
+    );
+    const summary = applyChapterUiScope(
+      temporaryRoot,
+      { number: "12", title: "Barycentric 좌표와 속성 보간" },
+      {
+        number: "12",
+        controls: ["current-control"],
+        stats: ["current-stat"],
+        regions: [".space-legend"],
+      },
+      ["#coordinate-debug", ".space-legend", "#fox-attribution"],
+    );
+    const html = readFileSync(path.join(webDirectory, "index.html"), "utf8");
+
+    assert.deepEqual(summary, {
+      visibleControls: ["current-control"],
+      visibleStats: ["current-stat"],
+      visibleRegions: [".space-legend"],
+    });
+    assert.match(html, /data-chapter-ui-scope="12"/);
+    assert.match(html, /<title>12장 · Barycentric 좌표와 속성 보간<\/title>/);
+    assert.match(html, /<h1>12장 · Barycentric 좌표와 속성 보간<\/h1>/);
+    assert.match(html, /label\[for="old-control"\]/);
+    assert.match(html, /#old-button/);
+    assert.match(html, /dd#old-stat/);
+    assert.match(html, /#coordinate-debug/);
+    assert.doesNotMatch(html, /label\[for="current-control"\]/);
+    assert.doesNotMatch(html, /dd#current-stat/);
+  } finally {
+    rmSync(temporaryRoot, { recursive: true, force: true });
+  }
 });
 
 test("focused 장 선택은 manifest 순서와 안전한 기본 장을 유지한다", () => {
@@ -202,13 +302,19 @@ test("build report는 실제 staged manifest의 hash를 기록한다", () => {
   const temporaryRoot = mkdtempSync(path.join(os.tmpdir(), "chapter-report-test-"));
   try {
     const manifestBytes = `${JSON.stringify({ chapters: [{ number: "16" }] })}\n`;
+    const uiPolicyBytes = `${JSON.stringify({ chapters: [{ number: "16" }] })}\n`;
     writeFileSync(path.join(temporaryRoot, "chapter-manifest.json"), manifestBytes);
+    writeFileSync(path.join(temporaryRoot, "chapter-ui.json"), uiPolicyBytes);
     writeBuildReport(temporaryRoot, "production", [{ number: "16" }]);
     const report = JSON.parse(readFileSync(path.join(temporaryRoot, "build-report.json"), "utf8"));
     assert.equal(report.chapterCount, 1);
     assert.equal(
       report.manifestSha256,
       createHash("sha256").update(manifestBytes).digest("hex"),
+    );
+    assert.equal(
+      report.uiPolicySha256,
+      createHash("sha256").update(uiPolicyBytes).digest("hex"),
     );
   } finally {
     rmSync(temporaryRoot, { recursive: true, force: true });

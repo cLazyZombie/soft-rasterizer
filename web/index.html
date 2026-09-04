@@ -54,6 +54,24 @@
         background: #000;
       }
 
+      .framebuffer-stage {
+        position: relative;
+      }
+
+      .frame-rate {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        padding: 5px 8px;
+        border: 1px solid rgb(142 161 189 / 70%);
+        border-radius: 5px;
+        background: rgb(13 20 34 / 82%);
+        color: #eef4ff;
+        font: 600 14px/1.2 ui-monospace, SFMono-Regular, Menlo, monospace;
+        font-variant-numeric: tabular-nums;
+        pointer-events: none;
+      }
+
       .controls {
         display: flex;
         flex-wrap: wrap;
@@ -334,7 +352,10 @@
           Mip level debug
         </label>
       </div>
-      <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
+      <div class="framebuffer-stage">
+        <canvas id="framebuffer" width="1" height="1" tabindex="0" aria-label="소프트웨어 래스터라이저 출력과 카메라 입력"></canvas>
+        <output id="current-fps" class="frame-rate" aria-label="현재 프레임 속도">FPS 측정 중</output>
+      </div>
       <p class="space-legend">
         transform → clip → fan → divide/viewport + 1/w → cull/setup → scalar 또는 disjoint 16×16 tile coverage → affine z_ndc → strict depth &lt; → perspective attributes → linear shade → sRGB write · opaque/cutout depth write → transparent back-to-front → strict depth test, no write → linear source-over · optional 2x render → linear 2x2 resolve · perspective dUV → nearest mip · UV/overdraw diagnostic post-view
       </p>

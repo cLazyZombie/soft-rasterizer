@@ -2,6 +2,8 @@ import { expect, test } from "@playwright/test";
 import { readFileSync } from "node:fs";
 
 const manifest = JSON.parse(readFileSync("chapter-manifest.json", "utf8"));
+const uiPolicy = JSON.parse(readFileSync("chapter-ui.json", "utf8"));
+const uiByChapter = new Map(uiPolicy.chapters.map((chapter) => [chapter.number, chapter]));
 const REPRESENTATIVE_CHAPTERS = ["01", "04", "10", "15", "16", "20", "21", "25", "26"];
 const REPRESENTATIVE_HASHES = {
   "01": "7c64ddc5",
@@ -58,6 +60,43 @@ async function deterministicSnapshot(page, number) {
     });
   }
   return page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+}
+
+async function visibleChapterUi(page) {
+  return page.evaluate((knownRegions) => {
+    const visible = (element) => {
+      const style = getComputedStyle(element);
+      return (
+        style.display !== "none" &&
+        style.visibility !== "hidden" &&
+        element.getClientRects().length > 0
+      );
+    };
+    const controls = [
+      ...[...document.querySelectorAll("label[for]")]
+        .filter(visible)
+        .map((label) => label.htmlFor),
+      ...[...document.querySelectorAll("button[id]")]
+        .filter(visible)
+        .map((button) => button.id),
+    ].sort();
+    const stats = [...document.querySelectorAll("dd[id]")]
+      .filter(visible)
+      .map((entry) => entry.id)
+      .sort();
+    const regions = knownRegions
+      .filter((selector) => {
+        const element = document.querySelector(selector);
+        return element !== null && visible(element);
+      })
+      .sort();
+    return {
+      scope: document.documentElement.dataset.chapterUiScope,
+      controls,
+      stats,
+      regions,
+    };
+  }, uiPolicy.regions);
 }
 
 test("chapter_launcher: manifest, 직접 접근과 iframe metadata가 일치한다", async ({
@@ -187,13 +226,15 @@ for (const chapter of manifest.chapters) {
   }, testInfo) => {
     testInfo.annotations.push(
       { type: "scenario", description: `chapter_${chapter.number}_boot` },
-      { type: "steps", description: "5" },
+      { type: "steps", description: "6" },
     );
     const errors = observeErrors(page);
     await installCanvasContextAudit(page);
     await openStandaloneChapter(page, chapter.number);
     const snapshot = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
     const contexts = await page.evaluate(() => window.__chapterRequestedContexts);
+    const visibleUi = await visibleChapterUi(page);
+    const expectedUi = uiByChapter.get(chapter.number);
 
     expect(snapshot.internalSize[0]).toBeGreaterThan(0);
     expect(snapshot.internalSize[1]).toBeGreaterThan(0);
@@ -202,6 +243,15 @@ for (const chapter of manifest.chapters) {
     expect(contexts).not.toContain("webgl");
     expect(contexts).not.toContain("webgl2");
     expect(contexts).not.toContain("webgpu");
+    expect(visibleUi).toEqual({
+      scope: chapter.number,
+      controls: [...expectedUi.controls].sort(),
+      stats: [...expectedUi.stats].sort(),
+      regions: [...expectedUi.regions].sort(),
+    });
+    await expect(page.locator("h1")).toHaveText(
+      `${Number(chapter.number)}장 · ${chapter.title}`,
+    );
     expect(errors).toEqual([]);
 
     testInfo.annotations.push({
@@ -211,12 +261,41 @@ for (const chapter of manifest.chapters) {
         commit: chapter.commit,
         internalSize: snapshot.internalSize,
         pixelHash: snapshot.pixelHash,
+        visibleUi,
         requestedContexts: contexts,
         consoleErrors: errors,
       }),
     });
   });
 }
+
+test("chapter_23_mipmap: 표시된 control만으로 texture와 mipmap을 활성화한다", async ({
+  page,
+}, testInfo) => {
+  testInfo.annotations.push(
+    { type: "scenario", description: "chapter_23_mipmap" },
+    { type: "steps", description: "4" },
+  );
+  const errors = observeErrors(page);
+  await openStandaloneChapter(page, "23");
+  await page.locator("#texture-sampling").check();
+  await page.locator("#mipmap-enabled").check();
+  const snapshot = await page.evaluate(() => window.__softRasterizer.advanceFrame(0));
+  expect(snapshot.textureSamplingEnabled).toBe(true);
+  expect(snapshot.stats.textureSamples).toBeGreaterThan(0);
+  expect(snapshot.stats.mipSamples).toBeGreaterThan(0);
+  expect(errors).toEqual([]);
+  testInfo.annotations.push({
+    type: "evidence",
+    description: JSON.stringify({
+      chapter: "23",
+      internalSize: snapshot.internalSize,
+      pixelHash: snapshot.pixelHash,
+      stats: snapshot.stats,
+      consoleErrors: errors,
+    }),
+  });
+});
 
 for (const number of REPRESENTATIVE_CHAPTERS) {
   test(`chapter_${number}_golden: 대표 경계 장의 pixel hash가 고정된다`, async ({

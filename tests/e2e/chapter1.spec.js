@@ -1,7 +1,11 @@
 import { expect, test } from "@playwright/test";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
-import { FrameTimingRing, summarizeFrameTimings } from "../../web/frame-timing.js";
+import {
+  FrameRateTracker,
+  FrameTimingRing,
+  summarizeFrameTimings,
+} from "../../web/frame-timing.js";
 import { resolveRasterPath } from "../../web/raster-path.js";
 
 const EXECUTION_MODE = process.env.SOFT_RASTERIZER_E2E_MODE ?? "unspecified";
@@ -2859,7 +2863,7 @@ test("diagnostics_profiling: UV/overdraw view와 release p50/p95 report를 연�
 }, testInfo) => {
   testInfo.annotations.push(
     { type: "scenario", description: "diagnostics_profiling" },
-    { type: "steps", description: "47" },
+    { type: "steps", description: "48" },
   );
   const browserLog = observeBrowserLog(page);
   await openReadyPage(page, { cullMode: 0, windingDebugMode: 0 });
@@ -2967,6 +2971,20 @@ test("diagnostics_profiling: UV/overdraw view와 release p50/p95 report를 연�
     presentMs: { p50: 3, p95: 100 },
     totalMs: { p50: 3, p95: 100 },
   });
+
+  const frameRate = new FrameRateTracker(3);
+  expect(frameRate.pushTimestamp(0)).toEqual({ count: 0, fps: null });
+  expect(frameRate.pushTimestamp(10)).toEqual({ count: 1, fps: 100 });
+  frameRate.pushTimestamp(30);
+  frameRate.pushTimestamp(60);
+  expect(frameRate.pushTimestamp(100)).toEqual({ count: 3, fps: 100 / 3 });
+  frameRate.reset();
+  expect(frameRate.summary()).toEqual({ count: 0, fps: null });
+  for (const invalidTimestamp of [-1, Number.NaN]) {
+    expect(() => frameRate.pushTimestamp(invalidTimestamp)).toThrow("유한한 0 이상");
+  }
+  frameRate.pushTimestamp(10);
+  expect(() => frameRate.pushTimestamp(10)).toThrow("이전 값보다 커야");
 
   const benchmark = await page.evaluate(() => window.__softRasterizer.runBenchmark(3, 7, 0));
   expect(benchmark.buildMode).toContain("release Wasm");

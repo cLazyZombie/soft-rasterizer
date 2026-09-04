@@ -34,7 +34,10 @@ test("chapter_production_boot: production launcher와 standalone Canvas가 표�
   await expect(page.locator("html")).toHaveAttribute("data-ready", "true");
   const chapter = page.frameLocator("#chapter-frame");
   await expect(chapter.locator("html")).toHaveAttribute("data-ready", "true");
+  await expect(chapter.locator("html")).toHaveAttribute("data-chapter-ui-scope", "26");
   await expect(chapter.locator("#framebuffer")).toBeVisible();
+  await expect(chapter.locator('label[for="animation-clip"]')).toBeVisible();
+  await expect(chapter.locator('label[for="cull-mode"]')).toBeHidden();
   await chapter.locator("html").evaluate(
     () => new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve))),
   );

@@ -40,14 +40,18 @@ pnpm run dev:current
 
 최신 장 앱의 Canvas 내부 버퍼는 물리 픽셀 수가 아니라 CSS 논리 해상도를 사용합니다. 예를 들어 화면 폭이 물리 1920px이고 `devicePixelRatio`가 2라면 내부 폭은 960px입니다. 창 크기나 화면 배율이 바뀌면 `Renderer::resize`로 색/깊이 버퍼를 함께 다시 만들고 오래된 Wasm `TypedArray` view를 버립니다.
 
-1–26장의 실제 commit을 각각 release Wasm 정적 앱으로 빌드하고 iframe 런처와 함께 `dist/`에 만들려면 다음 명령을 사용합니다. 빌드는 현재 working tree를 checkout하지 않으며 각 revision의 lockfile을 사용합니다.
+1–26장의 실제 commit을 각각 release Wasm 정적 앱으로 빌드하고 iframe 런처와 함께 `dist/`에 만들려면 다음 명령을 사용합니다. 빌드는 현재 working tree를 checkout하지 않으며 각 revision의 lockfile을 사용합니다. `chapter-ui.json`은 과거 DOM을 제거하지 않은 채 각 장에서 학습할 control, stat, 진단 region만 보이게 하는 현재 저장소의 표시 계약입니다.
 
 ```bash
 pnpm run build
 pnpm exec vite preview --config vite.gallery.config.js
 ```
 
-`/?chapter=16`처럼 직접 접근할 수 있고 각 장의 standalone URL은 `/chapters/16/` 형식입니다. 현재 HEAD만 단독으로 release 빌드하려면 `pnpm run build:current`를 사용하며 출력은 `dist-current/`에 생성됩니다.
+`/?chapter=16`처럼 직접 접근할 수 있고 각 장의 standalone URL은 `/chapters/16/` 형식입니다. standalone 제목도 manifest의 장 번호와 제목으로 정규화됩니다. 현재 HEAD만 단독으로 release 빌드하려면 `pnpm run build:current`를 사용하며 출력은 `dist-current/`에 생성됩니다.
+
+GitHub Pages 주소는 <https://clazyzombie.github.io/soft-rasterizer/>입니다. `main`에 push하면 `.github/workflows/pages.yml`이 전체 Git history를 가져와 1–26장을 빌드하고 장별 E2E를 통과한 production `dist/`만 배포합니다. Actions의 `Deploy chapter gallery to GitHub Pages`에서 수동 재배포도 가능합니다. 저장소 Settings → Pages의 Source는 `GitHub Actions`를 사용합니다. [16장 런처](https://clazyzombie.github.io/soft-rasterizer/?chapter=16)나 [16장 standalone](https://clazyzombie.github.io/soft-rasterizer/chapters/16/) 링크를 공유할 수 있습니다.
+
+Pages는 manifest에 고정된 장별 실행본을 제공합니다. `dev:current`의 누적 개발 UI와 최신 FPS 표시는 현재 HEAD용이며, 장별 manifest의 revision을 바꾸기 전에는 갤러리 실행본에 포함되지 않습니다.
 
 주요 검증 명령은 다음과 같습니다.
 

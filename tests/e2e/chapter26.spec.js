@@ -28,10 +28,19 @@ function observeErrors(page) {
 test("glb_scene: Fox GLB가 skin animation과 transactional failure를 렌더링한다", async ({ page }, testInfo) => {
   testInfo.annotations.push(
     { type: "scenario", description: "glb_scene" },
-    { type: "steps", description: "21" },
+    { type: "steps", description: "22" },
   );
   const errors = observeErrors(page);
   await openReadyPage(page);
+
+  const frameRate = await page.evaluate(() =>
+    window.__softRasterizer.testFrameRateTimestamps([0, 20, 40, 60]),
+  );
+  expect(frameRate).toEqual({
+    summary: { count: 3, fps: 50 },
+    text: "50.0 FPS",
+  });
+  await expect(page.locator("#current-fps")).toHaveText("50.0 FPS");
 
   const fallback = await page.evaluate(() => window.__softRasterizer.testBundledFoxFetchFailure());
   expect(fallback.error).toContain("HTTP 503");

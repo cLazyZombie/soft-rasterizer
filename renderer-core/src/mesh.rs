@@ -156,7 +156,7 @@ impl Mesh {
     }
 
     pub fn triangles(&self) -> impl ExactSizeIterator<Item = [usize; 3]> + '_ {
-        self.indices.chunks_exact(3).map(|triangle| {
+        self.indices.as_chunks::<3>().0.iter().map(|triangle| {
             [
                 triangle[0] as usize,
                 triangle[1] as usize,
@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(cube.indices().len(), 36);
         assert_eq!(cube.triangle_count(), 12);
         assert_eq!(cube.triangles().len(), 12);
-        for face in cube.vertices().chunks_exact(4) {
+        for face in cube.vertices().as_chunks::<4>().0.iter() {
             assert!(
                 face.iter()
                     .all(|vertex| vertex.normal_object == face[0].normal_object)

@@ -9,7 +9,7 @@ import {
 } from "./glb-upload.js";
 import { FramebufferPresenter } from "./present.js";
 import { decodeImageFileToRgba, validateDecodedTextureSize } from "./texture-upload.js";
-import { FrameTimingRing, summarizeFrameTimings } from "./frame-timing.js";
+import { FrameRateTracker, FrameTimingRing, summarizeFrameTimings } from "./frame-timing.js";
 import { resolveRasterPath } from "./raster-path.js";
 
 const MAX_FRAME_DT_SECONDS = 0.1;
@@ -83,6 +83,10 @@ function rendererStats(renderer) {
 
 function formatMilliseconds(value) {
   return `${value.toFixed(3)} ms`;
+}
+
+function formatFramesPerSecond(value) {
+  return value === null ? "FPS 측정 중" : `${value.toFixed(1)} FPS`;
 }
 
 function framebufferMiB(size) {
@@ -174,6 +178,7 @@ async function bootstrap() {
   let currentSize = initialSize;
   let lastFrameMetrics = null;
   const frameTimingWindow = new FrameTimingRing();
+  const frameRateTracker = new FrameRateTracker();
   let lastInputSnapshot = new Float64Array(8);
   let coordinateDebugText = "좌표 계산 대기 중";
   let textureStatusText = "fallback checkerboard · 2 × 2 · 2 mip levels · texture 0";
@@ -272,6 +277,9 @@ async function bootstrap() {
       : "clip 없음";
     document.querySelector("#coordinate-debug").textContent = coordinateDebugText;
     document.querySelector("#frame-index").textContent = String(updateCalls);
+    document.querySelector("#current-fps").textContent = formatFramesPerSecond(
+      frameRateTracker.summary().fps,
+    );
     if (lastFrameMetrics !== null) {
       document.querySelector("#high-level-calls").textContent = String(
         lastFrameMetrics.highLevelRenderCalls,
@@ -1200,6 +1208,7 @@ async function bootstrap() {
     updateAndRenderCalls: updateCalls,
     lastFrameMetrics,
     timingWindow: frameTimingWindow.summary(),
+    frameRate: frameRateTracker.summary(),
     resizeEvents,
     contextKind: "2d",
     camera: {
@@ -1405,6 +1414,7 @@ async function bootstrap() {
   };
 
   const onAnimationFrame = (timestamp) => {
+    frameRateTracker.pushTimestamp(timestamp);
     const dtSeconds =
       previousTimestamp === null
         ? 0
@@ -1416,6 +1426,17 @@ async function bootstrap() {
       window.__softRasterizer = Object.freeze({
         ready: true,
         runBenchmark,
+        testFrameRateTimestamps(timestamps) {
+          frameRateTracker.reset();
+          for (const timestamp of timestamps) {
+            frameRateTracker.pushTimestamp(timestamp);
+          }
+          updateStatus();
+          return {
+            summary: frameRateTracker.summary(),
+            text: document.querySelector("#current-fps").textContent,
+          };
+        },
         advanceFrame(requestedDtSeconds) {
           renderFrame(requestedDtSeconds);
           return snapshot();

@@ -1006,7 +1006,7 @@ mod tests {
     #[test]
     fn chapter_twenty_three_nearest_mip_sampling_clamps_lod_and_rejects_invalid_values() {
         let mut pixels = vec![0_u8; 4 * 4 * 4];
-        for pixel in pixels.chunks_exact_mut(4) {
+        for pixel in pixels.as_chunks_mut::<4>().0.iter_mut() {
             pixel.copy_from_slice(&[80, 120, 160, 255]);
         }
         let texture = Texture::from_rgba8(4, 4, &pixels, TextureColorSpace::Linear).unwrap();

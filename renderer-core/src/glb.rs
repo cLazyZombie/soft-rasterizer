@@ -803,7 +803,7 @@ fn parse_material(material: gltf::Material<'_>) -> Result<MaterialTemplate, GlbI
 
 fn generate_normals(positions: &[Vec3], indices: &[u32]) -> Vec<Vec3> {
     let mut normals = vec![Vec3::ZERO; positions.len()];
-    for triangle in indices.chunks_exact(3) {
+    for triangle in indices.as_chunks::<3>().0.iter() {
         let [a, b, c] = [
             triangle[0] as usize,
             triangle[1] as usize,
@@ -891,12 +891,8 @@ fn parse_primitive(
         }
         .into());
     }
-    for triangle in indices.chunks_exact_mut(3) {
-        triangle.copy_from_slice(&gltf_triangle_to_lh([
-            triangle[0],
-            triangle[1],
-            triangle[2],
-        ]));
+    for triangle in indices.as_chunks_mut::<3>().0.iter_mut() {
+        *triangle = gltf_triangle_to_lh(*triangle);
     }
     let normals = if let Some(normals) = reader.read_normals() {
         let normals = normals
