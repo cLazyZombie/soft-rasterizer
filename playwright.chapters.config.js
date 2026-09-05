@@ -31,7 +31,7 @@ export default defineConfig({
       name: "chapters-production-chromium-1x",
       testMatch: "gallery.production.spec.js",
       use: {
-        baseURL: "http://127.0.0.1:4175",
+        baseURL: "http://127.0.0.1:4175/soft-rasterizer/",
         browserName: "chromium",
         deviceScaleFactor: 1,
       },
@@ -47,8 +47,8 @@ export default defineConfig({
     },
     {
       command:
-        "pnpm exec vite preview --config vite.gallery.config.js --host 127.0.0.1 --port 4175",
-      url: "http://127.0.0.1:4175",
+        "pnpm exec vite preview --config vite.gallery.config.js --host 127.0.0.1 --port 4175 --base /soft-rasterizer/",
+      url: "http://127.0.0.1:4175/soft-rasterizer/",
       reuseExistingServer: false,
       timeout: 30_000,
     },

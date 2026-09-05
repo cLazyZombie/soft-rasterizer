@@ -8,7 +8,7 @@
 
 coverage만 알면 단색 삼각형만 그릴 수 있다. 실제 렌더링은 정점의 색, UV, 법선, world position을 픽셀마다 계산해야 한다. barycentric 좌표는 삼각형 내부의 점을 세 정점의 가중합으로 표현한다.
 
-이 장에서는 screen 공간에서 선형인 값을 affine 보간한다. 색 그라데이션과 z_ndc는 이 방식으로 충분하다. UV와 world position처럼 투영 전 공간에서 선형인 값은 14장에서 1/w를 사용해 보정한다.
+이 장에서는 screen 공간에서 선형인 값을 affine 보간한다. 화면에 정의한 debug 색 그라데이션과 z_ndc는 이 방식으로 보간한다. 3D 표면의 vertex color는 14장부터 일반 속성과 함께 원근 보정한다. UV와 world position처럼 투영 전 공간에서 선형인 값은 14장에서 1/w를 사용해 보정한다.
 
 ## 배경지식
 
@@ -27,6 +27,26 @@ coverage만 알면 단색 삼각형만 그릴 수 있다. 실제 렌더링은 �
 λ0 + λ1 + λ2 = 1
 a_affine = λ0*a0 + λ1*a1 + λ2*a2
 ```
+
+## edge 값을 색의 비율로 바꾸기
+
+11장의 같은 삼각형과 p=(0.5,0.5)를 사용하면 area=16, edge=(12,2,2)였다.
+
+```text
+λ0=12/16=3/4
+λ1= 2/16=1/8
+λ2= 2/16=1/8
+λ0+λ1+λ2=1
+```
+
+내부의 점 p로 나눈 작은 세 삼각형의 면적 합이 원래 면적이므로 `e0+e1+e2=area`다. 따라서 비율의 합도 1이다. 정점 색을 순서대로 빨강 (1,0,0), 초록 (0,1,0), 파랑 (0,0,1)로 정하면:
+
+```text
+C=λ0*C0+λ1*C1+λ2*C2=(0.75,0.125,0.125)
+debug 직접 양자화 round(255*C)=(191,32,32)
+```
+
+이 마지막 값은 12장의 화면 debug 색 인코딩 예제다. linear 색을 sRGB로 바꾸는 19장의 출력값과 같다고 가정하면 안 된다. 또한 표면 색을 보간하는 최신 기본 경로에는 14장의 원근 보정을 적용한다.
 
 ## 알고리즘과 구현 순서
 
@@ -50,13 +70,13 @@ if covered:
 
 보간과 색 변환은 Rust에서 수행한다. JS UI는 barycentric RGB, triangle ID, solid color 같은 debug shader mode를 enum 값으로 선택할 수 있다. 픽셀 속성 배열을 JS로 내보내지 않는다.
 
-현재 구현은 `TriangleSetup`에서 positive fixed-point area의 역수를 한 번 만들고, coverage callback이 받은 세 edge 값을 그대로 `BarycentricCoordinates`로 바꾼다. 공개 생성자는 세 edge가 각각 `0..=area`이고 합이 정확히 area인 경우만 허용해 가중치 invariant를 타입에 고정한다. `FragmentInput`은 이 장의 범위인 barycentric과 affine color만 담으며 UV, world position과 normal은 14장 전까지 넣지 않는다. vertex-color mode는 세 `ClipVertex.color`를 screen 공간에서 affine 보간하고, barycentric debug mode는 `(lambda0,lambda1,lambda2)`를 RGB로 기록한다.
+12장 학습 단계의 구현은 `TriangleSetup`에서 positive fixed-point area의 역수를 한 번 만들고, coverage callback이 받은 세 edge 값을 그대로 `BarycentricCoordinates`로 바꾼다. 공개 생성자는 세 edge가 각각 `0..=area`이고 합이 정확히 area인 경우만 허용해 가중치 invariant를 타입에 고정한다. 이 단계의 `FragmentInput`은 barycentric과 affine color만 담으며 UV, world position과 normal은 14장 전까지 넣지 않는다. 12장의 vertex-color mode는 세 `ClipVertex.color`를 screen 공간에서 affine 보간하고, barycentric debug mode는 `(lambda0,lambda1,lambda2)`를 RGB로 기록한다.
 
 색 채널은 유한한 값만 0..1로 clamp해 마지막에 RGBA8로 반올림한다. 범용 변환 함수에 직접 들어온 NaN/Inf 채널은 0으로 고정하지만, 렌더 경로의 `FragmentInput`은 non-finite 정점/보간 결과를 거부해 framebuffer를 쓰지 않고 `invalid_values`에 기록한다. `FrameStats.max_barycentric_sum_error`는 프레임의 모든 covered sample에서 최대 `|lambda0+lambda1+lambda2-1|`를 기록한다. R/G/B 단일 triangle fixture는 source affine color와 barycentric debug가 같은 이미지를 만드는 불변조건을 Rust-Wasm-Canvas 2D 경로에서 확인한다. 네 정점 색을 하나의 screen-space affine 함수로 정한 quad는 어느 대각선으로 나누어도 모든 내부 sample의 owner가 1이고 RGBA8 이미지가 exact match하는지 네이티브 invariant로 고정한다.
 
 ## 코딩 에이전트 작업 명세
 
-- FragmentInput 또는 Interpolants 구조를 만들고 현재는 affine color와 barycentric만 채운다.
+- FragmentInput 또는 Interpolants 구조를 만들고 12장에서는 affine color와 barycentric만 채운다.
 - 정점, 변의 중점, 무게중심에서 알려진 λ와 색을 반환하는 순수 함수 테스트를 작성한다.
 - barycentric debug view와 λ 합 오차의 최대값 통계를 추가한다.
 - color float-&gt;u8 변환에서 NaN, 음수, 1 초과 값을 안전하게 처리하는 정책을 만든다.
@@ -73,3 +93,5 @@ if covered:
 - e0를 v0 반대 edge가 아닌 다른 edge와 연결하면 색 꼭짓점이 뒤바뀐다. λ-정점 대응을 명시적으로 테스트한다.
 - area 부호가 음수인 삼각형을 그대로 받으면 내부 λ 부호와 coverage 규칙이 흔들린다. positive winding 입력을 보장한다.
 - RGBA8에서 직접 정수 보간하면 밴딩과 overflow가 생긴다. 계산은 f32 0..1, 마지막에만 u8로 바꾼다.
+
+12장 실행본은 화면 debug 색을 affine 보간하는 학습 단계다. 3D 표면에 붙은 vertex color는 UV처럼 일반 속성이므로 14장 이후 기본 경로에서는 perspective-correct 보간한다. 최신 `FragmentInput`은 world position, normal, UV, color를 함께 복원하며, 12장의 affine 설명은 최신 전체 경로의 기본값을 뜻하지 않는다.

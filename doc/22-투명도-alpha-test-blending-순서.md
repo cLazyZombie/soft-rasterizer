@@ -13,7 +13,7 @@ cutout은 threshold 아래 fragment를 버리고 나머지는 opaque처럼 depth
 ## 배경지식
 
 - <strong>Alpha test/cutout</strong>: alpha&lt;threshold면 discard, 아니면 depth write를 포함한 opaque 처리다. 잎, 철망에 적합하다.
-- <strong>Straight alpha source-over</strong>: C = Cs\*As + Cd\*(1-As). 최종 Canvas 배경을 opaque로 유지하면 출력 alpha를 1로 둘 수 있다.
+- <strong>Straight alpha source-over</strong>: 불투명 destination(Ad=1)에서는 C = Cs\*As + Cd\*(1-As). 최종 Canvas 배경을 opaque로 유지하면 출력 alpha를 1로 둘 수 있다.
 - <strong>Premultiplied alpha</strong>에서는 Cs가 이미 As를 곱한 값이고 C=Cs+Cd\*(1-As)다. texture 저장 방식과 공식을 섞지 않는다.
 - <strong>선형 색 공간</strong>에서 blend한다. 현재 RGBA8 sRGB 버퍼를 유지한다면 destination을 decode하고 blend 후 다시 encode하는 정확하지만 느린 기준 경로를 쓸 수 있다.
 - <strong>정렬</strong>: transparent draw items 또는 triangles를 view-space depth 기준 back-to-front로 정렬한다. 이 교재의 LH view에서는 `view_depth=z_view&gt;0`이고 큰 값이 더 멀기 때문에 descending이 back-to-front다. 교차하는 geometry에는 완전한 해결이 아니다.
@@ -22,10 +22,33 @@ cutout은 threshold 아래 fragment를 버리고 나머지는 opaque처럼 depth
 
 ```text
 cutout: if alpha < threshold -> discard before depth write
-straight source-over linear RGB: Cout = Csrc*Asrc + Cdst*(1-Asrc)
+opaque destination (Adst=1), straight linear RGB:
+Cout = Csrc*Asrc + Cdst*(1-Asrc)
 Aout = Asrc + Adst*(1-Asrc)
 transparent policy: depth_test=on, depth_write=off, order=back_to_front
 ```
+
+## 투명 색의 순서가 중요한 숫자 예제
+
+모든 RGB는 linear 값이고 배경은 불투명 검정이다. 빨강 Cs=(1,0,0), alpha=0.5를 먼저 합치면 C1=(0.5,0,0)이다. 그 위에 파랑 Cs=(0,0,1), alpha=0.5를 합치면:
+
+```text
+C2=(0,0,1)*0.5+(0.5,0,0)*(1-0.5)
+  =(0.25,0,0.5)
+```
+
+파랑 다음 빨강 순이면 (0.5,0,0.25)다. 합치는 순서가 색을 바꾸므로 먼 표면부터 가까운 표면 순으로 정렬한다. 같은 표면 안의 교차 관계까지 대표 깊이 하나로 해결할 수는 없다는 한계도 남는다.
+
+일반적인 straight-alpha 식은 destination alpha도 포함한다.
+
+```text
+Aout=As+Ad*(1-As)
+Cout=(Cs*As+Cd*Ad*(1-As))/Aout   (Aout>0)
+```
+
+현재 framebuffer의 Ad=1이면 Aout=1이므로 앞의 단순식으로 줄어든다. Aout=0인 완전 투명 결과의 RGB는 0처럼 명시적으로 정하고 나누지 않는다. premultiplied RGB는 이미 alpha를 곱한 저장값이므로 같은 공식을 그대로 섞어 쓰지 않는다.
+
+MASK는 비싼 texture를 읽기 전에 depth를 **검사**할 수 있다. 하지만 alpha가 threshold를 통과하기 전까지 depth를 **쓰기**하면 안 된다. 버려진 구멍이 다음 표면을 가리는 오류를 막는 구분이다.
 
 ## 알고리즘과 구현 순서
 
@@ -73,3 +96,7 @@ JS UI는 blend mode, cutout threshold, transparent sort debug를 바꿀 수 있�
 - transparent fragment가 depth를 쓰면 다음 투명 표면이 사라진다. test와 write를 분리한다.
 - straight texture에 premultiplied 공식을 적용하면 가장자리가 어두워지거나 색이 샌다.
 - object center 하나로 정렬하면 큰/교차 mesh에서 틀릴 수 있다. 기준선의 한계이며 OIT는 별도 고급 주제다.
+
+## 제출 순서 비교의 전제
+
+불투명 표면의 순서 독립성 검사는 같은 픽셀에 서로 다른 색이 동일 깊이로 겹치지 않는 fixture에 적용한다. strict `candidate < stored`에서는 동률인 뒤쪽 제출이 실패하므로, 동률 색이 다르면 먼저 제출한 색이 남는다. 최종 이미지가 같아도 early depth에 따른 pass/fail 수는 제출 순서에 따라 달라질 수 있다.

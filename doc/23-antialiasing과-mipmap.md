@@ -28,6 +28,29 @@ lod = log2(max(rho, epsilon))
 trilinear = lerp(sample(level floor(lod)), sample(level ceil(lod)), fract(lod))
 ```
 
+## UV 변화량에서 mip level까지 계산하기
+
+현재 필수 구현은 2×SSAA와 nearest mip다. MSAA와 trilinear 식은 확장 설명이며 현재 UI가 그 경로를 제공한다는 뜻은 아니다.
+
+한 픽셀에서 오른쪽으로 한 칸 이동할 때 UV 차이를 dUVdx, 아래로 한 칸 이동할 때 차이를 dUVdy라 한다. 14장의 분자와 분모를 이웃 위치에서도 다시 계산해야 원근에 맞는 차이가 나온다.
+
+```text
+uv(p)=(Σλi(p)*uv_i/wi)/(Σλi(p)/wi)
+dUVdx=uv(p+(1,0))-uv(p)
+dUVdy=uv(p+(0,1))-uv(p)
+texel_dx=(W*du/dx,H*dv/dx)
+texel_dy=(W*du/dy,H*dv/dy)
+rho=max(length(texel_dx),length(texel_dy))
+lod=log2(max(rho,epsilon))
+level=clamp(round(lod),0,last_level)
+```
+
+UV는 이미지 전체 폭을 1로 센다. 따라서 W를 곱하면 texel 단위가 된다. W=256, du/dx=1/64, 다른 변화 성분이 0이면 rho=256/64=4다. 한 화면 픽셀 안에 원본 texel 4개 폭이 들어온다. level 2는 폭이 256/4=64이므로 약 1texel/pixel이 된다. 그래서 `lod=log2(4)=2`를 선택한다.
+
+SSAA의 render scale 2는 W와 H를 모두 두 배로 하므로 샘플 수는 4배다. 네 완성된 linear 색을 더해 4로 나눈 뒤 sRGB로 저장한다. 현재 clear가 불투명하므로 배경까지 합친 최종 alpha는 255다. 부분 coverage는 투명 alpha가 아니라 샘플별 표면색과 배경색의 평균으로도 나타난다.
+
+mip의 다음 크기는 `max(1,ceil(W/2))`와 `max(1,ceil(H/2))`다. 홀수 크기는 마지막 행/열을 버리지 않지만, 각 단계에서 존재하는 texel만 평균하므로 최종 1×1이 모든 원본 texel에 같은 가중치를 준다는 보장은 없다. 실제 각 level의 RGBA8 저장에는 중간 양자화 오차도 있다.
+
 ## 알고리즘과 구현 순서
 
 1. 먼저 2x SSAA를 RenderScale 옵션으로 구현한다. 내부 target을 2배로 렌더하고 linear 평균으로 실제 Canvas 해상도 RGBA8를 만든다.
@@ -53,7 +76,7 @@ lod = clamp(log2(max(rho, EPS)), 0, max_level)
 
 ## JS-Wasm 경계
 
-JS는 quality preset과 내부 render scale을 선택하고 Canvas 표시 크기를 유지한다. 모든 sample coverage, mip 생성, LOD, resolve는 Rust에서 수행한다. JS/CSS의 image smoothing은 최종 framebuffer 확대일 뿐 scene antialiasing 대체물이 아니다.
+JS는 quality preset과 내부 render scale을 선택하고 Canvas 표시 크기를 유지한다. 모든 sample coverage, mip 생성, LOD, resolve는 Rust에서 수행한다. CSS image-rendering은 완성된 framebuffer의 확대 표시 방식이며 scene antialiasing의 대체물이 아니다. Canvas imageSmoothingEnabled는 putImageData 경로를 제어하지 않는다.
 
 ## 코딩 에이전트 작업 명세
 
@@ -66,7 +89,7 @@ JS는 quality preset과 내부 render scale을 선택하고 Canvas 표시 크기
 
 - 단색 영역은 no-AA와 SSAA resolve 후 정확히 같은 색이어야 한다.
 - edge pixel의 coverage가 0..1 사이이고 네 sample 중 통과 수와 resolve alpha/색이 일치해야 한다.
-- 4x4 texture mip chain이 4x4,2x2,1x1 크기이며 1x1이 전체 linear 평균이어야 한다.
+- 4x4 texture mip chain이 4x4,2x2,1x1 크기이며 이상적인 실수 연산에서 1x1은 전체 linear 평균이다. 실제 RGBA8 mip 저장은 중간 level에서 재인코딩·양자화하므로 그 오차를 허용해 비교한다.
 - texture가 멀어질수록 선택 mip level이 단조롭게 증가하는 대표 scene을 검사한다.
 - affine가 아닌 perspective UV 평가로 dUV를 구해 기울어진 면에서도 LOD seam이 줄어드는지 확인한다.
 

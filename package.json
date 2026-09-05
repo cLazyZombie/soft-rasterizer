@@ -17,7 +17,7 @@
     "format:check": "cargo fmt --all -- --check",
     "check": "cargo check --workspace --all-targets && cargo check -p renderer-wasm --target wasm32-unknown-unknown",
     "lint": "cargo clippy --workspace --all-targets -- -D warnings && eslint vite.config.js vite.gallery.config.js playwright.config.js playwright.chapters.config.js eslint.config.js launcher web tests scripts && pnpm run check:coverage-policy",
-    "test:build-scripts": "node --test scripts/build_chapters.test.mjs",
+    "test:build-scripts": "node --test scripts/build_chapters.test.mjs scripts/build_docs.test.mjs",
     "test": "cargo test --workspace && pnpm run test:build-scripts",
     "build": "pnpm run build:chapters",
     "e2e:smoke": "pnpm run build:test && SOFT_RASTERIZER_E2E_MODE=headless playwright test --grep @smoke",
@@ -35,6 +35,7 @@
     "@playwright/test": "1.62.1",
     "eslint": "10.9.0",
     "globals": "17.11.0",
+    "marked": "^18.0.11",
     "vite": "8.2.2"
   }
 }

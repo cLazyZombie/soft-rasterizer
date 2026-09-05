@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="800" height="360" viewBox="0 0 800 360" role="img" aria-labelledby="title desc">
+  <title id="title">표면 중간과 화면 중간의 차이</title>
+  <desc id="desc">표면에서 20퍼센트인 P가 투영 후 화면 중간으로 간다. 표면 중간 M은 화면에서 오른쪽 80퍼센트 위치로 간다.</desc>
+  <rect width="800" height="360" rx="12" fill="#101c2e"/>
+  <g font-family="system-ui, sans-serif" fill="#edf4ff" font-size="16">
+    <text x="40" y="38" font-size="21" font-weight="700">같은 점도 투영 전과 후의 비율이 다르다</text>
+    <text x="40" y="76" fill="#a8bcd8">표면의 비율 t — 위치와 UV를 선형 보간</text>
+    <text x="40" y="229" fill="#a8bcd8">화면의 위치 x_ndc</text>
+    <path d="M100 120H700 M100 275H700" stroke="#a8bcd8" stroke-width="3"/>
+    <path d="M220 128L400 263" stroke="#72dcff" stroke-width="2" stroke-dasharray="6 5"/>
+    <path d="M400 128L580 263" stroke="#ffd079" stroke-width="2" stroke-dasharray="6 5"/>
+    <g fill="#edf4ff"><circle cx="100" cy="120" r="5"/><circle cx="700" cy="120" r="5"/><circle cx="100" cy="275" r="5"/><circle cx="700" cy="275" r="5"/></g>
+    <g fill="#72dcff"><circle cx="220" cy="120" r="7"/><circle cx="400" cy="275" r="7"/></g>
+    <g fill="#ffd079"><circle cx="400" cy="120" r="7"/><circle cx="580" cy="275" r="7"/></g>
+    <g text-anchor="middle">
+      <text x="100" y="105">A</text><text x="220" y="105" fill="#72dcff">P</text><text x="400" y="105" fill="#ffd079">M</text><text x="700" y="105">B</text>
+      <text x="100" y="151">t=0</text><text x="220" y="151" fill="#72dcff">t=0.2</text><text x="400" y="151" fill="#ffd079">t=0.5</text><text x="700" y="151">t=1</text>
+      <text x="100" y="250">A</text><text x="400" y="250" fill="#72dcff">P</text><text x="580" y="250" fill="#ffd079">M</text><text x="700" y="250">B</text>
+      <text x="100" y="307">x=-1</text><text x="400" y="307" fill="#72dcff">x=0</text><text x="580" y="307" fill="#ffd079">x=0.6</text><text x="700" y="307">x=1</text>
+    </g>
+    <text x="400" y="340" text-anchor="middle" fill="#72dcff">화면 중간 P의 올바른 u는 0.5가 아니라 0.2</text>
+  </g>
+</svg>

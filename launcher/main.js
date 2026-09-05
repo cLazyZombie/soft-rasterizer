@@ -6,6 +6,25 @@ let frame = document.querySelector("#chapter-frame");
 const frameShell = document.querySelector(".frame-shell");
 const standaloneLink = document.querySelector("#standalone-link");
 const errorOutput = document.querySelector("#launcher-error");
+const readingPanel = document.querySelector("#reading-panel");
+const resultButton = document.querySelector("#result-view");
+const readingButton = document.querySelector("#reading-view");
+let documentFrame = document.querySelector("#document-frame");
+const documentLink = document.querySelector("#document-link");
+let documentation;
+
+function setReadingView(reading, updateHistory = true) {
+  frameShell.hidden = reading;
+  readingPanel.hidden = !reading;
+  resultButton.setAttribute("aria-pressed", String(!reading));
+  readingButton.setAttribute("aria-pressed", String(reading));
+  if (updateHistory) {
+    const url = new URL(window.location.href);
+    if (reading) url.searchParams.set("view", "reading");
+    else url.searchParams.delete("view");
+    window.history.replaceState(window.history.state, "", url);
+  }
+}
 
 function chapterLabel(chapter) {
   const suffix = chapter.reproduction === "integrated" ? ` — ${chapter.note}` : "";
@@ -49,6 +68,15 @@ function selectChapter(manifest, requestedNumber, historyMode = "replace") {
     `소프트웨어 래스터라이저 ${Number(chapter.number)}장 · ${chapter.title}`,
   );
   standaloneLink.href = url;
+  const chapterDocument = documentation.chapters.find((entry) => entry.number === chapter.number);
+  if (!chapterDocument) throw new Error(`${chapter.number}장 교재를 찾을 수 없습니다.`);
+  const nextDocumentFrame = documentFrame.cloneNode(false);
+  nextDocumentFrame.src = chapterDocument.href;
+  nextDocumentFrame.title = chapterDocument.title;
+  documentFrame.replaceWith(nextDocumentFrame);
+  documentFrame = nextDocumentFrame;
+  documentLink.href = chapterDocument.href;
+  setReadingView(new URL(window.location.href).searchParams.get("view") === "reading", false);
 
   if (chapter.note === undefined) {
     note.hidden = true;
@@ -71,6 +99,10 @@ async function bootstrap() {
   }
 
   const manifest = await response.json();
+  const docsResponse = await fetch("./chapter-docs.json");
+  if (!docsResponse.ok) throw new Error(`교재 목록을 읽지 못했습니다: HTTP ${docsResponse.status}`);
+  documentation = await docsResponse.json();
+  document.querySelector("#curriculum-link").href = documentation.index.href;
   select.replaceChildren(
     ...manifest.chapters.map((chapter) => {
       const option = document.createElement("option");
@@ -85,6 +117,8 @@ async function bootstrap() {
   selectChapter(manifest, requestedNumber, "replace");
 
   select.addEventListener("change", () => selectChapter(manifest, select.value, "push"));
+  resultButton.addEventListener("click", () => setReadingView(false));
+  readingButton.addEventListener("click", () => setReadingView(true));
   window.addEventListener("popstate", () => {
     const number = new URL(window.location.href).searchParams.get("chapter");
     selectChapter(manifest, number, "replace");
@@ -97,5 +131,7 @@ bootstrap().catch((error) => {
   errorOutput.textContent = error instanceof Error ? error.message : String(error);
   errorOutput.hidden = false;
   frameShell.hidden = true;
+  readingPanel.hidden = true;
+  document.querySelector(".view-toolbar").hidden = true;
   document.documentElement.dataset.ready = "error";
 });

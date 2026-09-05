@@ -28,6 +28,32 @@ spec = ndotl>0 ? pow(max(dot(N,H),0), shininess) : 0
 linear = ambient*albedo + light*(albedo*ndotl + specular_color*spec)*intensity
 ```
 
+## byte에서 조명 계산을 거쳐 byte로 돌아오기
+
+sRGB byte b를 먼저 `c=b/255`로 0..1에 맞춘 뒤 아래 decode에 넣는다. 출력 byte를 만들 때만 encode와 양자화를 한다.
+
+```text
+D(c) = c/12.92                         (c<=0.04045)
+       ((c+0.055)/1.055)^2.4            (그 밖)
+E(l) = 12.92*l                         (l<=0.0031308)
+       1.055*l^(1/2.4)-0.055           (그 밖)
+output_byte = round(255*E(clamp(linear,0,1)))
+```
+
+검정 b=0은 linear 0, 흰색 b=255는 linear 1이다. 빛의 양을 반씩 섞으면 0.5다. 이를 E에 넣으면 약 0.73536, byte로 약 188이다. encoded byte부터 평균낸 128은 그보다 어두운 빛의 양을 뜻한다. texture filtering·blending·AA resolve가 모두 linear에서 계산되어야 하는 같은 이유다. alpha는 빛의 밝기 인코딩이 아니므로 D/E를 적용하지 않는다.
+
+### Blinn–Phong 방향과 지수의 의미
+
+L은 표면→광원, V는 표면→카메라, N은 표면 법선이다. 모두 같은 world 공간에서 단위 길이로 만든다. H=normalize(L+V)는 광원과 시선의 중간 방향이다. `max(dot(N,H),0)^shininess`가 하이라이트의 세기를 정한다.
+
+```text
+N·H=0.5일 때:
+shininess=2 → 0.5^2=0.25
+shininess=8 → 0.5^8=0.00390625
+```
+
+지수가 크면 N과 H가 거의 나란한 좁은 영역만 밝게 남는다. N·L<=0이면 뒷면 광원이므로 specular도 0이다. L+V=0 또는 카메라와 fragment 위치가 같아 방향을 정규화할 수 없는 경우 현재 구현은 specular=0으로 처리해 NaN을 만들지 않는다.
+
 ## 알고리즘과 구현 순서
 
 1. Texture에 color_space를 표시한다. BaseColor는 SRGB, normal/metallic 같은 데이터 texture는 Linear로 분리할 준비를 한다.

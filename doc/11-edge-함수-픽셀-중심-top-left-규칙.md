@@ -32,6 +32,21 @@ top_left(a,b) iff dy<0 or (dy==0 and dx>0), screen y-down 규약
 E(x+1,y) = E(x,y) - dy*S,  E(x,y+1) = E(x,y) + dx*S
 ```
 
+## 한 픽셀의 edge 값과 소유자 계산
+
+v0=(0,0), v1=(4,0), v2=(0,4), 픽셀 (0,0)의 중심 p=(0.5,0.5)를 사용하자. 각 정점 반대편 edge를 순서대로 e0,e1,e2라 한다.
+
+```text
+area=orient2d(v0,v1,v2)=16
+e0=orient2d(v1,v2,p)=(-4)*0.5-4*(-3.5)=12
+e1=orient2d(v2,v0,p)=0*(-3.5)-(-4)*0.5=2
+e2=orient2d(v0,v1,p)=4*0.5-0*0.5=2
+```
+
+세 값이 양수이므로 안쪽이다. edge 위에서 E=0이면 top-left 조건 `dy<0 || (dy==0 && dx>0)`을 확인한다. 공유 대각선 (4,0)→(0,4)는 dy=4라 equality를 제외하고, 반대 방향은 dy=-4라 포함한다. 같은 샘플을 한쪽만 소유하는 이유다.
+
+실제 setup은 S=256을 사용한다. 정점은 S배 후 양자화하고 픽셀 중심은 `(x*S+S/2,y*S+S/2)`다. 위의 정수 정점 예제에서는 모든 edge와 area가 S²배가 되므로 다음 장의 `edge/area` 비율은 그대로다.
+
 ## 알고리즘과 구현 순서
 
 1. screen 위치를 S=256 같은 subpixel fixed-point i64로 양자화한다. 양자화 뒤 area를 다시 계산해 0이면 버린다.

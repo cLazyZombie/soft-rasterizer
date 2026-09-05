@@ -15,6 +15,7 @@ import {
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { buildDocumentation } from "./build_docs.mjs";
 
 const SCRIPT_DIRECTORY = path.dirname(fileURLToPath(import.meta.url));
 const REPOSITORY_ROOT = path.resolve(SCRIPT_DIRECTORY, "..");
@@ -445,6 +446,7 @@ function prepareOutput(stageDirectory, manifest, uiPolicy, repositoryRoot) {
     `${JSON.stringify(uiPolicy, null, 2)}\n`,
   );
   mkdirSync(path.join(stageDirectory, "chapters"), { recursive: true });
+  buildDocumentation(repositoryRoot, stageDirectory, manifest.chapters);
 }
 
 function extractCommit(repositoryRoot, commit, sourceDirectory, archivePath) {
@@ -532,6 +534,7 @@ export function writeBuildReport(stageDirectory, mode, chapterReports) {
     mode,
     manifestSha256: sha256File(path.join(stageDirectory, "chapter-manifest.json")),
     uiPolicySha256: sha256File(path.join(stageDirectory, "chapter-ui.json")),
+    documentationSha256: sha256File(path.join(stageDirectory, "chapter-docs.json")),
     chapterCount: chapterReports.length,
     chapters: chapterReports,
   };

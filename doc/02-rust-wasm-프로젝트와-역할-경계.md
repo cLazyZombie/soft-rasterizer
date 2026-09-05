@@ -24,6 +24,23 @@ wasm32-unknown-unknown은 브라우저용으로 흔히 쓰는 최소 WebAssembly
 메모리 소유권: Rust owns Vec<u8>; JS borrows a temporary view; JS never frees or stores the pointer as permanent truth
 ```
 
+## pointer와 view를 실제 값으로 읽기
+
+Wasm pointer는 JS 객체가 아니라 선형 메모리 안의 시작 byte offset이다. `ptr=1024`, `len=24`라면 다음 view는 byte 구간 `[1024,1048)`을 빌려 본다.
+
+```javascript
+const view = new Uint8ClampedArray(memory.buffer, 1024, 24);
+```
+
+여기서 원소 하나가 1byte이므로 length=24는 24byte다. 복사된 소유 배열이 아니다. Rust가 새 버퍼를 할당하거나 Wasm memory가 커지면 기존 view는 새 프레임버퍼를 가리킨다는 보장이 없어진다.
+
+```text
+새 view 필요 = buffer identity 변경 OR pointer 변경 OR length 변경
+새 ImageData 필요 = 위 조건 OR width/height 변경
+```
+
+경계의 기본 단위는 한 프레임이다. JS는 입력을 모아 작은 snapshot으로 보내고, Rust는 전체 픽셀을 만든다. 현재 저장소의 웹 진입점은 `web/main.js`와 pnpm scripts이며, 아래의 의사 코드는 그 책임을 설명한다.
+
 ## 알고리즘과 구현 순서
 
 1. renderer-core의 공개 API를 브라우저 타입 없이 설계한다. 입력도 f32, bool, 작은 Rust 구조체 또는 고정 배열로 표현한다.

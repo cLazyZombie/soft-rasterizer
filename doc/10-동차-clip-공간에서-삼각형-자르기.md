@@ -27,6 +27,31 @@ t = d_prev / (d_prev - d_curr)
 intersection = lerp(prev, curr, t)
 ```
 
+## 교점 비율 t를 유도하기
+
+선형 보간은 `lerp(A,B,t)=(1-t)A+tB=A+t(B-A)`다. clip 평면의 signed distance도 선형이므로 같은 t에서 다음이 성립한다.
+
+```text
+d(t) = (1-t)*dA+t*dB
+교점에서는 d(t)=0
+0 = dA+t*(dB-dA)
+t = dA/(dA-dB)
+```
+
+예를 들어 near 평면의 거리 함수는 clip z다.
+
+```text
+A_clip=(-0.5,0,-1,1), B_clip=(0.5,0,1,1)
+dA=-1, dB=1
+t=(-1)/(-1-1)=1/2
+I_clip=(1-t)*A+t*B=(0,0,0,1)
+uA=0, uB=1 → uI=0.5
+```
+
+위치와 원래 UV·색·normal을 모두 같은 t로 보간한다. clipping 직후의 normal은 아직 단위 길이가 아닐 수 있다. 14장의 perspective-correct fragment 복원 뒤 정규화한다. 먼저 u/w를 만들어 보간하면 안 되는 수치 예제도 14장에서 다룬다.
+
+Sutherland–Hodgman의 한 변 처리는 ‘안→안: B, 안→밖: 교점, 밖→안: 교점과 B, 밖→밖: 없음’이다. m정점의 convex polygon은 첫 정점에 fan으로 연결해 m-2개의 삼각형이 된다. 4정점이면 2개다. 삼각형에 여섯 평면을 적용한 정점 수 상한은 3+6=9이므로 작은 scratch 두 개를 번갈아 재사용할 수 있다.
+
 ## 알고리즘과 구현 순서
 
 1. 입력 triangle을 작은 Vec&lt;ClipVertex&gt; polygon으로 시작한다.

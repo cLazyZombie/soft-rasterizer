@@ -12,7 +12,7 @@ UV=1에서 width를 곱하면 index가 width가 되어 범위를 벗어난다. r
 
 ## 배경지식
 
-- <strong>texel center</strong>: 정규화 UV에서 첫 texel 중심은 대략 0.5/width다. bilinear는 x=u\*width-0.5로 두면 정수 texel 좌표의 중심과 맞는다.
+- <strong>texel center</strong>: 정규화 UV에서 첫 texel 중심은 정확히 0.5/width다. bilinear는 x=u\*width-0.5로 두면 정수 texel 좌표의 중심과 맞는다.
 - <strong>repeat</strong>는 fract(u)=u-floor(u)를 사용하면 음수에서도 0..1로 들어온다.
 - <strong>clamp</strong>는 UV를 0..1에 제한한 뒤 texel index를 0..width-1로 clamp한다.
 - <strong>nearest</strong>는 주소화된 UV에서 floor(u\*width)를 사용하고 마지막 index를 clamp한다.
@@ -27,6 +27,24 @@ nearest: x = min(floor(u * W), W-1), y = min(floor(v * H), H-1)
 bilinear coordinates: x = u*W - 0.5, y = v*H - 0.5
 cx0 = lerp(c00,c10,fx), cx1 = lerp(c01,c11,fx), c = lerp(cx0,cx1,fy)
 ```
+
+## UV 한 점의 bilinear 계산 전체
+
+`lerp(a,b,t)=(1-t)a+t*b`는 a에서 b로 t만큼 이동한 값이다. W=H=2, UV=(0.5,0.5)를 대입하자.
+
+```text
+x=u*W-0.5=0.5, y=v*H-0.5=0.5
+x0=floor(x)=0, y0=floor(y)=0
+fx=x-x0=0.5, fy=y-y0=0.5
+
+c=(1-fx)*(1-fy)*c00 + fx*(1-fy)*c10
+  +(1-fx)*fy*c01     + fx*fy*c11
+ =(c00+c10+c01+c11)/4
+```
+
+네 가중치는 각각 0.25, 합은 1이다. 최신 sampler의 base-color texture에서는 네 texel을 **linear RGB로 decode한 뒤** 이 식에 넣는다. encoded RGBA8 숫자 네 개의 단순 평균과 같다고 가정하면 안 된다. alpha는 sRGB 변환을 하지 않고 선형으로 평균낸다. 19장에서 검정·흰색 평균으로 이 차이를 계산한다.
+
+음수 repeat도 같은 규칙으로 계산한다. `repeat(-0.25)=-0.25-floor(-0.25)=-0.25-(-1)=0.75`다. u=1은 repeat에서 0으로 돌아가지만 clamp에서는 1이다. bilinear 경계의 각 이웃 index도 repeat/clamp 규칙으로 주소화하므로 반대편 texel 연결 여부가 달라진다.
 
 ## 알고리즘과 구현 순서
 
@@ -62,7 +80,7 @@ sampler state는 Rust Material의 일부다. JS UI가 filter/address enum을 변
 
 ## 검증 기준
 
-- 2x2 texture 중앙 UV에서 bilinear 결과가 네 색의 평균이어야 한다.
+- 2x2 texture 중앙 UV에서 bilinear 결과가 네 linear 색의 평균이어야 한다. sRGB texture는 먼저 linear로 decode한 값을 평균한다.
 - 1x1 texture는 어떤 UV와 filter에서도 같은 색을 반환해야 한다.
 - repeat(-0.25)와 repeat(0.75)가 같은 texel을 선택해야 한다.
 - clamp에서 UV=1과 매우 큰 값이 마지막 texel을 안전하게 반환해야 한다.

@@ -161,6 +161,13 @@ select {
   box-shadow: 0 20px 60px rgb(0 0 0 / 32%);
 }
 
+.view-toolbar { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; padding: 14px 16px; border: 1px solid #263751; border-top: 0; background: #0f1a2b; }
+.view-toolbar button { min-height: 40px; padding: 8px 18px; border: 1px solid #3d5576; border-radius: 8px; color: #eef4ff; background: #0b1525; font: inherit; cursor: pointer; }
+.view-toolbar button[aria-pressed="true"] { color: #081422; background: #82d9ff; border-color: #82d9ff; font-weight: 700; }
+.view-toolbar a { color: #aee8ff; font-size: 14px; text-underline-offset: 4px; }
+.view-toolbar a:first-of-type { margin-left: auto; }
+.reading-shell { overflow: hidden; border: 1px solid #263751; border-top: 0; border-radius: 0 0 12px 12px; }
+
 iframe {
   display: block;
   width: 100%;

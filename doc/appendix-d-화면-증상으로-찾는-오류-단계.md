@@ -5,7 +5,7 @@
 | Canvas가 완전히 투명/검정 | 초기화/표시 | alpha=255, ImageData 길이, Wasm init, pointer/view, clear pattern부터 확인 |
 | resize 뒤 화면이 멈춤 | 메모리 경계 | memory.buffer identity, pointer/len 변경 뒤 TypedArray 재생성 |
 | 모든 면이 사라짐 | culling/winding | culling off, screen area 부호, viewport y flip |
-| 카메라 근처에서 화면 폭발 | clipping/w | divide가 clip보다 앞인지, LH에서 w_clip=z_view인지, 앞 z_view&gt;0/뒤 z_view&lt;0인지, near distance=z와 w 유한성 |
+| 카메라 근처에서 화면 폭발 | clipping/w | divide가 clip보다 앞인지, LH에서 w_clip=z_view인지, 앞 z_view&gt;0/뒤 z_view&lt;0인지, clip 공간 near distance=z_clip과 w 유한성 |
 | 삼각형 사이 한 픽셀 틈 | coverage | top-left 식, fixed-point 양자화, 공유 edge 방향, quad owner count |
 | 멀리 있는 것이 앞에 보임 | depth | z_ndc 0..1, less 비교, clear=Inf, buffer index |
 | 텍스처가 대각선에서 꺾임 | 보간 | uv_over_w와 inv_w 분모, clipping 뒤 over_w 생성 |

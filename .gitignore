@@ -53,6 +53,8 @@ playwright-report/
 test-results/
 blob-report/
 /artifacts/
+/.playwright-cli/
+/output/playwright/
 
 # Local environment and logs
 .env

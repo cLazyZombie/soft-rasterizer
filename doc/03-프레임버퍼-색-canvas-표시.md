@@ -25,13 +25,28 @@ byte = 4 * (y * width + x),  rgba = buffer[byte .. byte + 4]
 픽셀 비용 비율: (2W * 2H) / (W * H) = 4배
 ```
 
+## 2×2 이미지와 필요한 메모리 계산
+
+폭과 높이가 모두 2이면 분모 `max(size-1,1)`은 1이다. 2×2에서는 네 픽셀이 모두 첫 8×8 체크 셀에 속하므로 blue=220이다. 그라데이션과 체크무늬를 함께 계산한 결과는 다음과 같다.
+
+```text
+(0,0): [  0,   0, 220, 255]
+(1,0): [255,   0, 220, 255]
+(0,1): [  0, 255, 220, 255]
+(1,1): [255, 255, 220, 255]
+```
+
+1×1에서는 두 분모가 1이고 x=y=0이므로 `[0,0,220,255]`다. 8×8 체크무늬의 셀 선택은 `((floor(x/8)+floor(y/8)) mod 2)==0`이다. 이 값으로 두 색 중 하나를 고른다.
+
+RGBA8는 픽셀당 4byte, f32 depth도 4byte다. 두 버퍼만 계산하면 `W*H*(4+4)`byte다. 800×600에서는 각각 1,920,000byte, 합계 3,840,000byte, 약 3.66MiB다. mesh·texture·임시 배열을 포함한 전체 앱 메모리는 이보다 크다.
+
 ## 알고리즘과 구현 순서
 
 1. width와 height를 usize로 바꾸기 전에 0, 최대 크기, 정수 범위를 검사한다. 곱셈은 checked_mul을 사용한다.
 1. resize가 실제 크기 변경일 때만 Vec을 재할당한다. 같은 크기에서는 기존 capacity를 재사용한다.
-1. put_pixel(x, y, rgba)는 디버그/선 그리기용 안전 버전으로 만든다. hot raster loop는 bounding box가 이미 보장하므로 내부의 unchecked 변형을 별도 private 함수로 둘 수 있다.
-1. x/width와 y/height로 그라데이션을 만들고, x/8과 y/8의 짝홀로 체크무늬를 만든다. 두 패턴은 row stride와 채널 순서를 쉽게 드러낸다.
-1. JS는 내부 렌더 해상도와 CSS 표시 크기를 분리한다. 예: 내부 800x600을 CSS로 컨테이너에 맞추고 image smoothing 여부를 선택한다.
+1. put_pixel(x, y, rgba)는 디버그/선 그리기용 안전 버전으로 만든다. 이 장에서는 safe indexing을 유지한다. unsafe 최적화는 범위 증명과 기준 이미지 비교를 갖춘 뒤 25장에서 별도로 검토한다.
+1. x/max(width-1,1)과 y/max(height-1,1)로 그라데이션을 만들고, x/8과 y/8의 짝홀로 체크무늬를 만든다. 두 패턴은 row stride와 채널 순서를 쉽게 드러낸다.
+1. JS는 내부 렌더 해상도와 CSS 표시 크기를 분리한다. 예: 내부 800x600을 CSS로 컨테이너에 맞추고 CSS image-rendering으로 확대 표시 방식을 선택한다. Canvas의 imageSmoothingEnabled는 putImageData나 CSS 확대를 제어하지 않는다.
 
 ```text
 for y in 0 .. height:

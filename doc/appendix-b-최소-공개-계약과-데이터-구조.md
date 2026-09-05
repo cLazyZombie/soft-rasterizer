@@ -43,6 +43,6 @@ FragmentInput:
 - Renderer가 살아 있는 동안 framebuffer Vec을 소유한다. JS view는 빌린 뷰이며 resize/memory growth 뒤 폐기한다.
 - asset upload bytes는 호출 중에만 빌리거나 Rust가 복사해 소유한다. 비동기 JS buffer를 Rust pointer로 장기간 참조하지 않는다.
 - GLB upload는 prepare, embedded image RGBA 공급, commit generation으로 나눈다. 모든 image와 runtime 구성이 성공하기 전에는 활성 scene과 texture store를 바꾸지 않는다.
-- GLB animation은 매 frame base pose에서 다시 시작해 channel을 적용한다. skinned primitive는 mesh node transform을 무시하고 `joint_global * inverse_bind`만 position/normal에 적용한다.
+- GLB animation은 매 frame base pose에서 다시 시작해 channel을 적용한다. skinned primitive에는 mesh node transform을 다시 곱하지 않는다. `J_j=joint_global_j * inverse_bind_j`라 할 때 위치는 `p′=Σj weight_j * J_j * p`로 변환한다. 법선은 `N_j=transpose(inverse(upper3x3(J_j)))`를 따로 만들어 `n′=normalize(Σj weight_j * N_j * n)`로 변환한다. [26장](26-glb-장면-skinning-animation.md)의 단계별 식과 예제를 참고한다.
 - frame hot path의 temporary polygon, transformed vertices, tile bins는 capacity를 재사용한다.
 - Mesh/Texture ID는 index+generation 같은 stale-handle 방지 방식을 선택할 수 있다. 최소 구현에서도 invalid ID는 오류가 되어야 한다.

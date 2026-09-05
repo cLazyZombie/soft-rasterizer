@@ -305,9 +305,11 @@ test("build report는 실제 staged manifest의 hash를 기록한다", () => {
     const uiPolicyBytes = `${JSON.stringify({ chapters: [{ number: "16" }] })}\n`;
     writeFileSync(path.join(temporaryRoot, "chapter-manifest.json"), manifestBytes);
     writeFileSync(path.join(temporaryRoot, "chapter-ui.json"), uiPolicyBytes);
+    writeFileSync(path.join(temporaryRoot, "chapter-docs.json"), "{}\n");
     writeBuildReport(temporaryRoot, "production", [{ number: "16" }]);
     const report = JSON.parse(readFileSync(path.join(temporaryRoot, "build-report.json"), "utf8"));
     assert.equal(report.chapterCount, 1);
+    assert.equal(report.documentationSha256, createHash("sha256").update("{}\n").digest("hex"));
     assert.equal(
       report.manifestSha256,
       createHash("sha256").update(manifestBytes).digest("hex"),

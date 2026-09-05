@@ -36,6 +36,16 @@ dist-chapters-test/
 
 기존 최신장 개발과 회귀 검증은 별도 출력인 `dist-current/`, `dist-current-test/`를 사용한다. 따라서 최신장 E2E가 `/`에서 단일 앱을 여는 계약과 장별 런처의 `/`가 충돌하지 않는다.
 
+## 교재 원본과 페이지
+
+교재는 과거 archive가 아닌 **현재 checkout의 `doc/`**를 읽는다. `scripts/build_docs.mjs`가 Markdown을 HTML로 변환하고 `doc/NN-*.md` 파일명으로 각 장에 연결한다. 장별 설명을 별도 JSON이나 HTML 원본에 다시 저장하지 않는다. 제목도 Markdown의 첫 H1에서 읽는다.
+
+`pnpm run build`는 production/test 출력에 `docs/`와 `chapter-docs.json`을 생성한다. 교재의 표, 코드, 한국어 heading anchor와 이미지가 유지되고, 로컬 `.md` 링크는 대응하는 `.html` 링크로 바뀐다. 부록과 결정 문서도 함께 변환한다. 파일 누락, 장 번호 중복과 깨진 로컬 링크는 빌드 오류다. 문서 HTML은 스크립트를 허용하지 않는 CSP를 사용한다.
+
+런처의 실행 결과/교재 읽기 전환은 renderer iframe을 다시 만들지 않는다. 장을 바꾸면 해당 실행본과 교재를 함께 바꾸며 `?chapter=14&view=reading`으로 읽기 화면을 직접 열 수 있다. 교재는 최신 설명이고 실행본은 manifest의 고정 revision이므로 새로 설명한 내용이 과거 실행본에 없는 경우 문서가 그 범위 차이를 명시해야 한다.
+
+`chapter-docs.json`은 각 원본의 SHA256을 기록하고 build report는 이 목록의 hash를 기록한다. Markdown 하나만 수정한 재빌드에서 HTML과 source hash가 함께 바뀌는 테스트로 단일 원본 계약을 검증한다. Pages workflow에는 경로 필터가 없으므로 문서만 바뀐 push도 새 사이트를 배포한다.
+
 ## iframe 경계
 
 런처는 `?chapter=16`처럼 장을 선택하고 `./chapters/16/`을 iframe으로 연다. 장마다 달라지는 DOM, event listener, 전역 automation object와 Wasm API는 iframe document 안에 남는다. 런처는 manifest metadata와 iframe URL만 소유한다. 빌더는 Vite 실행 전에 archive의 `web/index.html`에 현재 장의 표시 scope와 제목만 주입하며 JavaScript, Wasm 또는 렌더 결과는 바꾸지 않는다.

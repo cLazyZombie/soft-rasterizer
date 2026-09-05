@@ -18,7 +18,7 @@
           </div>
         </div>
         <p class="introduction">
-          각 장을 완성한 실제 커밋을 독립된 정적 앱으로 실행합니다. 선택한 장의 DOM과 Wasm은 아래 iframe 안에서 다른 장과 격리됩니다.
+          교재로 원리와 알고리즘을 읽고, 각 장을 완성한 실행 결과를 직접 확인하세요.
         </p>
       </header>
 
@@ -46,13 +46,23 @@
 
       <p id="launcher-error" role="alert" hidden></p>
 
-      <div class="frame-shell">
+      <div class="view-toolbar" aria-label="보기 선택">
+        <button id="result-view" type="button" aria-pressed="true" aria-controls="result-panel">실행 결과</button>
+        <button id="reading-view" type="button" aria-pressed="false" aria-controls="reading-panel">교재 읽기</button>
+        <a id="curriculum-link" target="_blank" rel="noopener">전체 목차</a>
+        <a id="document-link" target="_blank" rel="noopener">교재 새 탭</a>
+      </div>
+
+      <div id="result-panel" class="frame-shell">
         <iframe
           id="chapter-frame"
           src="about:blank"
           title="소프트웨어 래스터라이저 26장"
           allow="fullscreen"
         ></iframe>
+      </div>
+      <div id="reading-panel" class="reading-shell" hidden>
+        <iframe id="document-frame" src="about:blank" title="선택한 장의 교재"></iframe>
       </div>
     </main>
     <script type="module" src="./main.js"></script>

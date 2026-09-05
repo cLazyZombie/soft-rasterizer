@@ -26,6 +26,22 @@ triangle_count = indices.len / 3
 triangle = (vertices[idx[3k]], vertices[idx[3k+1]], vertices[idx[3k+2]])
 ```
 
+## 큐브가 8개가 아닌 24정점을 쓰는 이유
+
+모서리의 위치는 8개지만 정점은 위치만이 아니다. 면마다 법선과 UV가 다르면 같은 위치에도 다른 정점이 필요하다. 이 큐브는 `6면*4정점=24정점`, `6면*2삼각형*3인덱스=36인덱스`를 사용한다.
+
+카메라 eye=(0,0,-3) 쪽을 향한 면을 보자.
+
+```text
+A=(-1,-1,-1), B=(-1,1,-1), C=(1,1,-1), D=(1,-1,-1)
+triangle 1=(A,B,C), triangle 2=(A,C,D)
+B-A=(0,2,0), C-A=(2,2,0)
+cross(B-A,C-A)=(0,0,-4)
+normalize → outward normal=(0,0,-1)
+```
+
+index는 이 정점 배열의 위치를 참조한다. 인덱스가 유효해도 normal·UV·color가 NaN이면 이후 보간이 실패하므로 Mesh 업로드는 position을 포함한 모든 정점 속성의 유한성도 검사한다.
+
 ## 알고리즘과 구현 순서
 
 1. Vertex, Mesh, Primitive 또는 DrawItem의 최소 구조를 정의한다. 아직 복잡한 scene graph는 만들지 않는다.

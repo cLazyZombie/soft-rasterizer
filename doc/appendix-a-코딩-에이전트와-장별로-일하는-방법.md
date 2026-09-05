@@ -44,7 +44,7 @@
 
 ## 에이전트가 앞서 나가지 못하게 하는 범위선
 
-- 11장 전에는 texture/lighting을 구현하지 않는다. 단색 또는 barycentric 색이 기준이다.
+- 11장 전에는 texture/lighting을 구현하지 않는다. 그라데이션·선·wireframe으로 각 단계를 확인하고, 11장에서 단색 coverage, 12장에서 barycentric 색을 추가한다.
 - 15장의 scalar 컬러 큐브가 golden을 통과하기 전 worker/SIMD를 추가하지 않는다.
 - 외부 asset parser가 생겨도 core 테스트가 파일/DOM에 의존하지 않게 한다.
 - 26장 GLB parser는 binary scene/material/TRS animation/skinning까지만 다룬다. morph/PBR/cross-fade를 편의상 함께 구현하지 않고 embedded image decode는 브라우저 장치 계층에 남긴다.

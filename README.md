@@ -53,6 +53,8 @@ GitHub Pages 주소는 <https://clazyzombie.github.io/soft-rasterizer/>입니다
 
 Pages는 manifest에 고정된 장별 실행본을 제공합니다. `dev:current`의 누적 개발 UI와 최신 FPS 표시는 현재 HEAD용이며, 장별 manifest의 revision을 바꾸기 전에는 갤러리 실행본에 포함되지 않습니다.
 
+**교재 읽기**에서는 선택한 장의 설명을 실행 결과와 전환해서 볼 수 있습니다. 교재 원본은 현재 checkout의 `doc/*.md`와 `doc/decisions/*.md`뿐입니다. 빌드가 제목·표·코드·이미지·문서 링크를 HTML로 변환하고 장 번호에 맞춰 자동 연결하므로 내용을 두 곳에 복사하지 않습니다. `doc/14-*.md`처럼 해당 Markdown만 수정해 `main`에 push하면 Pages도 새 내용으로 갱신됩니다. `?chapter=14&view=reading`으로 교재 화면을 직접 공유할 수 있습니다. 생성된 `dist/docs/`와 `chapter-docs.json`은 직접 편집하거나 커밋하지 않습니다.
+
 주요 검증 명령은 다음과 같습니다.
 
 ```bash
@@ -198,7 +200,7 @@ Rust coverage 제외는 컴파일러 attribute를 사용하지 않고 source mar
 - [부록 D · 화면 증상으로 찾는 오류 단계](doc/appendix-d-화면-증상으로-찾는-오류-단계.md)
 - [부록 E · 최종 Capstone 평가표](doc/appendix-e-최종-capstone-평가표.md)
 - [부록 F · 공식 참고자료](doc/appendix-f-공식-참고자료.md)
-- [1–25장 교재 원본 DOCX](doc/software_rasterizer_curriculum_ko.docx) — 26장은 위 Markdown 장과 runtime guide로 추가했습니다.
+- [초기 1–25장 DOCX 보관본](doc/software_rasterizer_curriculum_ko.docx) — 과거 보관본입니다. 최신 교재는 위 Markdown 원본에서 관리하며 웹 페이지도 Markdown으로 생성합니다.
 
 ## 권장 구현 구조
 

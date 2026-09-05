@@ -8,7 +8,7 @@
 
 software rasterizer는 픽셀 수가 많아 scalar 단일 스레드가 빠르게 한계에 닿는다. 그러나 JS-Wasm 호출, per-fragment allocation, 전체 화면 bounding box 같은 큰 낭비를 먼저 제거하지 않고 thread를 추가하면 복잡성만 늘어난다.
 
-화면을 작은 tile로 나누면 color/depth의 메모리 지역성이 좋아지고, 각 tile을 한 작업자가 독점하게 해 race 없이 병렬화할 수 있다. opaque depth 렌더링은 triangle 제출 순서와 무관하므로 tile 작업 분할에 잘 맞는다.
+화면을 작은 tile로 나누면 color/depth의 메모리 지역성이 좋아지고, 각 tile을 한 작업자가 독점하게 해 race 없이 병렬화할 수 있다. 서로 다른 깊이의 opaque 표면은 제출 순서와 무관한 최종 색을 얻는다. 같은 깊이에서 색이 다르면 strict < 규칙상 먼저 제출한 쪽이 남으므로 tiled 경로도 원래 triangle 순서를 유지한다.
 
 ## 배경지식
 
@@ -27,6 +27,23 @@ triangle overlaps tiles from floor(bbox_min/TILE) to floor(bbox_max/TILE)
 parallel safety: each tile owns disjoint color/depth sample ranges
 speedup은 Amdahl의 법칙에 제한: serial fraction이 남으면 worker 수만 늘려도 선형 증가하지 않는다
 ```
+
+## tile 소유와 병렬화의 최대 이득
+
+폭 35, tile 폭 16이면 x 구간을 `[0,16)`, `[16,32)`, `[32,35)`로 나눈다. 오른쪽 끝은 포함하지 않으므로 픽셀 16은 두 번째 tile만 소유한다. bbox의 max가 inclusive이면 마지막 tile index는 floor(max/16), exclusive이면 비어 있지 않은 범위에서 floor((max-1)/16)이다. 경계의 의미를 섞지 않는다.
+
+현재 Tiled16은 삼각형별 bbox를 겹치지 않는 구간으로 방문하는 single-thread 구현이다. frame 전체의 triangle bin, worker, SIMD를 이미 제공하는 것은 아니다. 각 tile 내부의 triangle 순서도 유지해야 동일 깊이 tie의 결과까지 보존된다.
+
+Amdahl의 법칙은 병렬화되지 않는 부분의 한계를 계산한다. 전체 시간 T 중 비율 s는 순차 실행, 나머지 1-s만 N개 worker에 이상적으로 분배한다고 하자.
+
+```text
+T_N=s*T+(1-s)*T/N
+speedup=T/T_N=1/(s+(1-s)/N)
+s=0.2,N=4 → 1/(0.2+0.8/4)=2.5배
+N이 무한히 커져도 → 1/s=5배
+```
+
+이는 통신·동기화 비용이 0인 이상적 상한이다. 실제 이득은 더 작을 수 있으므로 exact image와 count를 보존한 release p50/p95 증거가 먼저 필요하다.
 
 ## 알고리즘과 구현 순서
 

@@ -173,3 +173,70 @@ browser E2E는 vendored Fox를 실제 `fetch -> Wasm parse -> browser image deco
 이 장은 21장의 glTF 좌표 adapter를 실제 container와 accessor에 연결하고, 22장의 alpha queue, 23장의 mip/SSAA, 24장의 통계, 25장의 scalar/tiled 경로를 그대로 재사용한다.
 
 후속 확장은 tangent/normal texture, metallic-roughness PBR, morph target, cross-fade, 진짜 trilinear filtering 순서가 적절하다. 각각 현재의 scalar reference와 pixel hash를 보존하는 별도 장으로 다뤄야 한다.
+
+## animation 값을 시간에서 계산하기
+
+현재 시간 t가 key 시각 t0,t1 사이에 있다면 `Δ=t1-t0>0`, `u=(t-t0)/Δ`다. u=0은 왼쪽 key, u=1은 오른쪽 key다.
+
+```text
+STEP:   p(t)=p0                 # 다음 key 전까지 왼쪽 값
+LINEAR: p(t)=(1-u)*p0+u*p1
+```
+
+p0=2,p1=6,t0=0,t1=2,t=0.5이면 u=0.25이고 LINEAR 값은 2*0.75+6*0.25=3이다. rotation quaternion은 네 성분을 그대로 lerp하면 길이와 회전 속도가 달라질 수 있어 LINEAR 모드에서 SLERP를 사용한다.
+
+### quaternion과 SLERP
+
+quaternion q=(x,y,z,w)는 단위 길이이며 q와 -q는 같은 회전이다. unit q에서 `v' = q*(v,0)*conjugate(q)`가 회전된 벡터다. 실제 구현에 쓸 수 있는 3×3 회전행렬은 다음과 같다.
+
+```text
+R(q)=
+[1-2(y²+z²)  2(xy-zw)    2(xz+yw)  ]
+[2(xy+zw)    1-2(x²+z²)  2(yz-xw)  ]
+[2(xz-yw)    2(yz+xw)    1-2(x²+y²)]
+```
+
+node의 local matrix는 4×4로 확장한 R을 사용해 `T*R*S`로 만든다. SLERP에서는 먼저 q0,q1을 정규화하고 d=dot(q0,q1)를 구한다. d<0이면 q1의 부호를 바꿔 같은 회전의 짧은 경로를 고른다. 다시 구한 d로:
+
+```text
+θ=acos(clamp(d,-1,1))
+q(u)=[sin((1-u)*θ)*q0+sin(u*θ)*q1]/sinθ
+```
+
+θ가 작으면 sinθ로 나누는 계산이 불안정하다. 현재 구현은 d>0.9995이면 `normalize((1-u)*q0+u*q1)`을 쓴다. u=0과 1에서 각각 원래 key가 나오는지 확인한다.
+
+### CUBICSPLINE과 tangent의 단위
+
+각 key는 `[in tangent, value, out tangent]` 순서다. 두 key 사이에서는 왼쪽 out tangent m0와 오른쪽 in tangent m1을 사용한다.
+
+```text
+h00= 2u³-3u²+1
+h10=  u³-2u²+u
+h01=-2u³+3u²
+h11=  u³-u²
+p=h00*p0+h10*Δ*m0+h01*p1+h11*Δ*m1
+```
+
+tangent는 ‘초당 값의 변화량’이다. u는 0..1의 무단위 비율이므로 실제 key 간 시간 Δ를 곱해야 단위가 맞는다. u=0에서는 h00=1, 나머지가 0이어서 p0, u=1에서는 h01=1이어서 p1이다. 시간 미분의 양 끝은 각각 m0,m1이 된다. p0=0,p1=1,m0=m1=0,u=0.5이면 h00=h01=0.5라 p=0.5다. 회전 CUBICSPLINE 결과는 마지막에 정규화하며 LINEAR의 임의 부호 반전을 tangent에 그대로 적용하지 않는다.
+
+## skinning을 두 joint로 따라가기
+
+inverse bind는 bind pose의 정점을 joint 기준 공간으로 되돌리고, 현재 joint global은 그 공간을 현재 scene 공간에 다시 놓는다. 열벡터라 오른쪽부터 적용한다.
+
+```text
+J_j=current_joint_global_j*inverse_bind_j
+p_skinned=Σj weight_j*(J_j*p_bind)
+```
+
+한 정점을 joint0은 x=0으로, joint1은 x=2로 보낸다고 하자. weight가 0.75,0.25이면 x=0.75*0+0.25*2=0.5다. 업로드 때 weight 합을 1로 정규화하고 유효하지 않은 joint index는 거부한다. root normalization은 skinning 뒤 한 번 적용한다.
+
+현재 법선 경로는 `N_j=transpose(inverse(upper3x3(J_j)))`를 계산하고 `normalize(Σj weight_j*N_j*n_bind)`를 사용한다. 이는 joint별로 변환한 법선을 섞는 현재 profile이다. 가중합 position 변형 전체의 inverse-transpose와 일반적으로 같다는 주장은 아니다. 특이 행렬이나 비유한 pose는 실패 처리하고 이전 유효 상태를 보존한다.
+
+## accessor의 실제 byte 위치
+
+```text
+address(i)=bufferView.byteOffset+accessor.byteOffset+i*stride
+밀집 저장 stride=component_size*component_count
+```
+
+f32 Vec3이면 component_size=4byte, component_count=3, 밀집 stride=12byte다. view offset=100, accessor offset=8이면 i=2의 시작은 100+8+2*12=132byte다. 포맷이 stride를 따로 지정하면 그 값을 쓰되 정렬·최소 크기와 마지막 원소까지의 범위를 검증한다. byte 주소 계산과 좌표계 변환은 서로 다른 단계다.

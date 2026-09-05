@@ -81,6 +81,7 @@ export default class ChapterReporter {
         pnpmLockSha256: fileHash("pnpm-lock.yaml"),
         chapterManifestSha256: fileHash("chapter-manifest.json"),
         chapterUiPolicySha256: fileHash("chapter-ui.json"),
+        chapterDocumentationSha256: fileHash("dist-chapters-test/chapter-docs.json"),
         chapterBuildReportSha256: fileHash("dist-chapters-test/build-report.json"),
         rustToolchain: commandOutput("rustc", ["--version"]),
       },

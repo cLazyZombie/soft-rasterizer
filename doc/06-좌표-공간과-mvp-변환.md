@@ -25,11 +25,33 @@
 ## 핵심 식과 불변조건
 
 ```text
-p_world = M * Vec4(p_object, 1)
+p_object_h = Vec4(p_object, 1)
+p_world = M * p_object_h
 p_view = V * p_world
-p_clip = P * p_view = (P * V * M) * p_object
+p_clip = P * p_view = (P * V * M) * p_object_h
 이 교재의 clip 규약: -w <= x <= w, -w <= y <= w, 0 <= z <= w
 ```
+
+## 한 정점을 clip 좌표까지 따라가기
+
+현재 model 합성은 `M=T*Rz*Ry*Rx*S`다. 점에는 scale→X회전→Y회전→Z회전→translation 순으로 작용한다. 원래 Vec3 위치에는 w=1을 붙여 `p_object_h=Vec4(x,y,z,1)`로 만든다.
+
+아래 예제는 회전과 scale을 생략하고 이동만 사용한다.
+
+```text
+object = (1,0,0,1)
+M = translation(0,0,2)
+world = M*object = (1,0,2,1)
+
+eye=(0,0,-3), target=(0,0,0)
+view = V*world = (1,0,5,1)
+
+fov_y=90°, aspect=1, near=1, far=10
+clip = P*view = (1,0,(10/9)*5-10/9,5)
+     = (1,0,40/9,5)
+```
+
+카메라가 z=-3에 있으므로 world z=2는 카메라에서 전방 5만큼 떨어져 있다. `p_clip=(P*V*M)*p_object_h`로 한 번에 곱해도 같은 값이어야 한다. 아직 clip xyz를 화면 좌표로 사용하지 않는다. 7장의 divide와 viewport를 적용하면 NDC=(1/5,0,8/9), 600×600 viewport에서 screen=(360,300), 깊이=8/9가 된다. 실제 삼각형은 divide 전에 10장의 clipping을 먼저 거친다.
 
 ## 알고리즘과 구현 순서
 

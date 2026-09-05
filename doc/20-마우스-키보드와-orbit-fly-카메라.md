@@ -29,6 +29,23 @@ radius = clamp(radius * exp(wheel * zoom_speed), min_r, max_r)
 fly movement = speed * dt * normalize(input_right*right + input_up*up + input_forward*forward)
 ```
 
+## 방향·속도·입력 단위를 연결하기
+
+이 교재의 왼손 카메라는 yaw=0,pitch=0에서 +Z를 본다. 각도는 라디안이다.
+
+```text
+F=(sin(yaw)*cos(pitch), sin(pitch), cos(yaw)*cos(pitch))
+R=normalize(cross((0,1,0),F))
+U=cross(F,R)
+orbit eye=target-radius*F
+```
+
+yaw=pitch=0이면 F=(0,0,1), R=(1,0,0)이다. target=(0,0,0), radius=3이면 eye=(0,0,-3)이다. yaw=π/2,pitch=0이면 F=(1,0,0), eye=(-3,0,0)이 된다. pitch는 up과 평행해지는 극점까지 도달하지 않도록 제한한다.
+
+현재 fly speed=3 units/s다. W를 dt=1/60초 유지하면 `3*(1/60)=0.05`만큼 이동한다. W+D는 F+R=(1,0,1)을 정규화한 뒤 0.05를 곱하므로 총 이동 거리도 0.05다. 정규화하지 않으면 대각선 속도가 √2배가 된다. 입력 방향이 0이면 정규화하지 않고 위치를 유지한다.
+
+키 상태는 시간에 따른 속도이므로 dt를 곱한다. 반면 pointer delta는 이미 지난 프레임 이후의 이동량이므로 감도만 곱하고 dt를 다시 곱하지 않는다. wheel의 지수 zoom `r'=r*exp(k*delta)`는 clamp에 닿지 않는 범위에서 두 입력 d1,d2가 `exp(k*d1)*exp(k*d2)=exp(k*(d1+d2))`로 합쳐져 이벤트 분할에 일관된다.
+
 ## 알고리즘과 구현 순서
 
 1. JS InputCollector가 keydown/up Set, pointerdown/move/up, wheel을 듣는다. Canvas에 focus 가능 tabindex를 주고 blur/visibilitychange에서 held keys를 비운다.

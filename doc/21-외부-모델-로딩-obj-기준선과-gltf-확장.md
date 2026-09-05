@@ -37,6 +37,35 @@ triangle list winding: (i0,i1,i2) -> (i0,i2,i1)
 tangent_lh = (C3*tangent.xyz, -tangent.w)
 ```
 
+## OBJ index와 좌표 변환 예제
+
+OBJ index는 1부터 시작하며 음수는 현재 목록의 끝을 기준으로 센다. 정점 수가 count일 때 다음 식을 사용한다.
+
+```text
+index>0 → index-1
+index<0 → count+index
+index=0 → 오류
+변환 결과는 0<=result<count여야 한다.
+
+count=5: 1→0, -1→4, -5→0, 0/-6→오류
+```
+
+같은 position index라도 `(position,uv,normal)`의 조합이 다르면 최종 정점이 다르다. 예를 들어 face의 `1/1/1`과 `1/2/1`은 위치와 법선이 같아도 UV가 달라 둘로 분리한다. 현재 normal이 없는 OBJ는 원본 position별로 면적 벡터를 누적하므로 UV seam을 넘어 smooth normal 방향을 공유한다.
+
+현재 OBJ profile은 위치를 내부 LH로 해석하고 UV는 아래쪽 원점을 가정해 importer에서 `(u,v)→(u,1-v)`로 바꾼다. 예를 들어 (0.25,0.75)→(0.25,0.25)다. glTF/GLB UV는 내부와 같은 위쪽 원점이므로 뒤집지 않는다. OBJ가 자체적으로 handedness를 강제하는 포맷이라고 일반화하지 않는다.
+
+### glTF 행렬에도 양쪽에서 C를 곱하는 이유
+
+```text
+C=diag(-1,1,1,1), C*C=I
+p'=C*p, M'=C*M*C
+M'*p'=(C*M*C)*(C*p)=C*M*p
+```
+
+따라서 변환된 입력을 변환된 행렬에 넣은 결과는 원래 결과를 C로 바꾼 것과 같다. C의 determinant=-1은 반사여서 삼각형 방향을 뒤집는다. index의 두 번째와 세 번째를 교환해야 normal과 outward winding이 다시 맞는다.
+
+OBJ bounds 처리는 카메라만 옮기는 것이 아니라 정점 자체를 중심 이동하고 최대 축 반폭으로 정규화한다. 원본 bounds 중심 c를 구하고 `h=max(|px-cx|,|py-cy|,|pz-cz|)`를 참조된 정점 전체에서 최댓값으로 잡는다. 현재 변환은 `(p-c)/h*0.75`이며, 구의 반경으로 나누는 방식과 다르다. GLB는 node/skin 관계를 보존하며 별도의 root normalization을 마지막에 적용한다.
+
 ## 알고리즘과 구현 순서
 
 1. JS가 파일 크기 상한을 먼저 확인하고 ArrayBuffer를 Wasm load_mesh에 전달한다.

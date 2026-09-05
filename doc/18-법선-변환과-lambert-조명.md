@@ -13,7 +13,7 @@ Lambert diffuse는 단위 법선 N과 표면에서 빛으로 향하는 단위 �
 ## 배경지식
 
 - <strong>flat normal</strong>은 triangle 두 변의 cross로 하나의 면 법선을 쓴다. <strong>smooth normal</strong>은 vertex normal을 보간하고 픽셀마다 normalize한다.
-- <strong>normal matrix</strong>는 world-space lighting이면 inverse(transpose(model upper 3x3))다. 정확한 표기는 transpose(inverse(M3))다.
+- <strong>normal matrix</strong>는 world-space lighting이면 transpose(inverse(model upper 3x3))다. 역행렬이 존재하면 inverse(transpose(M3))와 같은 값이다.
 - <strong>directional light</strong>는 위치 없이 방향만 가진다. 구조체의 direction이 빛이 진행하는 방향인지, 표면에서 빛으로 향하는 방향인지 이름으로 구분한다.
 - 이 교재는 L을 <strong>surface_to_light</strong>로 정의한다. 태양 광선 진행 방향을 저장했다면 L=-ray_direction이다.
 - <strong>ambient term</strong>은 간단한 상수로 완전히 검은 뒷면을 피한다. 물리적인 global illumination 모델은 아니다.
@@ -26,6 +26,45 @@ L = normalize(surface_to_light)
 diffuse = max(dot(N, L), 0)
 lit_rgb = albedo * (ambient + light_color * intensity * diffuse)
 ```
+
+## 법선을 위치와 같은 행렬로 곱하면 안 되는 이유
+
+표면 접선 T와 법선 N은 `dot(N,T)=0`이다. 위치의 선형 변환을 A라 하면 접선은 `T'=A*T`가 된다. 새 법선도 새 접선에 수직이어야 한다.
+
+```text
+N'=transpose(inverse(A))*N = A^(-T)*N
+(N')^T*T' = N^T*A^(-1)*A*T = N^T*T = 0
+```
+
+가운데 `A^(-1)*A=I`가 소거되어 원래의 수직 조건이 보존된다. 그래서 inverse-transpose를 사용한다. `transpose(inverse(A))`와 `inverse(transpose(A))`는 역행렬이 존재하면 같은 값이다.
+
+예를 들어 T=(1,1,0), N=(1,-1,0), A=diag(2,1,1)이라 하자.
+
+```text
+T'=(2,1,0)
+잘못된 A*N=(2,-1,0) → dot=4-1=3 (수직 아님)
+올바른 A^(-T)*N=(0.5,-1,0) → dot=1-1=0
+```
+
+마지막 정규화는 방향을 유지한 채 길이만 1로 맞춘다. 위치의 이동 성분은 방향에 적용하지 않으므로 A는 M의 왼쪽 위 3×3이다.
+
+### 필요한 3×3 역행렬 식
+
+```text
+A=[a b c; d e f; g h i]
+det(A)=a*(e*i-f*h)-b*(d*i-f*g)+c*(d*h-e*g)
+
+inverse(A) = 1/det(A) *
+[ e*i-f*h  c*h-b*i  b*f-c*e ]
+[ f*g-d*i  a*i-c*g  c*d-a*f ]
+[ d*h-e*g  b*g-a*h  a*e-b*d ]
+```
+
+transpose는 행과 열을 바꾼다. det=0이면 역행렬이 없으므로 나누지 않는다. 실제 구현은 determinant가 0 또는 비유한이거나, 계산된 역행렬 성분이 비유한이면 실패한다.
+
+### Lambert 밝기에 숫자 넣기
+
+N과 표면에서 광원으로 향하는 L을 단위 길이로 만들면 `dot(N,L)=cosθ`다. θ=0°,60°,90°,180°일 때 `max(cosθ,0)`은 각각 1,0.5,0,0이다. ambient=0.1, 흰 광원 intensity=1, albedo=(0.8,0.4,0.2), θ=60°이면 `albedo*(0.1+0.5)=(0.48,0.24,0.12)`다. 이 값은 linear RGB이며 화면 저장 직전의 sRGB encode는 다음 장에서 적용한다.
 
 ## 알고리즘과 구현 순서
 

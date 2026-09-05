@@ -17,7 +17,7 @@
 ## 배경지식
 
 - <strong>웹 디코딩 경로</strong>: File/Blob 또는 fetch Response -&gt; createImageBitmap -&gt; 임시 Canvas/OffscreenCanvas -&gt; getImageData -&gt; RGBA8.
-- <strong>Texture 구조</strong>는 width, height, Vec&lt;u8&gt; pixels, color_space, sampler 설정을 가진다. row-major이며 한 행 stride는 width\*4다.
+- <strong>Texture 구조</strong>는 width, height, RGBA8 pixels와 color_space를 소유한다. sampler는 Texture 내부가 아닌 별도 SamplerState이며 Material이 참조한다. mip level 소유는 23장에서 확장한다. row-major이며 한 행 stride는 width\*4다.
 - <strong>내부 UV 규약</strong>은 이 과정에서 u=0 왼쪽, v=0 위쪽으로 정한다. OBJ/glTF importer가 다른 규약을 만나면 import 시 한 번 변환한다.
 - <strong>업로드 검증</strong>: width/height가 0이 아니고 len=width\*height\*4이며 최대 texture 픽셀 수를 넘지 않는지 확인한다.
 - <strong>CORS와 tainted Canvas</strong>: 허가되지 않은 cross-origin 이미지를 Canvas에 그린 뒤 getImageData하면 보안 예외가 날 수 있다. 로컬 파일이나 CORS 허용 리소스로 시작한다.
@@ -29,6 +29,20 @@ texture_byte(x,y) = 4 * (y * texture_width + x)
 expected_len = checked(texture_width * texture_height * 4)
 업로드 비용은 O(texture pixels), 프레임 샘플 비용은 O(covered fragments)
 ```
+
+## 2×2 texture byte 배열 읽기
+
+한 행은 2픽셀*4채널=8byte다. (x,y) 픽셀은 `4*(y*2+x)`에서 시작한다.
+
+```text
+(0,0) → offset  0 → bytes  0..3
+(1,0) → offset  4 → bytes  4..7
+(0,1) → offset  8 → bytes  8..11
+(1,1) → offset 12 → bytes 12..15
+전체 길이=2*2*4=16byte
+```
+
+이미지 디코더는 이 배열을 만들고 Rust는 한 번 복사해 소유한다. 마지막 픽셀의 R을 읽으려면 bytes[12], A는 bytes[15]다. stride를 높이*4로 잘못 계산하면 정사각형에서는 숨겨지므로 3×2 같은 비정사각형도 검증한다. 업로드 실패 시 새 배열을 active texture로 교체하지 않아 기존 장면이 유지된다.
 
 ## 알고리즘과 구현 순서
 

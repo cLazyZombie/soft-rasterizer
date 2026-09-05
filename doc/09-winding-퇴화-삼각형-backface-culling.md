@@ -26,6 +26,20 @@ abs(area2) <= epsilon -> degenerate
 screen y-down 기준: area2 > 0 -> front, area2 < 0 -> back
 ```
 
+## 화면의 방향을 숫자로 판정하기
+
+```text
+orient2d(A,B,C) = (Bx-Ax)*(Cy-Ay) - (By-Ay)*(Cx-Ax)
+A=(0,0), B=(2,0), C=(0,2)
+orient2d = 2*2-0*0 = 4
+```
+
+이는 부호 있는 실제 면적의 **두 배**다. 면적은 2이며 y-down 화면에서 A→B→C는 시계 방향이어서 front face다. B와 C를 바꾸면 -4가 된다. 0이면 면적이 없는 선 또는 점이다.
+
+9장 wireframe의 float 조기 분류는 임시 `WIREFRAME_AREA_EPSILON=1e-5`를 사용한다. 11장 이후 픽셀 소유를 결정하는 최종 setup은 고정소수점 정수 area를 사용하며 양자화 뒤 `area==0`인지 정확히 판정한다. top-left equality를 float epsilon으로 대신하지 않는다.
+
+9장의 입력 삼각형 분류 등식은 clipping 전 단계의 이야기다. 10장 이후에는 clipping으로 생성된 삼각형 수가 바뀌므로 `generated=submitted+culled+degenerate+invalid`처럼 생성 이후의 단위를 맞춰 센다.
+
 ## 알고리즘과 구현 순서
 
 1. clip과 perspective divide를 통과한 세 screen 위치로 area2를 계산한다.
@@ -77,5 +91,5 @@ culling toggle과 double-sided 옵션은 JS UI가 상태를 바꿀 수 있지만
 ### 자주 생기는 오류
 
 - world/view 공간의 CCW 설명을 screen 공간에 그대로 적용하면 viewport y flip 때문에 부호가 반대가 된다.
-- 너무 큰 area epsilon은 멀리 있는 작지만 보이는 삼각형을 없앤다. screen 좌표와 고정소수점 단위에 맞춰 정한다.
+- 9장의 float 조기 분류에서 너무 큰 epsilon은 작지만 보이는 삼각형을 없앤다. 11장 고정소수점 setup에서는 epsilon 없이 양자화된 area==0을 판정한다.
 - culling이 켜진 상태에서 mesh winding 오류를 숨기지 않는다. debug 모드에서 양면 색을 먼저 확인한다.
